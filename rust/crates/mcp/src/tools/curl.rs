@@ -261,11 +261,7 @@ pub async fn run(
     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
     match response {
-        Ok((body, content_type)) => Ok(CallToolResult::success(body_to_mcp_content(
-            body,
-            content_type.as_deref(),
-            "Request completed.",
-        ))),
+        Ok(response) => Ok(response.into_tool_result()),
         Err(err) => Ok(pay_error_to_tool_result(err)),
     }
 }
@@ -886,10 +882,33 @@ fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Result of a paid fetch: raw response body bytes and the content-type the
-/// server advertised. Bytes (not String) so binary payloads — images, PDFs,
-/// octet streams — round-trip without UTF-8 mangling.
-type PaidFetchResult = (Vec<u8>, Option<String>);
+/// A completed fetch retains its execution status alongside the raw body and
+/// advertised content-type, including when the response follows a payment.
+struct PaidFetchResult {
+    exit_code: i32,
+    body: Vec<u8>,
+    content_type: Option<String>,
+}
+
+impl PaidFetchResult {
+    fn into_tool_result(self) -> CallToolResult {
+        let is_error = self.exit_code != 0;
+        let content = body_to_mcp_content(
+            self.body,
+            self.content_type.as_deref(),
+            if is_error {
+                "Request failed."
+            } else {
+                "Request completed."
+            },
+        );
+        if is_error {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        }
+    }
+}
 
 fn hardware_address_matches(expected: Option<&str>, actual: &str) -> bool {
     expected.is_none_or(|expected| actual == expected)
@@ -1467,8 +1486,15 @@ fn do_paid_fetch(
             "402 Payment Required but no recognized protocol".to_string(),
         )),
         RunOutcome::Completed {
-            body, content_type, ..
-        } => Ok((body.unwrap_or_default(), content_type)),
+            exit_code,
+            body,
+            content_type,
+            ..
+        } => Ok(PaidFetchResult {
+            exit_code,
+            body: body.unwrap_or_default(),
+            content_type,
+        }),
     }
 }
 
@@ -1576,8 +1602,15 @@ fn interpret_retry(
     use pay_core::client::runner::RunOutcome;
     match outcome {
         RunOutcome::Completed {
-            body, content_type, ..
-        } => Ok((body.unwrap_or_default(), content_type)),
+            exit_code,
+            body,
+            content_type,
+            ..
+        } => Ok(PaidFetchResult {
+            exit_code,
+            body: body.unwrap_or_default(),
+            content_type,
+        }),
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         _ => Err(pay_core::Error::Mpp(
             "Server returned 402 again after payment".to_string(),
@@ -1588,6 +1621,74 @@ fn interpret_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpret_retry_preserves_exit_code_and_response() {
+        use pay_core::client::runner::RunOutcome;
+
+        // Model the completed response to a request retried with payment proof.
+        // The fetch layer maps HTTP 502 to exit_code=1, just as for 400/429.
+        for exit_code in [0, 1, 22] {
+            for body in [None, Some(Vec::new()), Some(b"Bad Gateway".to_vec())] {
+                let content_type = Some("text/plain; charset=utf-8".to_string());
+                let response = interpret_retry(RunOutcome::Completed {
+                    exit_code,
+                    body: body.clone(),
+                    content_type: content_type.clone(),
+                    response_headers: Vec::new(),
+                })
+                .expect("a completed HTTP failure is not a payment/protocol error");
+                assert_eq!(response.exit_code, exit_code);
+                assert_eq!(response.body, body.unwrap_or_default());
+                assert_eq!(response.content_type, content_type);
+
+                let expected_text = if response.body.is_empty() {
+                    if exit_code == 0 {
+                        "Request completed."
+                    } else {
+                        "Request failed."
+                    }
+                } else {
+                    "Bad Gateway"
+                };
+                let result = response.into_tool_result();
+                assert_eq!(result.is_error, Some(exit_code != 0));
+                assert_eq!(result.content[0].as_text().unwrap().text, expected_text);
+            }
+        }
+    }
+
+    #[test]
+    fn interpret_retry_preserves_binary_http_failure() {
+        let body = b"\x89PNG\r\n\x1a\n\xff".to_vec();
+        let response = interpret_retry(pay_core::client::runner::RunOutcome::Completed {
+            exit_code: 1,
+            body: Some(body.clone()),
+            content_type: Some("image/png".to_string()),
+            response_headers: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(response.body, body);
+        assert_eq!(response.content_type.as_deref(), Some("image/png"));
+        let result = response.into_tool_result();
+        assert_eq!(result.is_error, Some(true));
+        let image = result.content[0].as_image().unwrap();
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(general_purpose::STANDARD.decode(&image.data).unwrap(), body);
+    }
+
+    #[test]
+    fn interpret_retry_still_rejects_repeated_402() {
+        let outcome = pay_core::client::runner::classify_402(
+            &[],
+            Some("Payment Required"),
+            "https://example.com/paid",
+        );
+        let Err(pay_core::Error::Mpp(message)) = interpret_retry(outcome) else {
+            panic!("a repeated 402 must remain a payment error");
+        };
+        assert_eq!(message, "Server returned 402 again after payment");
+    }
 
     #[test]
     fn hardware_account_connection_must_match_saved_address() {

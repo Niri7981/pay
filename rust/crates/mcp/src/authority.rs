@@ -129,6 +129,11 @@ impl Operations {
         {
             return Err(rejected("INVALID_TRUSTED_CONFIGURATION"));
         }
+        let parsed_url = reqwest::Url::parse(url).map_err(|_| rejected("INVALID_REQUEST"))?;
+        // Reqwest turns URL userinfo into Authorization before sending the probe.
+        if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+            return Err(rejected("PREFILLED_CREDENTIAL_OR_AMBIGUOUS_HEADER"));
+        }
         let mut canonical_headers = headers
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))

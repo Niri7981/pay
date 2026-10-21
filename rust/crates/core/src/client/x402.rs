@@ -37,6 +37,9 @@ pub struct Challenge {
     /// Stored verbatim so `build_payment` can echo it back per x402 v2
     /// §5.1.2 ("client must include at least the info received").
     pub extensions: Option<serde_json::Value>,
+    /// Original selected wire envelope, before SDK normalization. Controlled
+    /// hosts bind all alternatives/resource metadata/extensions to authority.
+    pub payment_required: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +111,34 @@ pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challen
         requirements,
         siwx,
         extensions,
+        payment_required: payment_required_value(headers, body),
     })
+}
+
+fn payment_required_value(
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let valid_envelope = |raw: &[u8]| {
+        let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+        serde_json::from_value::<PaymentRequiredEnvelope>(value.clone()).ok()?;
+        Some(value)
+    };
+    // Match the actual pay-kit exact parser's source precedence. In particular,
+    // never bind a body envelope when the SDK selected a valid header instead.
+    if let Some(raw) = header_value(headers, PAYMENT_REQUIRED_HEADER)
+        .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+        .and_then(|bytes| valid_envelope(&bytes))
+    {
+        return Some(raw);
+    }
+    if header_value(headers, X402_V1_PAYMENT_REQUIRED_HEADER)
+        .is_some_and(|value| serde_json::from_str::<PaymentRequirements>(value).is_ok())
+    {
+        return None;
+    }
+    body.and_then(|raw| valid_envelope(raw.as_bytes()))
 }
 
 /// Try to parse an x402 `sign-in-with-x` challenge.
@@ -1578,6 +1608,47 @@ mod tests {
     }
 
     #[test]
+    fn captured_wire_envelope_uses_the_sdk_selected_source_without_projection() {
+        let offer = serde_json::json!({"scheme":"exact","network":SOLANA_MAINNET,
+            "amount":"1000","asset":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo":"11111111111111111111111111111111","maxTimeoutSeconds":60,
+            "extra":{"feePayer":"SysvarRent111111111111111111111111111111111"}});
+        let header_envelope = serde_json::json!({"x402Version":2,
+            "resource":{"url":"https://example.com/data","serviceName":"preserve me","tags":["public"]},
+            "accepts":[offer],"extensions":{"builder-code":{"info":{"a":"example"}}}});
+        let mut body_envelope = header_envelope.clone();
+        body_envelope["accepts"][0]["amount"] = serde_json::json!("2000");
+        let header = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            header_envelope.to_string(),
+        );
+        let headers = vec![(PAYMENT_REQUIRED_HEADER.to_string(), header)];
+        let body = body_envelope.to_string();
+        let selected = parse(&headers, Some(&body)).unwrap();
+        assert_eq!(selected.requirements.amount, "1000");
+        assert_eq!(selected.payment_required, Some(header_envelope.clone()));
+        assert_eq!(
+            parse(&[], Some(&body)).unwrap().payment_required,
+            Some(body_envelope.clone())
+        );
+        let bad_header = vec![(
+            PAYMENT_REQUIRED_HEADER.to_string(),
+            "not-base64".to_string(),
+        )];
+        assert_eq!(
+            parse(&bad_header, Some(&body)).unwrap().payment_required,
+            Some(body_envelope)
+        );
+        // A valid legacy header wins over a v2 body in the actual SDK parser;
+        // capturing the body as though it authorized that selection is forbidden.
+        let legacy = header_envelope["accepts"][0].to_string();
+        let headers = vec![(X402_V1_PAYMENT_REQUIRED_HEADER.to_string(), legacy)];
+        let selected = parse(&headers, Some(&body)).unwrap();
+        assert_eq!(selected.requirements.amount, "1000");
+        assert!(selected.payment_required.is_none());
+    }
+
+    #[test]
     fn build_outbound_extensions_returns_none_when_inbound_absent() {
         assert!(build_outbound_extensions(None).unwrap().is_none());
     }
@@ -1815,6 +1886,7 @@ mod tests {
             requirements: sample_requirements(),
             siwx: Some(extension),
             extensions: None,
+            payment_required: None,
         };
 
         let (header_name, header_value) = build_siwx_header(&challenge, &signer, "devnet", &rt)
@@ -1928,6 +2000,7 @@ mod tests {
             requirements: sample_requirements(),
             siwx: None,
             extensions: None,
+            payment_required: None,
         };
 
         let err = build_payment(&challenge, &store, Some("localnet"), None, None).unwrap_err();
@@ -1950,6 +2023,7 @@ mod tests {
             requirements: sample_requirements(),
             siwx: None,
             extensions: None,
+            payment_required: None,
         };
 
         let err = build_payment(&challenge, &store, None, None, None).unwrap_err();
@@ -1969,6 +2043,7 @@ mod tests {
             requirements,
             siwx: None,
             extensions: None,
+            payment_required: None,
         };
         let err = build_payment(&challenge, &store, None, Some("alice"), None).unwrap_err();
         let msg = err.to_string();
@@ -2000,6 +2075,7 @@ mod tests {
             requirements,
             siwx: None,
             extensions: None,
+            payment_required: None,
         };
 
         // We can't exercise the full build path here (it needs a live

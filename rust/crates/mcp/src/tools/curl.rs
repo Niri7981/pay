@@ -1079,6 +1079,9 @@ fn do_paid_fetch(
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
+    if let Some(authority) = authority {
+        authority.trace("paid_fetch_entered");
+    }
     validate_cached_catalog_body(method, url, extra_headers, body)?;
     // A channel's available capacity is consumed by each request. MCP clients
     // may issue tool calls concurrently, so keep the full request/retry cycle
@@ -1281,11 +1284,26 @@ fn do_paid_fetch(
                 permissions.authorize_x402(&challenge, &resource_url)?;
             }
             if let Some(authority) = authority {
+                authority.trace("x402_quote_selected");
                 let network = pay_core::client::x402::challenge_network(
                     &challenge,
                     network_override.as_deref(),
                 );
-                authority.authorize(&challenge, &network)?;
+                let facts = authority.authorize(&challenge, &network)?;
+                if let Some(controller) = authority.controller() {
+                    // Return before every account load, signer, cached credential,
+                    // and Pay-owned paid retry. No fallthrough on controller failure.
+                    let result = interpret_retry(crate::controlled::run(controller, &facts)?);
+                    crate::authority::trace_execution(
+                        &facts,
+                        if result.is_ok() {
+                            "protocol_interpreted"
+                        } else {
+                            "protocol_failed"
+                        },
+                    );
+                    return result;
+                }
                 let selected = prepare_hardware_account(
                     store,
                     &network,

@@ -718,7 +718,7 @@ pub fn fetch_raw_with_body_for(
     )
 }
 
-fn raw_to_outcome(raw: RawResponse) -> RunOutcome {
+pub fn raw_to_outcome(raw: RawResponse) -> RunOutcome {
     if raw.status == 402 {
         // 402 challenge bodies are always JSON-as-text per spec; the
         // text view is correct here.

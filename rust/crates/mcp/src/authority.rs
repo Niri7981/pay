@@ -22,7 +22,7 @@ pub struct ImmutableRequest {
 }
 
 /// Facts obtained from the real SDK-decoded x402 exact offer.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SpendRequest {
     pub operation_id: String,
     /// Unique to this execution attempt, even across MCP process restarts.
@@ -37,6 +37,11 @@ pub struct SpendRequest {
     pub recipient: String,
     /// Full canonical accepted offer, including decimals/fee payer/memo/blockhash.
     pub accepted: serde_json::Value,
+    /// Original SDK-selected v2 envelope, required only by controlled custody.
+    /// Kept separate from request.url: a merchant may advertise a route-level
+    /// resource while the immutable request includes concrete query inputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_required: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +74,7 @@ pub struct AuthorityBinding {
     pub(crate) caller_id: String,
     authority: Arc<dyn SpendingAuthority>,
     timeout: Duration,
+    pub(crate) controlled: Option<Arc<dyn crate::controlled::ControlledExecution>>,
 }
 
 impl AuthorityBinding {
@@ -77,7 +83,17 @@ impl AuthorityBinding {
             caller_id: caller_id.into(),
             authority,
             timeout: Duration::from_secs(5),
+            controlled: None,
         }
+    }
+
+    /// Keep signed credentials and final HTTP under the host controller's custody.
+    pub fn with_controlled_execution(
+        mut self,
+        controller: Arc<dyn crate::controlled::ControlledExecution>,
+    ) -> Self {
+        self.controlled = Some(controller);
+        self
     }
 
     /// Invalid (zero or >60s) deadlines fail closed when the call starts.
@@ -184,11 +200,19 @@ impl Operations {
 }
 
 impl AuthorityAttempt {
+    /// Diagnostic facts only: never log request data, offers or payment credentials.
+    pub(crate) fn trace(&self, stage: &'static str) {
+        tracing::info!(target: "pay_execution", version = 1, caller_id = %self.binding.caller_id,
+            operation_id = %self.operation_id, attempt_id = %self.attempt_id, stage);
+    }
+    pub(crate) fn controller(&self) -> Option<&dyn crate::controlled::ControlledExecution> {
+        self.binding.controlled.as_deref()
+    }
     pub(crate) fn authorize(
         &self,
         challenge: &pay_core::client::x402::Challenge,
         execution_network: &str,
-    ) -> Result<(), pay_core::Error> {
+    ) -> Result<SpendRequest, pay_core::Error> {
         let accepted = challenge.requirements.to_accepted_value();
         // Keep this first seam narrow. Other schemes/authentication flows must not
         // fall through to a free signer, including those advertised beside exact.
@@ -225,23 +249,117 @@ impl AuthorityAttempt {
             execution_network: execution_network.to_string(),
             recipient: field("payTo")?,
             accepted,
+            payment_required: self
+                .binding
+                .controlled
+                .as_ref()
+                .map(|_| controlled_envelope(challenge, &self.request))
+                .transpose()?,
         };
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| rejected("AUTHORITY_RUNTIME_UNAVAILABLE"))?;
+        self.trace("authority_requested");
         let decision = runtime.block_on(async {
             tokio::time::timeout(
                 self.binding.timeout,
-                self.binding.authority.authorize(facts),
+                self.binding.authority.authorize(facts.clone()),
             )
             .await
         });
         match decision {
-            Ok(Ok(AuthorityDecision::Allow)) => Ok(()),
-            Ok(Ok(AuthorityDecision::Deny)) => Err(rejected("DENIED")),
-            Ok(Err(_)) => Err(rejected("UNAVAILABLE")),
-            Err(_) => Err(rejected("TIMEOUT")),
+            Ok(Ok(AuthorityDecision::Allow)) => {
+                self.trace("authority_allowed");
+                Ok(facts)
+            }
+            Ok(Ok(AuthorityDecision::Deny)) => {
+                self.trace("authority_denied");
+                Err(rejected("DENIED"))
+            }
+            Ok(Err(_)) => {
+                self.trace("authority_unavailable");
+                Err(rejected("UNAVAILABLE"))
+            }
+            Err(_) => {
+                self.trace("authority_timeout");
+                Err(rejected("TIMEOUT"))
+            }
         }
     }
+}
+
+fn controlled_envelope(
+    challenge: &pay_core::client::x402::Challenge,
+    request: &ImmutableRequest,
+) -> Result<serde_json::Value, pay_core::Error> {
+    use pay_kit::x402::exact::PaymentExtensions;
+    use serde_json::Value;
+    let envelope = challenge
+        .payment_required
+        .as_ref()
+        .ok_or_else(|| rejected("MISSING_PAYMENT_REQUIRED"))?;
+    if envelope.get("x402Version").and_then(Value::as_u64) != Some(2) {
+        return Err(rejected("UNSUPPORTED_PAYMENT"));
+    }
+    let bytes =
+        serde_json::to_string(envelope).map_err(|_| rejected("INVALID_PAYMENT_REQUIRED"))?;
+    let parsed = pay_core::client::x402::parse(&[], Some(&bytes))
+        .ok_or_else(|| rejected("INVALID_PAYMENT_REQUIRED"))?;
+    let accepted = challenge.requirements.to_accepted_value();
+    let offers = envelope
+        .get("accepts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| rejected("INVALID_PAYMENT_REQUIRED"))?;
+    if parsed.x402_version != 2
+        || parsed.siwx.is_some()
+        || parsed.requirements.to_accepted_value() != accepted
+        || parsed.requirements.resource != challenge.requirements.resource
+        || parsed.requirements.resource_info() != challenge.requirements.resource_info()
+        || parsed.extensions != challenge.extensions
+        || offers.iter().filter(|offer| **offer == accepted).count() != 1
+    {
+        return Err(rejected("PAYMENT_REQUIRED_BINDING_MISMATCH"));
+    }
+    let resource = envelope
+        .get("resource")
+        .and_then(|value| value.get("url"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| rejected("INVALID_RESOURCE_BINDING"))?;
+    let resource =
+        reqwest::Url::parse(resource).map_err(|_| rejected("INVALID_RESOURCE_BINDING"))?;
+    let target =
+        reqwest::Url::parse(&request.url).map_err(|_| rejected("INVALID_RESOURCE_BINDING"))?;
+    if !matches!(resource.scheme(), "http" | "https")
+        || resource.origin() != target.origin()
+        || resource.path() != target.path()
+        || !resource.username().is_empty()
+        || resource.password().is_some()
+        || resource.fragment().is_some()
+        || resource
+            .query()
+            .is_some_and(|query| Some(query) != target.query())
+        || resource.as_str() != challenge.requirements.resource
+    {
+        return Err(rejected("INVALID_RESOURCE_BINDING"));
+    }
+    // Validate with the SDK, but retain the raw object: typed serialization can
+    // discard unknown nested fields. This profile echoes existing information
+    // only; required client-generated identifiers remain explicitly unsupported.
+    let extensions = PaymentExtensions::echoing(challenge.extensions.as_ref())
+        .map_err(|_| rejected("INVALID_PAYMENT_EXTENSIONS"))?;
+    if let Some(extensions) = extensions {
+        if extensions.requires_payment_identifier() {
+            return Err(rejected("UNSUPPORTED_REQUIRED_PAYMENT_IDENTIFIER"));
+        }
+        if serde_json::to_value(extensions).ok().as_ref() != challenge.extensions.as_ref() {
+            return Err(rejected("UNSUPPORTED_NORMALIZING_PAYMENT_EXTENSIONS"));
+        }
+    }
+    Ok(envelope.clone())
+}
+
+pub(crate) fn trace_execution(facts: &SpendRequest, stage: &'static str) {
+    tracing::info!(target: "pay_execution", version = 1, caller_id = %facts.caller_id,
+        operation_id = %facts.operation_id, attempt_id = %facts.attempt_id, stage);
 }
 
 pub(crate) fn unsupported() -> pay_core::Error {

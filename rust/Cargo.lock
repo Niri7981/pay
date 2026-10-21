@@ -5337,6 +5337,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "solana-pay-kit",
+ "solana-pubkey 3.0.0",
  "tempfile",
  "tokio",
  "tracing",

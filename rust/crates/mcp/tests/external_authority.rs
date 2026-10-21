@@ -100,6 +100,7 @@ impl ApprovalPolicy for Approval {
 }
 struct Context {
     authority: Option<Arc<Authority>>,
+    controller: Option<Arc<dyn pay_mcp::controlled::ControlledExecution>>,
     store: Arc<Store>,
     approval: Arc<AtomicUsize>,
     permissions: Option<Arc<McpPermissions>>,
@@ -121,6 +122,7 @@ impl Context {
             .insert("fixture".into(), ephemeral.account);
         Self {
             authority,
+            controller: None,
             store: Arc::new(Store {
                 inner: MemoryAccountsStore::with_file(file),
                 reads: AtomicUsize::new(0),
@@ -156,7 +158,12 @@ impl PayContext for Context {
             ));
         }
         Ok(self.authority.as_ref().map(|a| {
-            AuthorityBinding::new("trusted-agent-42", a.clone()).with_timeout(self.timeout)
+            let binding =
+                AuthorityBinding::new("trusted-agent-42", a.clone()).with_timeout(self.timeout);
+            match &self.controller {
+                Some(controller) => binding.with_controlled_execution(controller.clone()),
+                None => binding,
+            }
         }))
     }
 }
@@ -272,6 +279,65 @@ impl Merchant {
                         // Canonical CAIP-2-only rejection is tested separately, not hidden.
                         if mode == "exact-with-cluster" {
                             challenge["accepts"][0]["cluster"] = json!("mainnet");
+                        }
+                        if mode == "mainnet-metadata" {
+                            // Public Agent402 quote shape observed 2026-10-20:
+                            // canonical Mainnet USDC, optional memo absent, and
+                            // metadata extensions. No public network is used here.
+                            challenge["accepts"] = json!([
+                                {"scheme":"exact","network":"eip155:8453","asset":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                                 "amount":"1000","payTo":"0xaBF4FAbd7c416fB67202E5f9002389Fc75e2a9D0","maxTimeoutSeconds":300,"extra":{"name":"USD Coin","version":"2"}},
+                                {"scheme":"exact","network":"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                                "asset":MINT,"amount":"1000","payTo":"J7aN3PLJnTCF5qpEnvJHJsnCjcGuqC2rYtEM8Gv3xwg",
+                                "maxTimeoutSeconds":300,"extra":{"feePayer":"BENrLoUbndxoNMUS5JXApGMtNykLjFXXixMtpDwDR9SP"}}]);
+                            challenge["extensions"] = json!({"bazaar":{},"builder-code":{},"payment-identifier":{"info":{"required":false}}});
+                        }
+                        if mode.starts_with("agent402-") {
+                            challenge = serde_json::from_str(include_str!(
+                                "fixtures/agent402-mainnet-quote.json"
+                            ))
+                            .unwrap();
+                            // The response is served by the isolated merchant,
+                            // while preserving the public route-level shape.
+                            challenge["resource"]["url"] = json!(u);
+                            if mode == "agent402-required-id" {
+                                challenge["extensions"]["payment-identifier"]["info"]["required"] =
+                                    json!(true);
+                            }
+                            if mode == "agent402-invalid-required" {
+                                challenge["extensions"]["payment-identifier"]["info"]["required"] =
+                                    json!("false");
+                            }
+                            if mode == "agent402-normalizing-extension" {
+                                challenge["extensions"]["payment-identifier"]["info"]["unrecognized"] =
+                                    json!("must not disappear");
+                            }
+                            if mode == "agent402-same-query" {
+                                challenge["resource"]["url"] =
+                                    json!(format!("{u}?coins=BTC%2CETH%2CSOL&currency=usd"));
+                            }
+                            if mode == "agent402-other-origin" {
+                                challenge["resource"]["url"] = json!("https://other.example/data");
+                            }
+                            if mode == "agent402-other-query" {
+                                challenge["resource"]["url"] = json!(format!("{u}?coins=ETH"));
+                            }
+                            if mode == "agent402-other-path" {
+                                challenge["resource"]["url"] = json!(format!("{u}/other"));
+                            }
+                            if mode == "agent402-duplicate-offer" {
+                                let selected = challenge["accepts"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|offer| {
+                                        offer["network"]
+                                            == "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+                                    })
+                                    .unwrap()
+                                    .clone();
+                                challenge["accepts"].as_array_mut().unwrap().push(selected);
+                            }
                         }
                         (
                             "402 Payment Required",
@@ -565,5 +631,175 @@ async fn canonical_yaml_rejection_remains_fail_closed_without_a_fallback() {
     assert_eq!(a.calls.load(Ordering::SeqCst), 0);
     assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
     assert_eq!(c.approval.load(Ordering::SeqCst), 0);
+    assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+}
+
+struct CustodyBoundary {
+    fail: bool,
+}
+impl pay_mcp::controlled::ControlledExecution for CustodyBoundary {
+    fn plan(&self, _: &SpendRequest) -> pay_core::Result<pay_mcp::controlled::ExecutionPlan> {
+        if self.fail {
+            return Err(pay_core::Error::PaymentRejected(
+                "CONTROLLER_UNAVAILABLE".into(),
+            ));
+        }
+        Ok(pay_mcp::controlled::ExecutionPlan::Replay {
+            response: pay_mcp::controlled::ControlledResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: b"{\"fixture\":\"controller-delivery\"}".to_vec(),
+            },
+        })
+    }
+    fn execute(
+        &self,
+        _: &SpendRequest,
+        _: Value,
+    ) -> pay_core::Result<pay_mcp::controlled::ControlledResponse> {
+        panic!("replay cannot enter preparation or execution")
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn controlled_execution_never_loads_an_account_or_falls_back_to_pay_signing() {
+    for fail in [false, true] {
+        let m = Merchant::new("exact").await;
+        let mut c = Context::new(Some(Authority::new(Decision::Allow)));
+        c.controller = Some(Arc::new(CustodyBoundary { fail }));
+        let c = Arc::new(c);
+        let result = call(c.clone(), args(&m.url, Some("controlled"))).await;
+        assert_eq!(result.is_error, Some(fail));
+        assert!(text(&result).contains(if fail {
+            "CONTROLLER_UNAVAILABLE"
+        } else {
+            "controller-delivery"
+        }));
+        assert_eq!(m.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+        assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(c.approval.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mainnet_route_metadata_reaches_authority_without_account_or_signer_access() {
+    for mode in [
+        "exact",
+        "mainnet-metadata",
+        "agent402-public",
+        "agent402-same-query",
+    ] {
+        let m = Merchant::new(mode).await;
+        let authority = Authority::new(Decision::Allow);
+        let mut c = Context::new(Some(authority.clone()));
+        c.controller = Some(Arc::new(CustodyBoundary { fail: false }));
+        let c = Arc::new(c);
+        let url = format!("{}?coins=BTC%2CETH%2CSOL&currency=usd", m.url);
+        let result = call(
+            c.clone(),
+            json!({"url":url,"method":"GET","operation_id":mode}),
+        )
+        .await;
+        assert_eq!(result.is_error, Some(false));
+        assert!(text(&result).contains("controller-delivery"));
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        let facts = authority.facts.lock().unwrap();
+        assert_eq!(facts[0].request.url, url);
+        let envelope = facts[0].payment_required.as_ref().unwrap();
+        assert_eq!(
+            envelope["resource"]["url"].as_str().unwrap(),
+            if mode == "agent402-same-query" {
+                url.as_str()
+            } else {
+                m.url.as_str()
+            }
+        );
+        assert!(facts[0].request.url.contains("?coins="));
+        assert_eq!(
+            envelope["accepts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|offer| **offer == facts[0].accepted)
+                .count(),
+            1
+        );
+        if mode == "agent402-public" {
+            let mut public_quote: Value =
+                serde_json::from_str(include_str!("fixtures/agent402-mainnet-quote.json")).unwrap();
+            public_quote["resource"]["url"] = json!(m.url);
+            assert_eq!(
+                envelope, &public_quote,
+                "no route metadata, alternatives or extension fields may disappear"
+            );
+            assert_eq!(facts[0].amount_atomic, "1000");
+            assert_eq!(facts[0].asset, MINT);
+        }
+        assert_eq!(m.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+        assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(c.approval.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn controlled_quote_constraints_remain_terminal_before_authority() {
+    for mode in [
+        "agent402-required-id",
+        "agent402-invalid-required",
+        "agent402-normalizing-extension",
+        "agent402-other-origin",
+        "agent402-other-query",
+        "agent402-other-path",
+        "agent402-duplicate-offer",
+    ] {
+        let m = Merchant::new(mode).await;
+        let authority = Authority::new(Decision::Allow);
+        let mut context = Context::new(Some(authority.clone()));
+        context.controller = Some(Arc::new(CustodyBoundary { fail: false }));
+        let context = Arc::new(context);
+        let result = call(
+            context.clone(),
+            json!({"url":format!("{}?coins=BTC", m.url),"method":"GET","operation_id":mode}),
+        )
+        .await;
+        assert_eq!(result.is_error, Some(true), "{mode}");
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0, "{mode}");
+        assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+        assert_eq!(context.store.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(context.approval.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mainnet_multichain_quote_selects_native_solana_before_a_deny_only_probe() {
+    let m = Merchant::new("mainnet-metadata").await;
+    let authority = Authority::new(Decision::Deny);
+    let context = Arc::new(Context::new(Some(authority.clone())));
+    // No controller in this classifier-only probe. Deny is terminal; it is
+    // not an authority success or a Mainnet purchase integration claim.
+    let result = call(
+        context.clone(),
+        json!({"url":m.url,"method":"GET","operation_id":"quote-probe"}),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(text(&result).contains("DENIED"));
+    let facts = authority.facts.lock().unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].network, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+    assert_eq!(facts[0].asset, MINT);
+    assert_eq!(facts[0].amount_atomic, "1000");
+    assert!(facts[0].payment_required.is_none());
+    assert!(
+        serde_json::to_value(&facts[0])
+            .unwrap()
+            .get("payment_required")
+            .is_none(),
+        "the optional authority hook without custody keeps its existing wire facts"
+    );
+    assert!(facts[0].accepted["extra"].get("decimals").is_none());
+    assert_eq!(context.store.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(context.approval.load(Ordering::SeqCst), 0);
     assert_eq!(m.paid.load(Ordering::SeqCst), 0);
 }

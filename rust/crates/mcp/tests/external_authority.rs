@@ -106,6 +106,7 @@ struct Context {
     permissions: Option<Arc<McpPermissions>>,
     timeout: Duration,
     config_error: bool,
+    outbound_policy: pay_core::client::fetch::OutboundPolicy,
 }
 impl Context {
     fn new(authority: Option<Arc<Authority>>) -> Self {
@@ -131,6 +132,7 @@ impl Context {
             permissions: None,
             timeout: Duration::from_secs(2),
             config_error: false,
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         }
     }
 }
@@ -144,7 +146,7 @@ impl PayContext for Context {
             approval: Arc::new(Approval(self.approval.clone())),
             payment_permissions: self.permissions.clone(),
             body_files: false,
-            outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
+            outbound_policy: self.outbound_policy,
         })
     }
     fn spending_authority(
@@ -172,6 +174,7 @@ struct Merchant {
     probes: Arc<AtomicUsize>,
     paid: Arc<AtomicUsize>,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    authorizations: Arc<Mutex<Vec<Option<String>>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Merchant {
@@ -186,10 +189,12 @@ impl Merchant {
         let probes = Arc::new(AtomicUsize::new(0));
         let paid = Arc::new(AtomicUsize::new(0));
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let (p, q, b, u, mode) = (
+        let authorizations = Arc::new(Mutex::new(Vec::new()));
+        let (p, q, b, a, u, mode) = (
             probes.clone(),
             paid.clone(),
             bodies.clone(),
+            authorizations.clone(),
             url.clone(),
             mode.to_string(),
         );
@@ -224,8 +229,11 @@ impl Merchant {
                     raw.extend_from_slice(&buf[..n]);
                 }
                 b.lock().unwrap().push(raw[end..].to_vec());
+                a.lock()
+                    .unwrap()
+                    .push(headers.get("authorization").cloned());
                 assert!(
-                    !headers.contains_key("authorization"),
+                    mode == "free-with-auth" || !headers.contains_key("authorization"),
                     "cached authorization escaped the authority path"
                 );
                 let (status, extra, body) = if let Some(header) = headers.get("payment-signature") {
@@ -259,7 +267,7 @@ impl Merchant {
                             format!("Location: {u}?redirected=1\r\n"),
                             "redirect".into(),
                         )
-                    } else if mode == "free" {
+                    } else if mode == "free" || mode == "free-with-auth" {
                         ("200 OK", String::new(), "free fixture".into())
                     } else if mode == "mpp" {
                         let request = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({"amount":"10000","currency":MINT,"recipient":RECIPIENT,"methodDetails":{"network":"mainnet"}}).to_string());
@@ -361,6 +369,7 @@ impl Merchant {
             probes,
             paid,
             bodies,
+            authorizations,
             task,
         }
     }
@@ -511,6 +520,88 @@ async fn missing_id_and_prefilled_payment_credentials_fail_before_probe() {
         assert_eq!(result.is_error, Some(true));
         assert_eq!(m.probes.load(Ordering::SeqCst), 0);
         assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn url_credentials_are_rejected_before_http_under_every_outbound_policy() {
+    use pay_core::client::fetch::OutboundPolicy;
+
+    for policy in [
+        OutboundPolicy::Unrestricted,
+        OutboundPolicy::PublicInternetOnly,
+    ] {
+        for userinfo in ["user:password", "user", ":password", "%75ser:p%40ssword"] {
+            let m = Merchant::new("free-with-auth").await;
+            let a = Authority::new(Decision::Deny);
+            let mut c = Context::new(Some(a.clone()));
+            c.outbound_policy = policy;
+            let c = Arc::new(c);
+            let url = m.url.replacen("://", &format!("://{userinfo}@"), 1);
+            let result = call(c.clone(), args(&url, Some("url-credentials"))).await;
+
+            assert_eq!(
+                m.probes.load(Ordering::SeqCst),
+                0,
+                "{policy:?}: URL userinfo {userinfo:?} reached HTTP with Authorization {:?}; authority calls: {}; result: {}",
+                m.authorizations.lock().unwrap(),
+                a.calls.load(Ordering::SeqCst),
+                text(&result),
+            );
+            assert_eq!(result.is_error, Some(true));
+            assert!(text(&result).contains("PREFILLED_CREDENTIAL"));
+            assert!(m.authorizations.lock().unwrap().is_empty());
+            assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+            assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+            assert_eq!(c.approval.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_authority_preserves_url_basic_auth_on_unrestricted_requests() {
+    for (userinfo, credentials) in [
+        ("user:password", "user:password"),
+        ("user", "user:"),
+        (":password", ":password"),
+        ("%75ser:p%40ssword", "user:p@ssword"),
+    ] {
+        let m = Merchant::new("free-with-auth").await;
+        let c = Arc::new(Context::new(None));
+        let url = m.url.replacen("://", &format!("://{userinfo}@"), 1);
+        let result = call(c, args(&url, None)).await;
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(m.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *m.authorizations.lock().unwrap(),
+            vec![Some(format!("Basic {}", STANDARD.encode(credentials)))],
+        );
+        assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_authority_preserves_public_outbound_restrictions() {
+    for userinfo in [None, Some("user:password"), Some("user"), Some(":password")] {
+        let m = Merchant::new("free-with-auth").await;
+        let mut c = Context::new(None);
+        c.outbound_policy = pay_core::client::fetch::OutboundPolicy::PublicInternetOnly;
+        let url = match userinfo {
+            Some(userinfo) => m.url.replacen("://", &format!("://{userinfo}@"), 1),
+            None => m.url.clone(),
+        };
+        let result = call(Arc::new(c), args(&url, None)).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(text(&result).contains(match userinfo {
+            Some(_) => "Hosted curl does not allow credentials in destination URLs",
+            None => "non-public",
+        }));
+        assert_eq!(m.probes.load(Ordering::SeqCst), 0);
+        assert!(m.authorizations.lock().unwrap().is_empty());
+        assert_eq!(m.paid.load(Ordering::SeqCst), 0);
     }
 }
 #[tokio::test(flavor = "multi_thread")]

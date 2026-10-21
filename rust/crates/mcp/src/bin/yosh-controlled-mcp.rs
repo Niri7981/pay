@@ -152,6 +152,30 @@ impl PayContext for Bridge {
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--unsigned-preflight") {
+        if std::env::args().len() != 2 {
+            return Err("INVALID_PREFLIGHT_ARGUMENTS".into());
+        }
+        let result = tokio::task::spawn_blocking(|| {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(131_073)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "PREFLIGHT_INPUT_UNAVAILABLE")?;
+            if bytes.len() > 131_072 {
+                return Err("PREFLIGHT_INPUT_TOO_LARGE");
+            }
+            let input = serde_json::from_slice(&bytes).map_err(|_| "INVALID_PREFLIGHT_INPUT")?;
+            pay_mcp::controlled::unsigned_preflight(input)
+        })
+        .await?;
+        let output = match result {
+            Ok(value) => json!({"ok": true, "result": value}),
+            Err(code) => json!({"ok": false, "code": code}),
+        };
+        println!("{output}");
+        return Ok(());
+    }
     // Only the fixed execution-stage fields are exported; other libraries may
     // log requests or credentials and must remain disabled in this host.
     tracing_subscriber::fmt()

@@ -37,6 +37,51 @@ pub struct ControlledLifetime {
     pub recent_blockhash: String,
     pub last_valid_block_height: String,
 }
+
+/// Inspection only: the same classifier and unsigned builder used by curl.
+/// No authority, account store, signer, controller or paid transport is reachable.
+pub fn unsigned_preflight(input: Value) -> SafeResult<Value> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Input {
+        payer: String,
+        rpc_url: String,
+        lifetime: ControlledLifetime,
+        url: String,
+        payment_required: Value,
+    }
+    let input: Input = serde_json::from_value(input).map_err(|_| "INVALID_PREFLIGHT_INPUT")?;
+    let url = reqwest::Url::parse(&input.url).map_err(|_| "INVALID_RESOURCE_URL")?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("INVALID_RESOURCE_URL");
+    }
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&input.payment_required).map_err(|_| "INVALID_CHALLENGE")?);
+    let outcome = pay_core::client::runner::classify_402(
+        &[("payment-required".into(), encoded)],
+        None,
+        &input.url,
+    );
+    let pay_core::client::runner::RunOutcome::X402Challenge { challenge, .. } = outcome else {
+        return Err("UNSUPPORTED_CHALLENGE");
+    };
+    if challenge.x402_version != 2 || challenge.siwx.is_some() {
+        return Err("UNSUPPORTED_CHALLENGE");
+    }
+    let accepted = challenge.requirements.to_accepted_value();
+    let unsigned = prepare_with_lifetime(
+        input.payer,
+        input.rpc_url,
+        accepted.clone(),
+        Some(input.lifetime),
+    )?;
+    Ok(json!({"accepted": accepted, "unsigned": unsigned}))
+}
 /// Configured by the trusted host alongside SpendingAuthority. Implementations
 /// must return only credential-free delivery after independently checking the
 /// original payment. Errors and lost replies never authorize a replacement.
@@ -328,6 +373,33 @@ mod tests {
         json!({"scheme":"exact","network":SOLANA_MAINNET,"asset":MAINNET_USDC,"amount":"1000",
             "payTo":"J7aN3PLJnTCF5qpEnvJHJsnCjcGuqC2rYtEM8Gv3xwg","maxTimeoutSeconds":300,
             "extra":{"feePayer":"BENrLoUbndxoNMUS5JXApGMtNykLjFXXixMtpDwDR9SP"}})
+    }
+
+    #[test]
+    fn readonly_preflight_uses_real_classifier_and_builder_with_optional_decimals() {
+        let challenge: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/agent402-mainnet-quote.json"
+        ))
+        .unwrap();
+        let input = json!({"payer":"11111111111111111111111111111111",
+            "rpcUrl":"https://no-egress.invalid/", "lifetime":{"recentBlockhash":"11111111111111111111111111111111","lastValidBlockHeight":"5000"},
+            "url":"https://agent402.tools/api/crypto-price?coins=BTC%2CETH%2CSOL&currency=usd", "paymentRequired":challenge});
+        let result = unsigned_preflight(input.clone()).unwrap();
+        assert_eq!(result["accepted"]["amount"], "1000");
+        assert_eq!(result["accepted"]["asset"], MAINNET_USDC);
+        let transaction =
+            pay_kit::core::tx::decode(result["unsigned"]["transaction"].as_str().unwrap()).unwrap();
+        assert!(
+            transaction
+                .signatures
+                .iter()
+                .all(|s| s.as_ref().iter().all(|b| *b == 0))
+        );
+        let mut changed = input;
+        changed["paymentRequired"]["accepts"] = json!([{"scheme":"exact","network":SOLANA_MAINNET,"asset":DEVNET_USDC,
+            "amount":"1000","payTo":"J7aN3PLJnTCF5qpEnvJHJsnCjcGuqC2rYtEM8Gv3xwg","maxTimeoutSeconds":300,
+            "extra":{"feePayer":"BENrLoUbndxoNMUS5JXApGMtNykLjFXXixMtpDwDR9SP"}}]);
+        assert!(unsigned_preflight(changed).is_err());
     }
 
     #[test]

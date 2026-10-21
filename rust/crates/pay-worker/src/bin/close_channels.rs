@@ -603,9 +603,15 @@ async fn plan_steps(
                     instructions: vec![channel::build_seal_ix(&address)],
                     effect: "permissionlessly seal the channel (grace elapsed)".into(),
                 });
-                let dist =
-                    build_distribute_step(rpc, rpc_url, decoded, treasury_owner, &token_program)
-                        .await?;
+                let dist = build_distribute_step(
+                    rpc,
+                    rpc_url,
+                    decoded,
+                    &me,
+                    treasury_owner,
+                    &token_program,
+                )
+                .await?;
                 steps.push(dist);
             } else {
                 info!(
@@ -617,8 +623,9 @@ async fn plan_steps(
             }
         }
         STATUS_SEALED => {
-            let dist = build_distribute_step(rpc, rpc_url, decoded, treasury_owner, &token_program)
-                .await?;
+            let dist =
+                build_distribute_step(rpc, rpc_url, decoded, &me, treasury_owner, &token_program)
+                    .await?;
             steps.push(dist);
         }
         STATUS_DISTRIBUTED => {
@@ -658,6 +665,7 @@ async fn build_distribute_step(
     rpc: &RpcClient,
     rpc_url: &str,
     decoded: &DecodedChannel,
+    fee_payer: &Pubkey,
     treasury_owner: &Pubkey,
     token_program: &Pubkey,
 ) -> Result<PlannedStep, JobError> {
@@ -677,7 +685,10 @@ async fn build_distribute_step(
     );
     Ok(PlannedStep {
         kind: StepKind::Distribute,
-        instructions: vec![ix],
+        instructions: vec![
+            channel::payer_refund_account_ix(fee_payer, decoded, token_program),
+            ix,
+        ],
         effect: format!("refund payer + pay {recipients} recipient(s) + tombstone channel"),
     })
 }

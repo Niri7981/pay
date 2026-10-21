@@ -187,7 +187,7 @@ fn apply_json(
     // Usage objects: OpenAI-compat (`prompt_tokens`/`completion_tokens`),
     // Anthropic (`input_tokens`/`output_tokens` — top-level on plain bodies
     // and `message_delta` events, nested under `message` on `message_start`;
-    // output counts are cumulative, so later values overwrite).
+    // counts are cumulative, so a later lower value never lowers them).
     for u in [
         json.get("usage"),
         json.pointer("/message/usage"),
@@ -202,25 +202,23 @@ fn apply_json(
             .or_else(|| u.get("input_tokens"))
             .and_then(|v| v.as_u64())
         {
-            usage.tokens_prompt = Some(prompt);
+            record_cumulative(&mut usage.tokens_prompt, prompt);
         }
         if let Some(completion) = u
             .get("completion_tokens")
             .or_else(|| u.get("output_tokens"))
             .and_then(|v| v.as_u64())
         {
-            usage.tokens_completion = Some(completion);
-            *authoritative = true;
+            record_authoritative_completion(usage, authoritative, completion);
         }
     }
 
     // Ollama-native counters (final `done: true` object or plain body).
     if let Some(prompt) = json.get("prompt_eval_count").and_then(|v| v.as_u64()) {
-        usage.tokens_prompt = Some(prompt);
+        record_cumulative(&mut usage.tokens_prompt, prompt);
     }
     if let Some(completion) = json.get("eval_count").and_then(|v| v.as_u64()) {
-        usage.tokens_completion = Some(completion);
-        *authoritative = true;
+        record_authoritative_completion(usage, authoritative, completion);
     }
 
     // Content-bearing stream events approximate completion tokens (~1 token
@@ -243,6 +241,25 @@ fn apply_json(
     }
 }
 
+fn record_cumulative(slot: &mut Option<u64>, value: u64) {
+    *slot = Some(slot.map_or(value, |current| current.max(value)));
+}
+
+/// The first authoritative count replaces the content-event approximation;
+/// later authoritative counts can only raise it.
+fn record_authoritative_completion(
+    usage: &mut InferenceUsage,
+    authoritative: &mut bool,
+    value: u64,
+) {
+    if *authoritative {
+        record_cumulative(&mut usage.tokens_completion, value);
+    } else {
+        usage.tokens_completion = Some(value);
+        *authoritative = true;
+    }
+}
+
 fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
@@ -259,6 +276,39 @@ mod tests {
         let anchor = start();
         observer.on_chunk(body.as_bytes(), anchor);
         observer.finish();
+    }
+
+    #[test]
+    fn decreasing_cumulative_usage_never_lowers_observed_tokens() {
+        let mut obs = StreamObserver::new(true);
+        feed_all(
+            &mut obs,
+            concat!(
+                "data: {\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":1000}}\n\n",
+                "data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            ),
+        );
+        assert_eq!(obs.usage.tokens_completion, Some(1000));
+        assert_eq!(obs.usage.tokens_prompt, Some(50));
+    }
+
+    #[test]
+    fn first_authoritative_count_replaces_a_higher_approximation() {
+        let mut obs = StreamObserver::new(true);
+        let anchor = start();
+        for _ in 0..5 {
+            obs.on_chunk(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+                anchor,
+            );
+        }
+        assert_eq!(obs.usage.tokens_completion, Some(5));
+        obs.on_chunk(
+            b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
+            anchor,
+        );
+        obs.finish();
+        assert_eq!(obs.usage.tokens_completion, Some(3));
     }
 
     #[test]

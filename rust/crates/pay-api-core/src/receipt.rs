@@ -16,11 +16,13 @@ use pay_api_types::{
 };
 use serde_json::Value;
 
-use crate::channel_state::{ChannelState, ChannelStatus, fetch_channel};
+use crate::channel_state::{ChannelState, fetch_channel};
 use crate::error::{Error, Result};
 use crate::rpc::RpcClient;
 use crate::stablecoin::Stablecoin;
-use crate::subscription_state::{fetch_recurring_delegation, period_label};
+use crate::subscription_state::{
+    SubscriptionDelegationState, fetch_subscription_delegation, period_label,
+};
 use crate::token_metadata::{TokenMetadata, resolve_mints};
 
 /// Canonical SPL memo program v2.
@@ -42,16 +44,23 @@ pub const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 /// Discriminators that — on either the multi-delegator OR the subscriptions
 /// program — denote the subscription intent rather than the pull-mode session
 /// intent. Used by the classifier to decide which intent kind to emit.
-const SUBSCRIPTION_DISCRIMINATORS: &[u8] = &[
-    0,  // initializeSubscriptionAuthority
-    6,  // closeSubscriptionAuthority
-    7,  // createPlan
-    8,  // updatePlan
-    9,  // deletePlan
-    10, // transferSubscription (renew)
-    11, // subscribe
-    12, // cancelSubscription
-];
+const SUBSCRIPTION_DISCRIMINATORS: &[u8] = {
+    use pay_kit::generated::subscriptions::instructions::*;
+    &[
+        INIT_SUBSCRIPTION_AUTHORITY_DISCRIMINATOR,
+        CLOSE_SUBSCRIPTION_AUTHORITY_DISCRIMINATOR,
+        CREATE_PLAN_DISCRIMINATOR,
+        UPDATE_PLAN_DISCRIMINATOR,
+        DELETE_PLAN_DISCRIMINATOR,
+        TRANSFER_SUBSCRIPTION_DISCRIMINATOR,
+        SUBSCRIBE_DISCRIMINATOR,
+        CANCEL_SUBSCRIPTION_DISCRIMINATOR,
+        RESUME_SUBSCRIPTION_DISCRIMINATOR,
+        REVOKE_SUBSCRIPTION_AUTHORITY_DISCRIMINATOR,
+        REVOKE_ABANDONED_SUBSCRIPTION_DISCRIMINATOR,
+        CANCEL_SUBSCRIPTION_NOW_DISCRIMINATOR,
+    ]
+};
 
 const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -83,12 +92,18 @@ pub async fn build_receipt(
     // the same getTransaction response.
     if matches!(receipt.intent.kind, ReceiptIntentKind::MppSession) {
         let ata_owners = collect_ata_owners(rpc_value);
-        reconcile_session_via_balances(&mut receipt, &ata_owners);
+        let payer = payment_channel_payer(rpc_value);
+        reconcile_session_via_balances(&mut receipt, &ata_owners, payer.as_ref());
 
         // Best-effort: if the channel is still open, decode its state to
         // attach the on-chain `payer`, `payee`, and `status`.
-        let candidates = session_account_candidates(rpc_value);
-        if !candidates.is_empty()
+        let candidates = match payment_channel_accounts(top_level_instructions(rpc_value)) {
+            channels if channels.len() == 1 => channels,
+            channels if channels.is_empty() => session_account_candidates(rpc_value),
+            _ => Vec::new(),
+        };
+        if receipt.session.is_some()
+            && !candidates.is_empty()
             && let Ok(Some(channel)) = fetch_channel(rpc, rpc_url, &candidates).await
         {
             attach_channel_state(&mut receipt, &channel);
@@ -96,17 +111,19 @@ pub async fn build_receipt(
     }
 
     if matches!(receipt.intent.kind, ReceiptIntentKind::MppSubscription) {
-        // Try to find the RecurringDelegation PDA in the instruction's
-        // accounts list and decode period_hours / amount / start / expiry.
-        let candidates = session_account_candidates(rpc_value);
-        if !candidates.is_empty()
-            && let Ok(Some(state)) = fetch_recurring_delegation(rpc, rpc_url, &candidates).await
+        // Decode the SubscriptionDelegation the instruction names by role.
+        if let Some((subscription, plan)) =
+            subscription_delegation_accounts(rpc_value, receipt.intent.program_id.as_deref())
+            && let Some(program_id) = receipt.intent.program_id.clone()
+            && let Ok(Some(state)) =
+                fetch_subscription_delegation(rpc, rpc_url, &program_id, &subscription, &plan).await
         {
-            let mint = state.mint.to_string();
-            if !metadata.contains_key(&mint) {
+            if let Some(mint) = state.mint.map(|mint| mint.to_string())
+                && !metadata.contains_key(&mint)
+            {
                 metadata.extend(resolve_mints(rpc, rpc_url, network, stablecoins, &[mint]).await);
             }
-            attach_recurring_delegation_state(&mut receipt, &state);
+            attach_subscription_delegation_state(&mut receipt, &state);
         }
         if let Some(ref mut subscription) = receipt.subscription {
             attach_subscription_metadata(subscription, &metadata);
@@ -151,34 +168,147 @@ fn collect_ata_owners(rpc_value: &Value) -> BTreeMap<String, String> {
     map
 }
 
-/// Reclassify session events using `ata_owners` so we can tell apart:
+fn top_level_instructions(rpc_value: &Value) -> &[Value] {
+    rpc_value
+        .pointer("/transaction/message/instructions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// Distinct channel PDAs named by top-level payment-channels lifecycle
+/// instructions, by account role (mirrors pay-kit's `channels_in_message`).
+fn payment_channel_accounts(top: &[Value]) -> Vec<String> {
+    use pay_kit::generated::payment_channels::instructions::{
+        DISTRIBUTE_DISCRIMINATOR, OPEN_DISCRIMINATOR, RECLAIM_DISCRIMINATOR,
+        REQUEST_CLOSE_DISCRIMINATOR, SEAL_DISCRIMINATOR, SETTLE_AND_SEAL_DISCRIMINATOR,
+        SETTLE_DISCRIMINATOR, TOP_UP_DISCRIMINATOR, WITHDRAW_PAYER_DISCRIMINATOR,
+    };
+    let mut channels: Vec<String> = Vec::new();
+    for ix in top {
+        if ix.get("programId").and_then(Value::as_str) != Some(PAYMENT_CHANNELS_PROGRAM) {
+            continue;
+        }
+        let slot = match ix
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(first_data_byte)
+        {
+            Some(OPEN_DISCRIMINATOR) => 5,
+            Some(
+                TOP_UP_DISCRIMINATOR
+                | SETTLE_AND_SEAL_DISCRIMINATOR
+                | REQUEST_CLOSE_DISCRIMINATOR
+                | WITHDRAW_PAYER_DISCRIMINATOR,
+            ) => 1,
+            Some(
+                SETTLE_DISCRIMINATOR
+                | DISTRIBUTE_DISCRIMINATOR
+                | SEAL_DISCRIMINATOR
+                | RECLAIM_DISCRIMINATOR,
+            ) => 0,
+            _ => continue,
+        };
+        if let Some(channel) = ix
+            .get("accounts")
+            .and_then(Value::as_array)
+            .and_then(|accounts| accounts.get(slot))
+            .and_then(Value::as_str)
+            && !channels.iter().any(|known| known == channel)
+        {
+            channels.push(channel.to_string());
+        }
+    }
+    channels
+}
+
+/// The channel payer as named by a payment-channels instruction's account
+/// roles, with the payer token account when the instruction moves funds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelPayer {
+    wallet: String,
+    token_account: Option<String>,
+}
+
+/// Resolve the payer from the first top-level payment-channels instruction
+/// that names it.
+fn payment_channel_payer(rpc_value: &Value) -> Option<ChannelPayer> {
+    use pay_kit::generated::payment_channels::instructions::{
+        DISTRIBUTE_DISCRIMINATOR, OPEN_DISCRIMINATOR, REQUEST_CLOSE_DISCRIMINATOR,
+        TOP_UP_DISCRIMINATOR, WITHDRAW_PAYER_DISCRIMINATOR,
+    };
+    let top = rpc_value
+        .pointer("/transaction/message/instructions")
+        .and_then(Value::as_array)?;
+    for ix in top {
+        if ix.get("programId").and_then(Value::as_str) != Some(PAYMENT_CHANNELS_PROGRAM) {
+            continue;
+        }
+        let Some(discriminator) = ix
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(first_data_byte)
+        else {
+            continue;
+        };
+        let (wallet_index, token_account_index) = match discriminator {
+            OPEN_DISCRIMINATOR => (0, Some(6)),
+            TOP_UP_DISCRIMINATOR => (0, Some(2)),
+            REQUEST_CLOSE_DISCRIMINATOR => (0, None),
+            DISTRIBUTE_DISCRIMINATOR => (1, Some(4)),
+            WITHDRAW_PAYER_DISCRIMINATOR => (0, Some(3)),
+            _ => continue,
+        };
+        let accounts = ix.get("accounts").and_then(Value::as_array)?;
+        let account = |index: usize| {
+            accounts
+                .get(index)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        return Some(ChannelPayer {
+            wallet: account(wallet_index)?,
+            token_account: token_account_index.and_then(account),
+        });
+    }
+    None
+}
+
+/// Reclassify session events using `ata_owners` and the instruction-bound
+/// `payer` so we can tell apart:
 ///
+/// - original payer refund (legs to the payer's token account or wallet)
 /// - operator's payee (fee_payer's wallet receives)
-/// - original payer refund (any non-operator wallet receiving from the channel)
 /// - platform splits / treasury (other recipients)
-fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<String, String>) {
+///
+/// Without a payer role the refund cannot be told apart from payouts, so the
+/// payer and totals are left unresolved rather than guessed.
+fn reconcile_session_via_balances(
+    receipt: &mut Receipt,
+    ata_owners: &BTreeMap<String, String>,
+    payer: Option<&ChannelPayer>,
+) {
     let Some(session) = receipt.session.as_mut() else {
         return;
     };
-    let operator = receipt.fee_payer.clone();
-
-    // First pass: classify based on operator/non-operator and accumulate
-    // totals per wallet to identify the largest non-operator refund.
-    let mut wallet_total: BTreeMap<String, u128> = BTreeMap::new();
-    for ev in &session.events {
-        let raw: u128 = ev.raw_amount.parse().unwrap_or(0);
-        let owner = ata_owners
-            .get(&ev.receiver)
-            .cloned()
-            .unwrap_or_else(|| ev.receiver.clone());
-        *wallet_total.entry(owner).or_default() += raw;
+    // Infer channel lifecycle from the action when the on-chain state isn't
+    // available (e.g. account already closed).
+    session.channel_status = Some(match session.action.as_str() {
+        "open" | "topUp" => WireChannelStatus::Open,
+        "requestClose" => WireChannelStatus::Closing,
+        "seal" | "settleAndSeal" | "withdrawPayer" => WireChannelStatus::Sealed,
+        "settle" | "distribute" => WireChannelStatus::Open,
+        _ => WireChannelStatus::Unknown,
+    });
+    // Only payouts leave the channel; open / topUp legs are deposits.
+    if !matches!(
+        session.action.as_str(),
+        "settle" | "settleAndSeal" | "distribute" | "seal" | "requestClose" | "withdrawPayer"
+    ) {
+        return;
     }
-
-    let payer_wallet = wallet_total
-        .iter()
-        .filter(|(w, _)| *w != &operator)
-        .max_by_key(|(_, raw)| **raw)
-        .map(|(w, _)| w.clone());
+    let operator = receipt.fee_payer.clone();
+    let payer_wallet = payer.map(|payer| payer.wallet.clone());
 
     let mut consumed_total: u128 = 0;
     let mut refunded_total: u128 = 0;
@@ -205,7 +335,9 @@ fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<S
             .get(&ev.receiver)
             .cloned()
             .unwrap_or_else(|| ev.receiver.clone());
-        let is_refund = matches!(&payer_wallet, Some(p) if p == &owner);
+        let is_refund = payer.is_some_and(|payer| {
+            payer.wallet == owner || payer.token_account.as_deref() == Some(ev.receiver.as_str())
+        });
         let is_consume = owner == operator;
         if is_refund {
             ev.kind = "refund".to_string();
@@ -231,11 +363,14 @@ fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<S
         }
     }
 
+    let unresolved = payer.is_none() && session.events.iter().any(|ev| ev.kind == "distribute");
+    if unresolved {
+        consumed_total = 0;
+        refunded_total = 0;
+    }
     session.payer = payer_wallet.clone();
     // For settle / seal / distribute, the wallet receiving the operator's
-    // leg is the fee_payer — they signed the transaction. For open / topUp
-    // the original `build_session` value already represents the channel-ATA
-    // owner, which is the channel PDA; leave it untouched in that case.
+    // leg is the fee_payer — they signed the transaction.
     let action_acts_as_operator = matches!(
         session.action.as_str(),
         "settle" | "settleAndSeal" | "distribute" | "seal" | "requestClose"
@@ -263,10 +398,12 @@ fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<S
     // Re-derive distributed[] from the consume + distribute events so the
     // refund leg is excluded from the operator-side breakdown.
     let mut by_recipient: BTreeMap<String, u128> = BTreeMap::new();
-    for ev in &session.events {
-        if ev.kind == "consume" || ev.kind == "distribute" {
-            let raw: u128 = ev.raw_amount.parse().unwrap_or(0);
-            *by_recipient.entry(ev.receiver.clone()).or_default() += raw;
+    if !unresolved {
+        for ev in &session.events {
+            if ev.kind == "consume" || ev.kind == "distribute" {
+                let raw: u128 = ev.raw_amount.parse().unwrap_or(0);
+                *by_recipient.entry(ev.receiver.clone()).or_default() += raw;
+            }
         }
     }
     let grand = consumed_total.max(1);
@@ -282,16 +419,6 @@ fn reconcile_session_via_balances(receipt: &mut Receipt, ata_owners: &BTreeMap<S
             }
         })
         .collect();
-
-    // Infer channel lifecycle from the action when the on-chain state isn't
-    // available (e.g. account already closed).
-    session.channel_status = Some(match session.action.as_str() {
-        "open" | "topUp" => WireChannelStatus::Open,
-        "requestClose" => WireChannelStatus::Closing,
-        "seal" | "settleAndSeal" | "withdrawPayer" => WireChannelStatus::Sealed,
-        "settle" | "distribute" => WireChannelStatus::Open,
-        _ => WireChannelStatus::Unknown,
-    });
 }
 
 fn attach_channel_state(receipt: &mut Receipt, channel: &ChannelState) {
@@ -299,53 +426,66 @@ fn attach_channel_state(receipt: &mut Receipt, channel: &ChannelState) {
         return;
     };
     session.channel = Some(channel.address.clone());
-    session.channel_status = Some(match channel.status {
-        ChannelStatus::Open => WireChannelStatus::Open,
-        ChannelStatus::Closing => WireChannelStatus::Closing,
-        ChannelStatus::Sealed => WireChannelStatus::Sealed,
-        ChannelStatus::Unknown => WireChannelStatus::Unknown,
-    });
-    // The on-chain Channel struct is authoritative for payer / payee when the
-    // account is still open.
+    // The live account may be newer than this transaction, so only its
+    // immutable parties are attached; `channel_status` stays the one implied
+    // by the transaction's own action.
     session.payer = Some(channel.payer.to_string());
     session.payee = Some(channel.payee.to_string());
 }
 
 /// Fill in subscription fields that can only be read from the on-chain
-/// RecurringDelegation account: subscriber, per-period amount, period length
-/// and expiry. Mirrors the channel-state pattern so the skeleton stays
-/// usable without the RPC round-trip.
-fn attach_recurring_delegation_state(
+/// SubscriptionDelegation account. Mirrors the channel-state pattern so the
+/// skeleton stays usable without the RPC round-trip.
+///
+/// The account is read live, so its period and expiry are only attached
+/// while the transaction still falls inside the live current period; once
+/// the subscription has moved on they describe a later state.
+fn attach_subscription_delegation_state(
     receipt: &mut Receipt,
-    state: &crate::subscription_state::RecurringDelegationState,
+    state: &SubscriptionDelegationState,
 ) {
+    let block_time = receipt.block_time;
     let Some(subscription) = receipt.subscription.as_mut() else {
         return;
     };
     subscription.subscription_id = Some(state.address.clone());
-    if subscription.subscriber.is_none() {
-        subscription.subscriber = Some(state.subscriber.to_string());
+    subscription.plan = Some(state.plan.to_string());
+    // The delegator is the subscriber; the transfer authority the skeleton
+    // guessed may be the puller or the subscription-authority PDA.
+    let subscriber = state.subscriber.to_string();
+    if let Some(guessed) = subscription.subscriber.replace(subscriber.clone())
+        && guessed != subscriber
+    {
+        for event in &mut subscription.events {
+            if event.sender == guessed {
+                event.sender = subscriber.clone();
+            }
+        }
     }
 
-    let period_hours = state.period_length_s / 3600;
+    let period_hours = state.period_hours;
     if period_hours > 0 {
         subscription.period_hours = Some(period_hours);
         subscription.period_label = Some(period_label(period_hours));
     }
-    if state.current_period_start_ts > 0 {
-        subscription.period_start_ts = Some(state.current_period_start_ts);
-        subscription.period_end_ts = Some(
-            state
-                .current_period_start_ts
-                .saturating_add(state.period_length_s as i64),
-        );
+    let period_start = state.current_period_start_ts;
+    let period_end =
+        period_start.saturating_add(period_hours.saturating_mul(3600).min(i64::MAX as u64) as i64);
+    let in_live_period = period_start > 0
+        && block_time.is_some_and(|time| period_start <= time && time < period_end);
+    if in_live_period {
+        subscription.period_start_ts = Some(period_start);
+        subscription.period_end_ts = Some(period_end);
+        if state.expires_at_ts > 0 && subscription.status == SubscriptionStatus::Cancelled {
+            subscription.expires_at_ts = Some(state.expires_at_ts);
+        }
     }
-    if state.expiry_ts > 0 {
-        subscription.expires_at_ts = Some(state.expiry_ts);
-    }
-    if subscription.period_amount.is_none() && state.amount_per_period > 0 {
+    if subscription.period_amount.is_none()
+        && state.amount_per_period > 0
+        && let Some(mint) = state.mint
+    {
         subscription.period_amount = Some(ReceiptAmount {
-            asset: state.mint.to_string(),
+            asset: mint.to_string(),
             symbol: None,
             name: None,
             logo_uri: None,
@@ -354,6 +494,56 @@ fn attach_recurring_delegation_state(
             ui_amount: state.amount_per_period as f64,
         });
     }
+}
+
+/// Account positions of `(subscriptionPda, planPda)` per subscriptions-program
+/// lifecycle instruction.
+fn subscription_account_roles(discriminator: u8) -> Option<(usize, usize)> {
+    use pay_kit::generated::subscriptions::instructions::*;
+    match discriminator {
+        TRANSFER_SUBSCRIPTION_DISCRIMINATOR => Some((0, 1)),
+        SUBSCRIBE_DISCRIMINATOR => Some((3, 2)),
+        CANCEL_SUBSCRIPTION_DISCRIMINATOR => Some((2, 1)),
+        RESUME_SUBSCRIPTION_DISCRIMINATOR => Some((2, 1)),
+        REVOKE_ABANDONED_SUBSCRIPTION_DISCRIMINATOR => Some((1, 3)),
+        CANCEL_SUBSCRIPTION_NOW_DISCRIMINATOR => Some((3, 2)),
+        _ => None,
+    }
+}
+
+/// The `(subscription, plan)` accounts of the first top-level subscription
+/// lifecycle instruction for `program_id`.
+fn subscription_delegation_accounts(
+    rpc_value: &Value,
+    program_id: Option<&str>,
+) -> Option<(String, String)> {
+    let program_id = program_id?;
+    if program_id != SUBSCRIPTIONS_PROGRAM && program_id != MULTI_DELEGATOR_PROGRAM {
+        return None;
+    }
+    let top = rpc_value
+        .pointer("/transaction/message/instructions")
+        .and_then(Value::as_array)?;
+    for ix in top {
+        if ix.get("programId").and_then(Value::as_str) != Some(program_id) {
+            continue;
+        }
+        let Some((subscription_index, plan_index)) = ix
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(first_data_byte)
+            .and_then(subscription_account_roles)
+        else {
+            continue;
+        };
+        let accounts = ix.get("accounts").and_then(Value::as_array)?;
+        let account = |index: usize| accounts.get(index).and_then(Value::as_str);
+        return Some((
+            account(subscription_index)?.to_string(),
+            account(plan_index)?.to_string(),
+        ));
+    }
+    None
 }
 
 fn attach_subscription_metadata(
@@ -484,6 +674,17 @@ pub fn build_receipt_skeleton(
         // settle/distribute in particular — still surface instead of an empty receipt.
         transfers = extract_transfers_from_balances(rpc_value, stablecoins);
         balance_fallback_count = transfers.len();
+    } else {
+        // Parsed instructions name token accounts; report their owners like
+        // the balance-delta path does.
+        let owners = collect_ata_owners(rpc_value);
+        for transfer in &mut transfers {
+            for party in [&mut transfer.sender, &mut transfer.receiver] {
+                if let Some(owner) = owners.get(party.as_str()) {
+                    *party = owner.clone();
+                }
+            }
+        }
     }
     transfers.extend(extract_sol_transfers(
         &top_instructions,
@@ -506,7 +707,11 @@ pub fn build_receipt_skeleton(
 
     let total = aggregate_total(&transfers);
 
+    // A transaction settling several channels has no single session: its
+    // transfers stay transaction-level instead of being merged into one.
+    let channels = payment_channel_accounts(&top_instructions);
     let session = match intent.kind {
+        ReceiptIntentKind::MppSession if channels.len() > 1 => None,
         ReceiptIntentKind::MppSession => Some(build_session(
             intent
                 .action
@@ -887,10 +1092,7 @@ fn is_transfer_ix(ix: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("");
     if program == SPL_TOKEN_PROGRAM || program == TOKEN_2022_PROGRAM {
-        return matches!(
-            kind,
-            "transfer" | "transferChecked" | "mintTo" | "mintToChecked"
-        );
+        return matches!(kind, "transfer" | "transferChecked");
     }
     if program == SYSTEM_PROGRAM {
         return matches!(kind, "transfer" | "transferChecked");
@@ -999,11 +1201,9 @@ fn extract_token_transfers(
             Some(value) => value,
             None => continue,
         };
+        // Issuance (`mintTo*`) debits no payer, so it is never a payment.
         let kind = parsed.get("type").and_then(Value::as_str).unwrap_or("");
-        if !matches!(
-            kind,
-            "transfer" | "transferChecked" | "mintTo" | "mintToChecked"
-        ) {
+        if !matches!(kind, "transfer" | "transferChecked") {
             continue;
         }
         let info = match parsed.get("info") {
@@ -1427,12 +1627,14 @@ fn build_subscription(
     let status = match action.as_str() {
         "subscribe" => SubscriptionStatus::Active,
         "renew" => SubscriptionStatus::Renewed,
-        "cancel" => SubscriptionStatus::Cancelled,
+        "resume" => SubscriptionStatus::Active,
+        "cancel" | "cancelNow" | "revokeAbandonedSubscription" => SubscriptionStatus::Cancelled,
         "createPlan"
         | "updatePlan"
         | "deletePlan"
         | "initSubscriptionAuthority"
-        | "closeSubscriptionAuthority" => SubscriptionStatus::Admin,
+        | "closeSubscriptionAuthority"
+        | "revokeSubscriptionAuthority" => SubscriptionStatus::Admin,
         _ => SubscriptionStatus::Unknown,
     };
 
@@ -1576,6 +1778,11 @@ fn subscription_or_session_label(byte: u8) -> String {
         10 => "renew".to_string(),
         11 => "subscribe".to_string(),
         12 => "cancel".to_string(),
+        13 => "resume".to_string(),
+        14 => "revokeSubscriptionAuthority".to_string(),
+        15 => "revokeAbandonedDelegation".to_string(),
+        16 => "revokeAbandonedSubscription".to_string(),
+        17 => "cancelNow".to_string(),
         228 => "emitEvent".to_string(),
         other => format!("ix-{other}"),
     }
@@ -1688,7 +1895,10 @@ fn build_session(
     top_instructions: &[Value],
     account_keys: &[String],
 ) -> ReceiptSession {
-    let channel = extract_session_channel(top_instructions, account_keys, program_id.as_deref());
+    let channel = payment_channel_accounts(top_instructions)
+        .into_iter()
+        .next()
+        .or_else(|| extract_session_channel(top_instructions, account_keys, program_id.as_deref()));
 
     // For `open`: the sender of the deposit is the original payer.
     // For `settle`/`distribute`/`seal`: the channel sends to recipients
@@ -1719,7 +1929,9 @@ fn build_session(
         ),
         "initMultiDelegate" | "createFixedDelegation" => (Some(fee_payer.to_string()), None),
         "settle" | "settleAndSeal" | "distribute" => (None, primary_recipient(&token_transfers)),
-        "seal" | "requestClose" | "withdrawPayer" => (
+        // The withdrawal goes back to the payer; there is no payee leg.
+        "withdrawPayer" => (None, None),
+        "seal" | "requestClose" => (
             // On close, the channel sends the remainder back to the payer.
             // We can't know which leg is the refund without account-info
             // lookups; leave `payer` empty and surface the breakdown via
@@ -1922,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn recurring_state_amount_uses_mint_decimals() {
+    fn delegation_state_amount_uses_mint_decimals() {
         let mint = Pubkey::new_unique();
         let mut subscription = ReceiptSubscription {
             action: "cancel".to_string(),
@@ -1939,15 +2151,15 @@ mod tests {
             expires_at_ts: None,
             events: Vec::new(),
         };
-        let state = crate::subscription_state::RecurringDelegationState {
+        let state = SubscriptionDelegationState {
             address: Pubkey::new_unique().to_string(),
             subscriber: Pubkey::new_unique(),
-            puller: Pubkey::new_unique(),
-            mint,
-            current_period_start_ts: 0,
-            period_length_s: 0,
-            expiry_ts: 0,
+            plan: Pubkey::new_unique(),
+            mint: Some(mint),
             amount_per_period: 5_000_000,
+            period_hours: 0,
+            current_period_start_ts: 0,
+            expires_at_ts: 0,
         };
         let mut receipt = parse(json!({
             "slot": 1,
@@ -1955,7 +2167,7 @@ mod tests {
             "transaction": {"message": {"accountKeys": ["payer"], "instructions": []}}
         }));
         receipt.subscription = Some(subscription.clone());
-        attach_recurring_delegation_state(&mut receipt, &state);
+        attach_subscription_delegation_state(&mut receipt, &state);
         subscription = receipt.subscription.take().unwrap();
 
         let metadata = HashMap::from([(
@@ -1971,6 +2183,361 @@ mod tests {
         let amount = subscription.period_amount.unwrap();
         assert_eq!(amount.decimals, 6);
         assert_eq!(amount.ui_amount, 5.0);
+    }
+
+    mod subscription_enrichment {
+        use super::*;
+        use crate::subscription_state::tests::{
+            plan_bytes, subscription_delegation_bytes, subscription_pda, subscriptions_program,
+        };
+        use crate::test_rpc::StubRpc;
+        use std::str::FromStr;
+
+        pub(crate) struct Fixture {
+            pub(crate) subscriber: Pubkey,
+            pub(crate) plan: Pubkey,
+            pub(crate) subscription: Pubkey,
+            pub(crate) mint: Pubkey,
+        }
+
+        impl Fixture {
+            pub(crate) fn new(program: &Pubkey) -> Self {
+                let subscriber = Pubkey::new_unique();
+                let plan = Pubkey::new_unique();
+                Self {
+                    subscription: subscription_pda(program, &plan, &subscriber),
+                    subscriber,
+                    plan,
+                    mint: Pubkey::new_unique(),
+                }
+            }
+
+            pub(crate) fn install(&self, rpc: &StubRpc, owner: &str) {
+                rpc.set_account(
+                    &self.subscription.to_string(),
+                    owner,
+                    subscription_delegation_bytes(
+                        &self.subscriber,
+                        &self.plan,
+                        10_000_000,
+                        720,
+                        1_700_000_000,
+                        1_800_000_000,
+                    ),
+                );
+                rpc.set_account(
+                    &self.plan.to_string(),
+                    owner,
+                    plan_bytes(&Pubkey::new_unique(), &self.mint),
+                );
+            }
+        }
+
+        /// A subscriptions-program instruction with `accounts` in order.
+        pub(crate) fn tx(program: &str, disc: u8, accounts: &[String]) -> Value {
+            json!({
+                "slot": 10,
+                "blockTime": 1_700_000_100_i64,
+                "meta": { "err": null, "fee": 5000_u64, "innerInstructions": [] },
+                "transaction": { "message": {
+                    "accountKeys": [{"pubkey": "Op111111111111111111111111111111111111111"}],
+                    "instructions": [{
+                        "programId": program,
+                        "accounts": accounts,
+                        "data": bs58::encode([disc]).into_string()
+                    }]
+                }}
+            })
+        }
+
+        pub(crate) async fn build(rpc: &StubRpc, value: &Value) -> Receipt {
+            build_receipt(
+                &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+                &rpc.url,
+                "sig",
+                Network::Sandbox,
+                value,
+                &[],
+            )
+            .await
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn cancel_enriches_from_the_delegation_at_its_role_not_the_plan() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // cancelSubscription: [subscriber, planPda, subscriptionPda, ...].
+            let value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    f.plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(
+                subscription.subscription_id,
+                Some(f.subscription.to_string())
+            );
+            assert_eq!(subscription.plan, Some(f.plan.to_string()));
+            assert_eq!(subscription.subscriber, Some(f.subscriber.to_string()));
+            assert_eq!(subscription.period_hours, Some(720));
+            assert_eq!(subscription.period_start_ts, Some(1_700_000_000));
+            assert_eq!(subscription.period_end_ts, Some(1_700_000_000 + 720 * 3600));
+            assert_eq!(subscription.expires_at_ts, Some(1_800_000_000));
+            let amount = subscription.period_amount.unwrap();
+            assert_eq!(amount.asset, f.mint.to_string());
+            assert_eq!(amount.raw_amount, "10000000");
+            assert_eq!(
+                rpc.requests(),
+                vec![vec![f.subscription.to_string(), f.plan.to_string()]]
+            );
+        }
+
+        #[tokio::test]
+        async fn advanced_subscription_state_is_not_bound_to_an_older_renewal() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // transferSubscription: [subscriptionPda, planPda, ...].
+            let mut value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                10,
+                &[f.subscription.to_string(), f.plan.to_string()],
+            );
+            for (block_time, attached) in [
+                (1_700_000_000 - 30 * 24 * 3600, false),
+                (1_700_000_000 - 1, false),
+                (1_700_000_000, true),
+                (1_700_000_000 + 720 * 3600 - 1, true),
+                (1_700_000_000 + 720 * 3600, false),
+            ] {
+                value["blockTime"] = json!(block_time);
+                let subscription = build(&rpc, &value).await.subscription.unwrap();
+                assert_eq!(
+                    subscription.subscription_id,
+                    Some(f.subscription.to_string())
+                );
+                assert_eq!(subscription.period_hours, Some(720));
+                assert_eq!(
+                    subscription.period_start_ts.is_some(),
+                    attached,
+                    "{block_time}"
+                );
+                assert_eq!(
+                    subscription.period_end_ts.is_some(),
+                    attached,
+                    "{block_time}"
+                );
+                // Expiry only describes a cancellation.
+                assert_eq!(subscription.expires_at_ts, None);
+            }
+            value.as_object_mut().unwrap().remove("blockTime");
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.period_start_ts, None);
+        }
+
+        #[tokio::test]
+        async fn immediate_cancellation_is_a_typed_subscription_cancel() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // cancelSubscriptionNow: [subscriber, merchant, planPda, subscriptionPda, ...].
+            let mut data = vec![17u8];
+            data.extend_from_slice(&1_725_000_000_i64.to_le_bytes());
+            let mut value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                17,
+                &[
+                    f.subscriber.to_string(),
+                    Pubkey::new_unique().to_string(),
+                    f.plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            value["transaction"]["message"]["instructions"][0]["data"] =
+                json!(bs58::encode(data).into_string());
+            let receipt = build(&rpc, &value).await;
+            assert_eq!(receipt.intent.kind, ReceiptIntentKind::MppSubscription);
+            assert_eq!(receipt.intent.action.as_deref(), Some("cancelNow"));
+            assert!(receipt.session.is_none());
+            let subscription = receipt.subscription.unwrap();
+            assert_eq!(subscription.status, SubscriptionStatus::Cancelled);
+            assert_eq!(
+                subscription.subscription_id,
+                Some(f.subscription.to_string())
+            );
+            assert_eq!(subscription.expires_at_ts, Some(1_800_000_000));
+        }
+
+        #[tokio::test]
+        async fn legacy_program_receipts_decode_legacy_owned_delegations() {
+            let legacy = Pubkey::from_str(MULTI_DELEGATOR_PROGRAM).unwrap();
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&legacy);
+            f.install(&rpc, MULTI_DELEGATOR_PROGRAM);
+            let value = tx(
+                MULTI_DELEGATOR_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    f.plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            let receipt = build(&rpc, &value).await;
+            assert_eq!(receipt.intent.name, "subscription");
+            let subscription = receipt.subscription.unwrap();
+            assert_eq!(
+                subscription.subscription_id,
+                Some(f.subscription.to_string())
+            );
+            assert_eq!(subscription.period_hours, Some(720));
+            assert_eq!(subscription.period_amount.unwrap().raw_amount, "10000000");
+        }
+
+        #[tokio::test]
+        async fn delegation_owner_must_match_the_instruction_program() {
+            let rpc = StubRpc::start().await;
+            // Canonical-derived and canonical-owned, named by a legacy instruction.
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            let accounts = [
+                f.subscriber.to_string(),
+                f.plan.to_string(),
+                f.subscription.to_string(),
+            ];
+            let value = tx(MULTI_DELEGATOR_PROGRAM, 12, &accounts);
+            assert_eq!(
+                build(&rpc, &value)
+                    .await
+                    .subscription
+                    .unwrap()
+                    .subscription_id,
+                None
+            );
+
+            // Legacy-owned but derived under the canonical program.
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, MULTI_DELEGATOR_PROGRAM);
+            let accounts = [
+                f.subscriber.to_string(),
+                f.plan.to_string(),
+                f.subscription.to_string(),
+            ];
+            for program in [MULTI_DELEGATOR_PROGRAM, SUBSCRIPTIONS_PROGRAM] {
+                let value = tx(program, 12, &accounts);
+                assert_eq!(
+                    build(&rpc, &value)
+                        .await
+                        .subscription
+                        .unwrap()
+                        .subscription_id,
+                    None,
+                    "{program}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn pull_renewal_reports_the_delegator_as_subscriber() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            let authority = Pubkey::new_unique().to_string();
+            let puller = Pubkey::new_unique().to_string();
+            let mut value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                10,
+                &[
+                    f.subscription.to_string(),
+                    f.plan.to_string(),
+                    authority.clone(),
+                    "DelegatorATA".to_string(),
+                    "RecipientATA".to_string(),
+                    puller,
+                ],
+            );
+            value["meta"]["innerInstructions"] = json!([{
+                "index": 0,
+                "instructions": [
+                    token_transfer(&authority, "RecipientATA", &f.mint.to_string(), "10000000", 6),
+                    token_transfer("Merchant", "TreasuryATA", &f.mint.to_string(), "1", 6)
+                ]
+            }]);
+            let skeleton = parse(value.clone()).subscription.unwrap();
+            assert_eq!(skeleton.subscriber.as_deref(), Some(authority.as_str()));
+
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            let delegator = f.subscriber.to_string();
+            assert_eq!(subscription.subscriber.as_deref(), Some(delegator.as_str()));
+            assert_eq!(subscription.events[0].sender, delegator);
+            assert_eq!(subscription.events[0].kind, "renew");
+            // Unrelated legs keep their own sender.
+            assert_eq!(subscription.events[1].sender, "Merchant");
+        }
+
+        #[tokio::test]
+        async fn plan_account_is_never_published_as_the_subscription() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // The plan PDA sits where the subscription PDA belongs.
+            let value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    f.plan.to_string(),
+                    f.plan.to_string(),
+                ],
+            );
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.subscription_id, None);
+            assert_eq!(subscription.period_hours, None);
+            assert_eq!(subscription.expires_at_ts, None);
+            assert!(subscription.period_amount.is_none());
+        }
+
+        #[tokio::test]
+        async fn delegation_for_another_plan_is_not_attached() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            let other_plan = Pubkey::new_unique();
+            rpc.set_account(
+                &other_plan.to_string(),
+                SUBSCRIPTIONS_PROGRAM,
+                plan_bytes(&Pubkey::new_unique(), &f.mint),
+            );
+            let value = tx(
+                SUBSCRIPTIONS_PROGRAM,
+                12,
+                &[
+                    f.subscriber.to_string(),
+                    other_plan.to_string(),
+                    f.subscription.to_string(),
+                ],
+            );
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.subscription_id, None);
+        }
+
+        #[tokio::test]
+        async fn admin_instructions_skip_delegation_lookup() {
+            let rpc = StubRpc::start().await;
+            let f = Fixture::new(&subscriptions_program());
+            f.install(&rpc, SUBSCRIPTIONS_PROGRAM);
+            // createPlan names the plan but no delegation.
+            let value = tx(SUBSCRIPTIONS_PROGRAM, 7, &[f.plan.to_string()]);
+            let subscription = build(&rpc, &value).await.subscription.unwrap();
+            assert_eq!(subscription.subscription_id, None);
+            assert!(rpc.requests().is_empty());
+        }
     }
 
     #[test]
@@ -2152,6 +2719,455 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn reconcile(receipt: &mut Receipt, rpc: &Value) {
+        reconcile_session_via_balances(
+            receipt,
+            &collect_ata_owners(rpc),
+            payment_channel_payer(rpc).as_ref(),
+        );
+    }
+
+    /// A payment-channels `distribute` naming `payer` and its token account.
+    fn distribute_ix(channel: &str, payer: &str, payer_token_account: &str) -> Value {
+        json!({
+            "programId": PAYMENT_CHANNELS_PROGRAM,
+            "accounts": [
+                channel, payer, "RentPayer", "ChannelATA", payer_token_account,
+                "PayeeATA", "TreasuryATA", "Mint", SPL_TOKEN_PROGRAM
+            ],
+            "data": bs58::encode([7u8]).into_string()
+        })
+    }
+
+    fn high_usage_distribute(instructions: Vec<Value>) -> Value {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {
+                "err": null,
+                "fee": 5000_u64,
+                "innerInstructions": [{
+                    "index": 0,
+                    "instructions": [
+                        token_transfer("ChannelPDA", "BeneficiaryATA", mint, "9000", 6),
+                        token_transfer("ChannelPDA", "PayerATA", mint, "1000", 6)
+                    ]
+                }],
+                "postTokenBalances": [
+                    {"accountIndex": 2, "owner": "BeneficiaryWallet", "mint": mint},
+                    {"accountIndex": 3, "owner": "PayerWallet", "mint": mint}
+                ]
+            },
+            "transaction": {"message": {
+                "accountKeys": [
+                    {"pubkey": "OperatorWallet", "signer": true},
+                    {"pubkey": "ChannelPDA"},
+                    {"pubkey": "BeneficiaryATA"},
+                    {"pubkey": "PayerATA"}
+                ],
+                "instructions": instructions
+            }}
+        })
+    }
+
+    #[test]
+    fn largest_beneficiary_payout_is_not_reported_as_the_payer_refund() {
+        let rpc =
+            high_usage_distribute(vec![distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]);
+        let mut receipt = parse(rpc.clone());
+        reconcile(&mut receipt, &rpc);
+        let session = receipt.session.unwrap();
+        assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+        assert_eq!(session.refunded.unwrap().raw_amount, "1000");
+        assert_eq!(session.consumed.unwrap().raw_amount, "9000");
+        assert_eq!(session.events[0].kind, "distribute");
+        assert_eq!(session.events[1].kind, "refund");
+        assert_eq!(session.distributed.len(), 1);
+        assert_eq!(session.distributed[0].recipient, "BeneficiaryWallet");
+    }
+
+    #[test]
+    fn refund_matches_the_payer_token_account_without_owner_metadata() {
+        let mut rpc =
+            high_usage_distribute(vec![distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]);
+        rpc["meta"]["postTokenBalances"] = json!([]);
+        let mut receipt = parse(rpc.clone());
+        reconcile(&mut receipt, &rpc);
+        let session = receipt.session.unwrap();
+        assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+        assert_eq!(session.refunded.unwrap().raw_amount, "1000");
+        assert_eq!(session.consumed.unwrap().raw_amount, "9000");
+    }
+
+    #[test]
+    fn payout_without_a_payer_role_leaves_payer_and_totals_unresolved() {
+        // settleAndSeal alone names no payer account.
+        let rpc = high_usage_distribute(vec![json!({
+            "programId": PAYMENT_CHANNELS_PROGRAM,
+            "accounts": ["OperatorWallet", "ChannelPDA"],
+            "data": bs58::encode([4u8]).into_string()
+        })]);
+        let mut receipt = parse(rpc.clone());
+        reconcile(&mut receipt, &rpc);
+        let session = receipt.session.unwrap();
+        assert_eq!(session.payer, None);
+        assert!(session.refunded.is_none());
+        assert!(session.consumed.is_none());
+        assert!(session.distributed.is_empty());
+        assert!(session.events.iter().all(|event| event.kind != "refund"));
+    }
+
+    fn owner_balance(account_index: u64, owner: &str, amount: &str) -> Value {
+        json!({
+            "accountIndex": account_index,
+            "owner": owner,
+            "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "uiTokenAmount": {"amount": amount, "decimals": 6}
+        })
+    }
+
+    #[test]
+    fn parsed_transfers_report_token_account_owners() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let charge = parse(json!({
+            "meta": {
+                "err": null, "fee": 5000, "innerInstructions": [],
+                "preTokenBalances": [owner_balance(2, "MerchantA", "0"), owner_balance(3, "MerchantB", "0")],
+                "postTokenBalances": [owner_balance(2, "MerchantA", "700000"), owner_balance(3, "MerchantB", "300000")]
+            },
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "MerchantA_ATA", "MerchantB_ATA"],
+                "instructions": [
+                    token_transfer("PayerWallet", "MerchantA_ATA", mint, "700000", 6),
+                    token_transfer("PayerWallet", "MerchantB_ATA", mint, "300000", 6)
+                ]
+            }}
+        }));
+        assert!(matches!(charge.intent.kind, ReceiptIntentKind::MppCharge));
+        assert_eq!(charge.transfers[0].receiver, "MerchantA");
+        assert_eq!(charge.transfers[1].receiver, "MerchantB");
+        assert_eq!(
+            charge
+                .splits
+                .iter()
+                .map(|split| split.recipient.as_str())
+                .collect::<Vec<_>>(),
+            vec!["MerchantA", "MerchantB"]
+        );
+
+        let x402 = parse(json!({
+            "meta": {"err": null, "fee": 5000, "innerInstructions": [],
+                "postTokenBalances": [owner_balance(2, "MerchantWallet", "1000000")]},
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "Merchant_ATA"],
+                "instructions": [
+                    token_transfer("PayerWallet", "Merchant_ATA", mint, "1000000", 6),
+                    {"programId": MEMO_PROGRAM, "program": "spl-memo", "parsed": "nonce"}
+                ]
+            }}
+        }));
+        assert!(matches!(x402.intent.kind, ReceiptIntentKind::X402Exact));
+        assert_eq!(x402.transfers[0].receiver, "MerchantWallet");
+
+        let subscription = parse(json!({
+            "meta": {"err": null, "fee": 5000, "innerInstructions": [],
+                "postTokenBalances": [owner_balance(2, "MerchantWallet", "5000000")]},
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "Merchant_ATA"],
+                "instructions": [
+                    {"programId": SUBSCRIPTIONS_PROGRAM, "accounts": ["Subscriber", "Plan"],
+                     "data": bs58::encode([11u8]).into_string()},
+                    token_transfer("PayerWallet", "Merchant_ATA", mint, "5000000", 6)
+                ]
+            }}
+        }));
+        assert_eq!(
+            subscription.subscription.unwrap().recipient.as_deref(),
+            Some("MerchantWallet")
+        );
+    }
+
+    #[test]
+    fn parsed_transfer_keeps_token_account_without_owner_metadata() {
+        let receipt = parse(json!({
+            "meta": {"err": null, "fee": 5000, "innerInstructions": [],
+                "postTokenBalances": [{"accountIndex": 2, "mint": "M"}]},
+            "transaction": {"message": {
+                "accountKeys": ["FeePayer", "SourceATA", "Merchant_ATA"],
+                "instructions": [token_transfer("PayerWallet", "Merchant_ATA", "M", "1", 6)]
+            }}
+        }));
+        assert_eq!(receipt.transfers[0].receiver, "Merchant_ATA");
+        assert_eq!(receipt.transfers[0].sender, "PayerWallet");
+    }
+
+    #[tokio::test]
+    async fn open_deposit_is_not_reported_as_a_refund() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        for (disc, action) in [(1u8, "open"), (3u8, "topUp")] {
+            let value = json!({
+                "slot": 100,
+                "blockTime": 1_700_000_000_i64,
+                "meta": {
+                    "err": null,
+                    "fee": 5000_u64,
+                    "innerInstructions": [{
+                        "index": 0,
+                        "instructions": [token_transfer("PayerWallet", "ChannelATA", mint, "5000000", 6)]
+                    }],
+                    "postTokenBalances": [{
+                        "accountIndex": 2,
+                        "owner": "ChannelPDA",
+                        "mint": mint,
+                        "uiTokenAmount": {"amount": "5000000", "decimals": 6}
+                    }]
+                },
+                "transaction": {"message": {
+                    "accountKeys": [
+                        {"pubkey": "OperatorWallet", "signer": true},
+                        {"pubkey": "PayerWallet"},
+                        {"pubkey": "ChannelATA"}
+                    ],
+                    "instructions": [{
+                        "programId": PAYMENT_CHANNELS_PROGRAM,
+                        "accounts": ["OperatorWallet", "ChannelPDA", "PayerWallet", "ChannelATA"],
+                        "data": bs58::encode([disc]).into_string()
+                    }]
+                }}
+            });
+            let receipt = build_receipt(
+                &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+                &rpc.url,
+                "sig",
+                Network::Sandbox,
+                &value,
+                &[],
+            )
+            .await
+            .unwrap();
+            let session = receipt.session.unwrap();
+            assert_eq!(session.action, action);
+            assert_eq!(session.deposit.unwrap().raw_amount, "5000000");
+            assert!(session.refunded.is_none(), "{action}");
+            assert!(session.consumed.is_none(), "{action}");
+            assert_eq!(session.events[0].kind, "deposit");
+            assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+            assert_eq!(session.channel_status, Some(WireChannelStatus::Open));
+        }
+    }
+
+    #[test]
+    fn minting_with_a_memo_is_not_an_x402_payment() {
+        let mint = "AttackerMint1111111111111111111111111111111";
+        for kind in ["mintTo", "mintToChecked"] {
+            for program in [SPL_TOKEN_PROGRAM, TOKEN_2022_PROGRAM] {
+                let receipt = parse(json!({
+                    "meta": {
+                        "err": null, "fee": 5000, "innerInstructions": [],
+                        "postTokenBalances": [owner_balance(1, "Attacker", "123456")]
+                    },
+                    "transaction": {"message": {
+                        "accountKeys": ["Attacker", "AttackerATA"],
+                        "instructions": [
+                            {"programId": program, "program": "spl-token", "parsed": {
+                                "type": kind,
+                                "info": {
+                                    "account": "AttackerATA",
+                                    "mint": mint,
+                                    "mintAuthority": "Attacker",
+                                    "tokenAmount": {"amount": "123456", "decimals": 6}
+                                }
+                            }},
+                            {"programId": MEMO_PROGRAM, "program": "spl-memo", "parsed": "proof"}
+                        ]
+                    }}
+                }));
+                assert!(
+                    matches!(receipt.intent.kind, ReceiptIntentKind::Transfer),
+                    "{kind}"
+                );
+                assert!(receipt.transfers.is_empty(), "{kind}");
+                assert!(receipt.total.is_none(), "{kind}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_channel_status_does_not_overwrite_the_transaction_action() {
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let mut data = vec![0u8; 256];
+        data[3] = 1; // Sealed since.
+        data[88..120].copy_from_slice(payer.as_ref());
+        data[120..152].copy_from_slice(payee.as_ref());
+        rpc.set_account("ChannelPDA", PAYMENT_CHANNELS_PROGRAM, data);
+        let value = json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {"err": null, "fee": 5000_u64, "innerInstructions": [{
+                "index": 0,
+                "instructions": [token_transfer("PayerWallet", "ChannelATA", "M", "5", 6)]
+            }]},
+            "transaction": {"message": {
+                "accountKeys": [{"pubkey": "OperatorWallet", "signer": true}],
+                "instructions": [{
+                    "programId": PAYMENT_CHANNELS_PROGRAM,
+                    "accounts": ["OperatorWallet", "ChannelPDA"],
+                    "data": bs58::encode([1u8]).into_string()
+                }]
+            }}
+        });
+        let receipt = build_receipt(
+            &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+            &rpc.url,
+            "sig",
+            Network::Sandbox,
+            &value,
+            &[],
+        )
+        .await
+        .unwrap();
+        let session = receipt.session.unwrap();
+        assert_eq!(session.channel.as_deref(), Some("ChannelPDA"));
+        assert_eq!(session.channel_status, Some(WireChannelStatus::Open));
+        assert_eq!(session.payer, Some(payer.to_string()));
+        assert_eq!(session.payee, Some(payee.to_string()));
+    }
+
+    fn two_channel_batch() -> Value {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {"err": null, "fee": 5000_u64, "innerInstructions": [
+                {"index": 0, "instructions": [
+                    token_transfer("ChannelA", "OperatorWallet", mint, "900", 6),
+                    token_transfer("ChannelA", "PayerA_ATA", mint, "100", 6)
+                ]},
+                {"index": 1, "instructions": [
+                    token_transfer("ChannelB", "OperatorWallet", mint, "200", 6),
+                    token_transfer("ChannelB", "PayerB_ATA", mint, "800", 6)
+                ]}
+            ]},
+            "transaction": {"message": {
+                "accountKeys": [{"pubkey": "OperatorWallet", "signer": true}],
+                "instructions": [
+                    distribute_ix("ChannelA", "PayerA", "PayerA_ATA"),
+                    distribute_ix("ChannelB", "PayerB", "PayerB_ATA")
+                ]
+            }}
+        })
+    }
+
+    #[test]
+    fn batched_channel_settlements_do_not_collapse_into_one_session() {
+        let rpc = two_channel_batch();
+        let receipt = parse(rpc.clone());
+        assert_eq!(receipt.intent.kind, ReceiptIntentKind::MppSession);
+        assert!(receipt.session.is_none());
+        assert_eq!(receipt.transfers.len(), 4);
+        assert_eq!(
+            payment_channel_accounts(top_level_instructions(&rpc)),
+            vec!["ChannelA".to_string(), "ChannelB".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_settlement_skips_channel_enrichment() {
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        let receipt = build_receipt(
+            &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+            &rpc.url,
+            "sig",
+            Network::Sandbox,
+            &two_channel_batch(),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(receipt.session.is_none());
+        assert!(
+            rpc.requests()
+                .iter()
+                .all(|request| !request.contains(&"ChannelA".to_string()))
+        );
+    }
+
+    #[test]
+    fn repeated_instructions_for_one_channel_keep_a_single_session() {
+        let mut rpc = two_channel_batch();
+        rpc["transaction"]["message"]["instructions"] = json!([
+            {
+                "programId": PAYMENT_CHANNELS_PROGRAM,
+                "accounts": ["OperatorWallet", "ChannelA"],
+                "data": bs58::encode([4u8]).into_string()
+            },
+            distribute_ix("ChannelA", "PayerA", "PayerA_ATA")
+        ]);
+        let session = parse(rpc).session.expect("single channel session");
+        assert_eq!(session.channel.as_deref(), Some("ChannelA"));
+    }
+
+    #[tokio::test]
+    async fn payer_withdrawal_is_reported_as_a_refund() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let rpc = crate::test_rpc::StubRpc::start().await;
+        // withdrawPayer: [payer, channel, channelTokenAccount, payerTokenAccount, ...],
+        // signed and fee-paid by the payer.
+        let value = json!({
+            "slot": 100,
+            "blockTime": 1_700_000_000_i64,
+            "meta": {
+                "err": null,
+                "fee": 5000_u64,
+                "innerInstructions": [{
+                    "index": 0,
+                    "instructions": [token_transfer("ChannelPDA", "PayerATA", mint, "9900", 6)]
+                }],
+                "postTokenBalances": [{
+                    "accountIndex": 2,
+                    "owner": "PayerWallet",
+                    "mint": mint,
+                    "uiTokenAmount": {"amount": "9900", "decimals": 6}
+                }]
+            },
+            "transaction": {"message": {
+                "accountKeys": [
+                    {"pubkey": "PayerWallet", "signer": true},
+                    {"pubkey": "ChannelPDA"},
+                    {"pubkey": "PayerATA"}
+                ],
+                "instructions": [{
+                    "programId": PAYMENT_CHANNELS_PROGRAM,
+                    "accounts": ["PayerWallet", "ChannelPDA", "ChannelATA", "PayerATA"],
+                    "data": bs58::encode([8u8]).into_string()
+                }]
+            }}
+        });
+        let receipt = build_receipt(
+            &RpcClient::new(std::time::Duration::from_secs(5)).unwrap(),
+            &rpc.url,
+            "sig",
+            Network::Sandbox,
+            &value,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.intent.action.as_deref(), Some("withdrawPayer"));
+        let session = receipt.session.unwrap();
+        assert_eq!(session.events[0].kind, "refund");
+        assert_eq!(session.refunded.unwrap().raw_amount, "9900");
+        assert!(session.consumed.is_none());
+        assert_eq!(session.payer.as_deref(), Some("PayerWallet"));
+        assert_eq!(session.payee, None);
+        assert_eq!(session.channel.as_deref(), Some("ChannelPDA"));
+        assert_eq!(session.channel_status, Some(WireChannelStatus::Sealed));
     }
 
     // ── Plain transfer / SOL / Token-2022 ─────────────────────────────────
@@ -2624,6 +3640,10 @@ mod tests {
             (10, "renew"),
             (11, "subscribe"),
             (12, "cancel"),
+            (13, "resume"),
+            (14, "revokeSubscriptionAuthority"),
+            (16, "revokeAbandonedSubscription"),
+            (17, "cancelNow"),
         ];
         for program in [MULTI_DELEGATOR_PROGRAM, SUBSCRIPTIONS_PROGRAM] {
             for (disc, label) in cases {
@@ -2674,7 +3694,16 @@ mod tests {
         assert_eq!(s.action, "cancel");
         assert_eq!(s.status, pay_api_types::SubscriptionStatus::Cancelled);
 
-        for disc in [0u8, 6, 7, 8, 9] {
+        for (disc, status) in [
+            (13u8, pay_api_types::SubscriptionStatus::Active),
+            (16, pay_api_types::SubscriptionStatus::Cancelled),
+            (17, pay_api_types::SubscriptionStatus::Cancelled),
+        ] {
+            let r = parse(subscription_program_tx(SUBSCRIPTIONS_PROGRAM, disc));
+            assert_eq!(r.subscription.unwrap().status, status, "disc {disc}");
+        }
+
+        for disc in [0u8, 6, 7, 8, 9, 14] {
             let r = parse(subscription_program_tx(SUBSCRIPTIONS_PROGRAM, disc));
             let s = r.subscription.expect("admin builds a block");
             assert_eq!(s.status, pay_api_types::SubscriptionStatus::Admin);
@@ -2758,7 +3787,7 @@ mod tests {
                         "programId": PAYMENT_CHANNELS_PROGRAM,
                         "accounts": ["OperatorWallet", "ChannelPDA"],
                         "data": bs58::encode([4u8]).into_string()
-                    }]
+                    }, distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]
                 }
             }
         });
@@ -2766,8 +3795,7 @@ mod tests {
         // Build the skeleton, then manually invoke the reconciler with the
         // ata→owner map (the async path does this internally).
         let mut receipt = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
-        let owners = collect_ata_owners(&rpc);
-        reconcile_session_via_balances(&mut receipt, &owners);
+        reconcile(&mut receipt, &rpc);
 
         let s = receipt.session.expect("session present");
         assert_eq!(s.payer.as_deref(), Some("PayerWallet"));
@@ -2776,7 +3804,7 @@ mod tests {
         assert_eq!(s.consumed.as_ref().unwrap().raw_amount, "100");
         // refund leg is excluded from distributed[]
         assert_eq!(s.distributed.len(), 1);
-        assert_eq!(s.distributed[0].recipient, "OperatorATA");
+        assert_eq!(s.distributed[0].recipient, "OperatorWallet");
     }
 
     #[test]
@@ -2816,7 +3844,7 @@ mod tests {
                         "programId": PAYMENT_CHANNELS_PROGRAM,
                         "accounts": ["OperatorWallet", "ChannelPDA"],
                         "data": bs58::encode([4u8]).into_string()
-                    }]
+                    }, distribute_ix("ChannelPDA", "PayerWallet", "PayerATA")]
                 }
             }
         });
@@ -2829,8 +3857,7 @@ mod tests {
             "expected wallet-keyed receiver from balance extraction"
         );
 
-        let owners = collect_ata_owners(&rpc);
-        reconcile_session_via_balances(&mut receipt, &owners);
+        reconcile(&mut receipt, &rpc);
 
         let s = receipt.session.expect("session present");
         assert_eq!(s.payer.as_deref(), Some("PayerWallet"));
@@ -2872,11 +3899,11 @@ mod tests {
                     "programId": PAYMENT_CHANNELS_PROGRAM,
                     "accounts": ["OperatorWallet"],
                     "data": bs58::encode([4u8]).into_string()
-                }]
+                }, distribute_ix("PDA", "PayerWallet", "PayerATA")]
             }}
         });
         let mut r = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
-        reconcile_session_via_balances(&mut r, &collect_ata_owners(&rpc));
+        reconcile(&mut r, &rpc);
         let s = r.session.unwrap();
         let kinds: Vec<&str> = s.events.iter().map(|e| e.kind.as_str()).collect();
         assert!(kinds.contains(&"refund"));
@@ -2910,7 +3937,7 @@ mod tests {
                     "programId": PAYMENT_CHANNELS_PROGRAM,
                     "accounts": ["Op"],
                     "data": bs58::encode([4u8]).into_string()
-                }]
+                }, distribute_ix("PDA", "PayerWallet", "PayerATA")]
             }}
         });
         let mut r = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
@@ -2919,12 +3946,13 @@ mod tests {
             owners.is_empty(),
             "no postTokenBalances should give empty map"
         );
-        reconcile_session_via_balances(&mut r, &owners);
+        reconcile(&mut r, &rpc);
         let s = r.session.expect("session still present");
         assert_eq!(s.payee.as_deref(), Some("Op"));
-        // Without owner data the only "non-operator wallet" the reconciler can
-        // see is the destination ATA itself, so it surfaces as the payer.
-        assert!(s.payer.is_some());
+        // The payer comes from the distribute instruction, not the legs.
+        assert_eq!(s.payer.as_deref(), Some("PayerWallet"));
+        assert!(s.refunded.is_none());
+        assert_eq!(s.consumed.unwrap().raw_amount, "100");
     }
 
     // ── Account creation detection (ATAs) ─────────────────────────────────
@@ -3187,7 +4215,7 @@ mod tests {
             }}
         });
         let mut r = build_receipt_skeleton("sig", Network::Sandbox, &rpc, &[]).unwrap();
-        reconcile_session_via_balances(&mut r, &collect_ata_owners(&rpc));
+        reconcile(&mut r, &rpc);
         let s = r.session.unwrap();
         assert_eq!(s.channel_status, Some(WireChannelStatus::Sealed));
     }

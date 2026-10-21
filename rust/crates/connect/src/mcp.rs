@@ -12,7 +12,8 @@
 //! [`crate::tenants::CloudContext`] turns it into the wallet and policy the
 //! tools act with.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -35,6 +36,27 @@ pub const ALLOWED_HOSTS_ENV: &str = "PAY_CONNECT_MCP_ALLOWED_HOSTS";
 /// deployment.
 pub const ANONYMOUS_TOKEN_ENV: &str = "PAY_CONNECT_DEV_ANONYMOUS_TOKEN";
 pub const PATH: &str = "/mcp";
+const SESSION_HEADER: &str = "mcp-session-id";
+
+/// The tenant that opened each live MCP session. A session's tools hold
+/// per-tenant payment state (reusable session credentials, batch channels),
+/// so a request may only resume a session its own tenant opened.
+#[derive(Clone, Default)]
+struct SessionOwners(Arc<Mutex<HashMap<String, String>>>);
+
+impl SessionOwners {
+    fn owner(&self, session: &str) -> Option<String> {
+        self.0.lock().unwrap().get(session).cloned()
+    }
+
+    fn bind(&self, session: String, tenant: String) {
+        self.0.lock().unwrap().insert(session, tenant);
+    }
+
+    fn forget(&self, session: &str) {
+        self.0.lock().unwrap().remove(session);
+    }
+}
 
 /// Who a request acts for. Today the fingerprint of the static token that
 /// authenticated it; the tenant store will map tokens to real tenants.
@@ -212,7 +234,10 @@ pub fn router(auth: Auth, context: Arc<dyn pay_mcp::PayContext>) -> Router {
         );
     Router::new()
         .nest_service(PATH, service)
-        .layer(middleware::from_fn_with_state(auth, require_bearer))
+        .layer(middleware::from_fn_with_state(
+            (auth, SessionOwners::default()),
+            require_bearer,
+        ))
 }
 
 /// Refuse anything without a live token; tag the rest with its tenant.
@@ -220,7 +245,11 @@ pub fn router(auth: Auth, context: Arc<dyn pay_mcp::PayContext>) -> Router {
 /// `Authorization: Bearer <token>` is the standard; a bare `<token>` is
 /// accepted too, because some host dialogs offer a single "authorization"
 /// box and send it verbatim.
-async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) -> Response {
+async fn require_bearer(
+    State((auth, owners)): State<(Auth, SessionOwners)>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let raw = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -239,8 +268,40 @@ async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) 
     });
     match tenant {
         Some(tenant) => {
+            let session = req
+                .headers()
+                .get(SESSION_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            if let Some(session) = &session
+                && owners.owner(session).as_deref() != Some(tenant.id.as_str())
+            {
+                tracing::info!("mcp session resumed by a different tenant refused");
+                return session_not_found();
+            }
+            let closing = req.method() == axum::http::Method::DELETE;
+            let tenant_id = tenant.id.clone();
             req.extensions_mut().insert(tenant);
-            next.run(req).await
+            let response = next.run(req).await;
+            match session {
+                None => {
+                    if let Some(created) = response
+                        .headers()
+                        .get(SESSION_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        owners.bind(created.to_string(), tenant_id);
+                    }
+                }
+                Some(session) => {
+                    if (closing && response.status().is_success())
+                        || response.status() == StatusCode::NOT_FOUND
+                    {
+                        owners.forget(&session);
+                    }
+                }
+            }
+            response
         }
         None => {
             if req.method() == axum::http::Method::GET
@@ -304,6 +365,16 @@ fn browser_navigation(headers: &axum::http::HeaderMap) -> bool {
                     .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
             })
         })
+}
+
+/// What the transport answers for an unknown session: the client starts a
+/// new one.
+fn session_not_found() -> Response {
+    let body = serde_json::json!({
+        "error": "session_not_found",
+        "message": "This MCP session does not exist for this credential. Start a new session.",
+    });
+    (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
 }
 
 fn unauthorized(cfg: &Config) -> Response {
@@ -705,5 +776,40 @@ pub(crate) mod tests {
             "DNS-rebinding hosts must not reach the session: {}",
             res.status()
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_cannot_be_resumed_by_another_tenant() {
+        let app = app();
+        let (status, headers, body) = mcp_post(&app, Some("tok-alpha"), None, INIT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let session = headers["mcp-session-id"].to_str().unwrap().to_string();
+        let (status, _, _) = mcp_post(&app, Some("tok-alpha"), Some(&session), INITIALIZED).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // Same session id, different bearer: refused before tool dispatch.
+        for body in [TOOLS_LIST, INITIALIZED] {
+            let (status, _, response) =
+                mcp_post(&app, Some("tok-beta"), Some(&session), body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{response}");
+            assert!(response.contains("session_not_found"), "{response}");
+        }
+
+        // The owner keeps using it; a forged id is refused too.
+        let (status, _, body) = mcp_post(&app, Some("tok-alpha"), Some(&session), TOOLS_LIST).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _, _) =
+            mcp_post(&app, Some("tok-alpha"), Some("not-a-session"), TOOLS_LIST).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Each tenant gets its own session.
+        let (status, headers, _) = mcp_post(&app, Some("tok-beta"), None, INIT).await;
+        assert_eq!(status, StatusCode::OK);
+        let beta = headers["mcp-session-id"].to_str().unwrap().to_string();
+        assert_ne!(beta, session);
+        let (status, _, _) = mcp_post(&app, Some("tok-beta"), Some(&beta), INITIALIZED).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, _, _) = mcp_post(&app, Some("tok-alpha"), Some(&beta), TOOLS_LIST).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

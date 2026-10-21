@@ -27,7 +27,7 @@ struct Args {
     #[arg(long, env = "COMPUTE_ALLOWED_HOSTS", value_delimiter = ',')]
     allowed_hosts: Vec<String>,
     /// Disable MCP Host-header validation. This is safe for the private Cloud
-    /// Run origin because IAM and the verified-payer header remain mandatory.
+    /// Run origin because IAM and the proxy-proven payer remain mandatory.
     #[arg(long, env = "COMPUTE_DISABLE_HOST_VALIDATION", default_value_t = false)]
     disable_host_validation: bool,
 }
@@ -52,6 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if executor_proof.len() < 32 {
         return Err("COMPUTE_TRIGGER_EXECUTOR_PROOF must contain at least 32 bytes".into());
     }
+    let proxy_proof = std::env::var("COMPUTE_PROXY_PROOF")
+        .map_err(|_| "COMPUTE_PROXY_PROOF must be set")?
+        .into_bytes();
+    if proxy_proof.len() < 32 {
+        return Err("COMPUTE_PROXY_PROOF must contain at least 32 bytes".into());
+    }
     let allowed_hosts = if args.disable_host_validation {
         Vec::new()
     } else if args.allowed_hosts.is_empty() {
@@ -70,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allowed_hosts,
             bindings,
             executor_proof,
+            proxy_proof,
             payments,
         ),
     )

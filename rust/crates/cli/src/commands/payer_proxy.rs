@@ -906,6 +906,7 @@ fn terminal_cached_session_error(body: &[u8]) -> bool {
         || text.contains(terminal_errors::OPERATOR_ONLY)
         || text.contains(terminal_errors::PREDATES_PROOF_BINDING)
         || text.contains(terminal_errors::PROOF_MISMATCH)
+        || text.contains(terminal_errors::CLOSED_ONCHAIN)
 }
 
 /// Hosted providers must challenge successful inference requests, but model
@@ -2050,6 +2051,7 @@ mod tests {
                 terminal_errors::PREDATES_PROOF_BINDING
             ),
             &format!("use authentication {}", terminal_errors::PROOF_MISMATCH),
+            &format!("{}; open a new session", terminal_errors::CLOSED_ONCHAIN),
         ] {
             let body = session_failed_body(message);
             assert!(

@@ -59,6 +59,20 @@ impl CallScope {
         self.approval.gate(peer)
     }
 
+    /// Run one signing operation under this caller's approval. Whatever the
+    /// approval reserved is kept only when `sign` returns its signed result;
+    /// a refusal or a later build/sign failure releases it.
+    pub fn with_approval<T>(
+        &self,
+        peer: Option<&Peer<RoleServer>>,
+        sign: impl FnOnce(AuthOverride) -> pay_core::Result<T>,
+    ) -> pay_core::Result<T> {
+        let (gate, hold) = self.approval.gate_with_hold(peer);
+        let signed = sign(gate)?;
+        hold.commit();
+        Ok(signed)
+    }
+
     /// RPC endpoint for `network`.
     pub fn rpc_url(&self, network: &str) -> String {
         if network == pay_core::accounts::MAINNET_NETWORK {
@@ -75,6 +89,40 @@ pub trait ApprovalPolicy: Send + Sync {
     /// A fresh gate for one signing operation, or `None` to let the
     /// account's own policy (the platform prompt) decide.
     fn gate(&self, peer: Option<&Peer<RoleServer>>) -> AuthOverride;
+
+    /// [`Self::gate`] plus a hold on anything the gate reserves while it
+    /// authorizes. Dropping the hold uncommitted releases the reservation.
+    fn gate_with_hold(&self, peer: Option<&Peer<RoleServer>>) -> (AuthOverride, ApprovalHold) {
+        (self.gate(peer), ApprovalHold::default())
+    }
+}
+
+/// Reservations made for one signing operation, released on drop unless
+/// [`ApprovalHold::commit`] is called.
+#[derive(Default)]
+pub struct ApprovalHold {
+    release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ApprovalHold {
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// Keep the reservations: a signature was produced.
+    pub fn commit(mut self) {
+        self.release = None;
+    }
+}
+
+impl Drop for ApprovalHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
 }
 
 /// Whether the connected client can show an approval prompt of its own.

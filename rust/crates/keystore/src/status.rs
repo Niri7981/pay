@@ -46,6 +46,7 @@ fn describe(intent: &AuthIntent) -> (BlockedKind, &'static str) {
         AuthIntent::ExportAccount(_) => (BlockedKind::Auth, "Authenticate to export account"),
         AuthIntent::DeleteAccount(_) => (BlockedKind::Auth, "Authenticate to delete account"),
         AuthIntent::UseAccount(_) => (BlockedKind::Auth, "Authenticate to use account"),
+        AuthIntent::SignIn(_) => (BlockedKind::Permission, "Approve wallet sign-in"),
     }
 }
 

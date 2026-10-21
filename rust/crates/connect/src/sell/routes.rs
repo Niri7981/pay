@@ -22,6 +22,7 @@ use base64::Engine;
 use futures_util::StreamExt;
 use pay_core::pricing::{PricingConfig, TokenRate};
 use pay_core::sell_inference::{SellInference, SellPricing};
+use pay_core::server::completion_stream::{MeteredSettlement, StreamCompletion};
 use pay_core::server::payment::payment_middleware;
 use pay_types::metering::Scheme;
 use serde::{Deserialize, Serialize};
@@ -187,18 +188,28 @@ impl Drop for ReservationGuard {
     }
 }
 
+/// Who settles a streamed request's reservation: the payment adapter, once it
+/// has committed (or given up on) the buyer's payment.
+#[derive(Clone)]
+enum ResponseSettlement {
+    /// Flat price, charged only at explicit completion.
+    Completion(StreamCompletion),
+    /// Per-token price, earned as the session meter commits usage.
+    Metered(MeteredSettlement),
+}
+
 /// Releases a parked request if its buyer response is dropped before the
 /// worker completes or fails it.
 struct ClaimedRequestGuard {
     entry: Arc<EndpointEntry>,
     request_id: String,
     expected_usd: f64,
-    completion: Option<pay_core::server::completion_stream::StreamCompletion>,
+    settlement: Option<ResponseSettlement>,
 }
 
 impl Drop for ClaimedRequestGuard {
     fn drop(&mut self) {
-        if self.entry.queue.abandon(&self.request_id).is_some() && self.completion.is_none() {
+        if self.entry.queue.abandon(&self.request_id).is_some() && self.settlement.is_none() {
             self.entry.release(self.expected_usd);
         }
     }
@@ -621,7 +632,7 @@ fn view_of(state: &SellState, entry: &EndpointEntry, owner_token: Option<String>
         chat_completions_url: format!("{}/{}", state.public_url, sale.chat_path()),
         model: sale.model.clone(),
         pricing: PricingInput::from(&sale.pricing),
-        schemes: sale.pricing.schemes(),
+        schemes: state.operator.schemes(&sale.pricing),
         recipient: sale.recipient.clone(),
         network: sale.network.clone(),
         currencies: sale.currencies.clone(),
@@ -784,7 +795,8 @@ async fn next_request(
     let wait = Duration::from_secs(query.wait.unwrap_or(30)).min(MAX_POLL_WAIT);
     let next = entry.queue.next(wait).await;
     for request in next.abandoned {
-        if !flat_stream(request.stream, &request.admission.pricing) {
+        // A streamed request's response settlement owns its reservation.
+        if !request.stream {
             entry.release(request.admission.expected_usd);
         }
     }
@@ -866,7 +878,7 @@ async fn complete(
         .complete(&request, input.event)
         .map_err(queue_error)?;
     let admission = completion.admission;
-    if flat_stream(completion.stream, &admission.pricing) {
+    if completion.stream {
         // Enqueuing is not delivery or payment commitment. The response's
         // settlement observer still owns the earning reservation.
         return if completion.delivered {
@@ -902,7 +914,7 @@ async fn fail(
         .queue
         .fail(&request, input.status.unwrap_or(502), input.message)
         .map_err(queue_error)?;
-    if !flat_stream(completion.stream, &completion.admission.pricing) {
+    if !completion.stream {
         entry.release(completion.admission.expected_usd);
     }
     if !completion.delivered {
@@ -957,7 +969,7 @@ async fn dispatch(
                 return openai_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
-                    &format!("request body is not JSON: {error}"),
+                    &format!("invalid request body: {error}"),
                 );
             }
         };
@@ -1022,6 +1034,13 @@ fn admission_for(sale: &SellInference, body: &[u8]) -> Result<Admission, serde_j
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // The gate prices this exact model string; never let accounting resolve
+    // a different rate for a whitespace variant of it.
+    if model.as_deref().is_some_and(|m| m.trim() != m) {
+        return Err(serde::de::Error::custom(
+            "model must not have leading or trailing whitespace",
+        ));
+    }
     let pricing = sale.pricing.clone();
     Ok(Admission {
         expected_usd: pricing.max_usd(),
@@ -1068,7 +1087,7 @@ async fn chat_completions(
                     return openai_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_request",
-                        &format!("request body is not JSON: {error}"),
+                        &format!("invalid request body: {error}"),
                     );
                 }
             };
@@ -1100,24 +1119,30 @@ async fn chat_completions(
         }
     };
 
-    let completion = completion_billed.then(|| {
+    let settlement = stream.then(|| {
         let entry = entry.clone();
-        pay_core::server::completion_stream::StreamCompletion::with_settlement_callback(
-            move |paid| {
-                if paid {
-                    entry.settle(expected_usd, expected_usd);
-                } else {
-                    entry.release(expected_usd);
-                }
-            },
-        )
+        if completion_billed {
+            ResponseSettlement::Completion(StreamCompletion::with_settlement_callback(
+                move |paid| {
+                    if paid {
+                        entry.settle(expected_usd, expected_usd);
+                    } else {
+                        entry.release(expected_usd);
+                    }
+                },
+            ))
+        } else {
+            ResponseSettlement::Metered(MeteredSettlement::with_callback(move |committed_usd| {
+                entry.settle(expected_usd, committed_usd.min(expected_usd));
+            }))
+        }
     });
     // Own cleanup before the first await: cancellation can race with claim.
     let guard = ClaimedRequestGuard {
         entry,
         request_id: id,
         expected_usd,
-        completion,
+        settlement,
     };
     // No answer starts until a worker takes the request.
     match tokio::time::timeout(CLAIM_TIMEOUT, rx.recv()).await {
@@ -1188,7 +1213,11 @@ fn sse(value: &Value) -> Bytes {
 }
 
 fn stream_response(rx: mpsc::UnboundedReceiver<Event>, guard: ClaimedRequestGuard) -> Response {
-    let completion = guard.completion.clone().unwrap_or_default();
+    let settlement = guard.settlement.clone();
+    let completion = match &settlement {
+        Some(ResponseSettlement::Completion(completion)) => completion.clone(),
+        _ => StreamCompletion::default(),
+    };
     let signal = completion.clone();
     let done = Bytes::from_static(b"data: [DONE]\n\n");
     let frames = futures_util::stream::unfold(Some((rx, guard)), move |state| {
@@ -1230,7 +1259,14 @@ fn stream_response(rx: mpsc::UnboundedReceiver<Event>, guard: ClaimedRequestGuar
         async move { keep }
     });
     let mut response = Response::new(Body::from_stream(frames));
-    response.extensions_mut().insert(completion);
+    match settlement {
+        Some(ResponseSettlement::Metered(metered)) => {
+            response.extensions_mut().insert(metered);
+        }
+        _ => {
+            response.extensions_mut().insert(completion);
+        }
+    }
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
@@ -1279,7 +1315,8 @@ mod tests {
         keypair[..32].copy_from_slice(sk.as_bytes());
         keypair[32..].copy_from_slice(sk.verifying_key().as_bytes());
         let signer = pay_kit::solana_keychain::MemorySigner::from_bytes(&keypair).unwrap();
-        let operator = Operator::new(Arc::new(signer), "http://127.0.0.1:1", SECRET);
+        let operator = Operator::new(Arc::new(signer), "http://127.0.0.1:1", SECRET)
+            .with_batch_store(Arc::new(pay_kit::core::store::MemoryChannelStore::new()));
         // No RPC in tests: challenges read this cached blockhash.
         operator
             .blockhashes
@@ -1545,6 +1582,41 @@ mod tests {
             assert_eq!(state.registry.get(&id).unwrap().queue.depth(), (0, 0));
             assert_eq!(state.registry.get(&id).unwrap().pending_usd(), 0.0);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn whitespace_padded_model_is_refused_before_admission() {
+        let state = state();
+        let app = router(state.clone());
+        let (id, token) = create_endpoint(
+            &app,
+            json!({
+                "pricing": { "per_token": {
+                    "default": { "in": 1.0, "out": 1.0 },
+                    "models": { "fast": { "in": 0.1, "out": 0.1 } },
+                    "max_usd": 0.25 } },
+                "model": "agent",
+                "network": "devnet",
+                "earn_cap_usd": 0.25
+            }),
+        )
+        .await;
+
+        let response = buyer(&state, &id, json!({ "model": " fast ", "messages": [] })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let entry = state.registry.get(&id).unwrap();
+        assert_eq!(entry.queue.depth(), (0, 0));
+        assert_eq!(entry.pending_usd(), 0.0);
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(view["earned_usd"], 0.0);
+        assert_eq!(view["closed"], false);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2978,5 +3050,338 @@ mod tests {
         let flat: PricingInput =
             serde_json::from_value(json!({ "per_request_usd": 0.02 })).unwrap();
         assert_eq!(flat, PricingInput::PerRequestUsd(0.02));
+    }
+
+    /// Per-token SSE through a real delegated MPP session gate.
+    mod metered_session {
+        use super::*;
+        use pay_core::PaymentState;
+        use pay_core::client::session::SessionHandle;
+        use pay_core::server::session::{SessionMpp, test_channel_state};
+        use pay_kit::core::store::{ChannelStore, MemoryChannelStore};
+        use pay_kit::mpp::server::session::SessionConfig;
+        use pay_kit::mpp::{SessionAuthentication, SessionVoucherSigner};
+        use pay_kit::solana_keychain::{MemorySigner, TransactionSigner};
+        use pay_types::metering::ApiSpec;
+        use solana_pubkey::Pubkey;
+
+        #[derive(Clone)]
+        struct SessionPaymentState {
+            apis: Vec<ApiSpec>,
+            session: Arc<SessionMpp>,
+        }
+
+        impl PaymentState for SessionPaymentState {
+            fn apis(&self) -> &[ApiSpec] {
+                &self.apis
+            }
+
+            fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+                None
+            }
+
+            fn session_mpp_handle(&self) -> Option<Arc<SessionMpp>> {
+                Some(self.session.clone())
+            }
+        }
+
+        pub(super) struct Fixture {
+            pub state: Arc<SellState>,
+            pub worker: Router,
+            pub id: String,
+            pub token: String,
+            pub entry: Arc<EndpointEntry>,
+            pub session: Arc<SessionMpp>,
+            pub channel: String,
+            buyer: Router,
+            authorization: String,
+        }
+
+        impl Fixture {
+            pub async fn new() -> Self {
+                let state = state();
+                let worker = router(state.clone());
+                let (id, token) = create_endpoint(
+                    &worker,
+                    json!({
+                        "pricing": {"per_token": {
+                            "default": {"in": 1.0, "out": 3.0},
+                            "max_usd": 0.25
+                        }},
+                        "model": "agent",
+                        "network": "devnet",
+                        "earn_cap_usd": 0.25
+                    }),
+                )
+                .await;
+                let entry = state.registry.get(&id).unwrap();
+                let sale = entry.sale();
+                let operator = &state.operator;
+                let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+                let config = SessionConfig {
+                    operator: operator.pubkey(),
+                    recipient: operator.pubkey(),
+                    amount: 1,
+                    suggested_deposit: Some(1_000_000),
+                    currency: "USDC".into(),
+                    decimals: 6,
+                    network: "devnet".into(),
+                    voucher_signer: SessionVoucherSigner::Operator,
+                    fee_payer_signer: Some(operator.signer.clone()),
+                    // No chain: the seeded channel is not re-read on `use`.
+                    rpc_url: None,
+                    ..SessionConfig::default()
+                };
+                let cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+                cache.set("11111111111111111111111111111111".into(), 1_000, 1);
+                let session = Arc::new(
+                    SessionMpp::new_with_channel_store(config, SECRET, store.clone())
+                        .with_blockhash_cache(cache)
+                        .with_payment_channel_signer(operator.signer.clone()),
+                );
+                let challenge = session.challenge(None).unwrap();
+                let payer = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+                let channel = Pubkey::new_unique().to_string();
+                let proof =
+                    SessionAuthentication::sign(challenge.id.clone(), &channel, &payer).unwrap();
+                store
+                    .put_channel(
+                        &channel,
+                        test_channel_state(
+                            &channel,
+                            1_000_000,
+                            operator.pubkey(),
+                            "operator",
+                            &challenge.id,
+                            bs58::encode(payer.verifying_key().as_bytes()).into_string(),
+                            Some(serde_json::to_string(&proof).unwrap()),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                let mut keypair = [0u8; 64];
+                keypair[..32].copy_from_slice(payer.as_bytes());
+                keypair[32..].copy_from_slice(payer.verifying_key().as_bytes());
+                let signer: Box<dyn TransactionSigner> =
+                    Box::new(MemorySigner::from_bytes(&keypair).unwrap());
+                let authorization = SessionHandle::new(channel.parse().unwrap(), signer, challenge)
+                    .with_authentication(proof)
+                    .use_header()
+                    .await
+                    .unwrap();
+                let buyer = Router::new()
+                    .route(&format!("/{}", sale.chat_path()), post(chat_completions))
+                    .layer(middleware::from_fn_with_state(
+                        SessionPaymentState {
+                            apis: vec![sale.api_spec()],
+                            session: session.clone(),
+                        },
+                        payment_middleware::<SessionPaymentState>,
+                    ))
+                    .with_state(Arc::new(BuyerState {
+                        entry: Arc::downgrade(&entry),
+                        sale,
+                    }));
+                Self {
+                    state,
+                    worker,
+                    id,
+                    token,
+                    entry,
+                    session,
+                    channel,
+                    buyer,
+                    authorization,
+                }
+            }
+
+            /// Start a streamed buyer request and claim it as the worker.
+            pub async fn start(&self) -> (Response, String) {
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/{}", self.entry.sale().chat_path()))
+                    .header(header::HOST, "connect.test")
+                    .header(header::AUTHORIZATION, &self.authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model":"agent","stream":true,"messages":[]}).to_string(),
+                    ))
+                    .unwrap();
+                let buyer = tokio::spawn(self.buyer.clone().oneshot(request));
+                let (_, _, next) = self
+                    .worker_call(Method::GET, "queue/next?wait=5", None)
+                    .await;
+                let rid = next["request_id"].as_str().unwrap().to_string();
+                let response = tokio::time::timeout(Duration::from_secs(5), buyer)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "text/event-stream"
+                );
+                (response, rid)
+            }
+
+            pub async fn worker_call(
+                &self,
+                method: Method,
+                path: &str,
+                body: Option<Value>,
+            ) -> (StatusCode, HeaderMap, Value) {
+                send(
+                    &self.worker,
+                    method,
+                    &format!("/v1/endpoints/{}/{path}", self.id),
+                    Some(&self.token),
+                    body,
+                )
+                .await
+            }
+
+            pub fn committed(&self) -> u64 {
+                self.session
+                    .committed_watermark(&self.channel)
+                    .unwrap_or_default()
+            }
+
+            /// Settlement runs when the response's meter drops; wait for it.
+            pub async fn settled(&self) {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while self.entry.pending_usd() > 0.0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the response settlement must resolve the reservation");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn unread_per_token_stream_does_not_earn_before_session_commit() {
+            let fixture = Fixture::new().await;
+            let (response, rid) = fixture.start().await;
+            let (status, _, body) = fixture
+                .worker_call(
+                    Method::POST,
+                    &format!("requests/{rid}/complete"),
+                    Some(json!({
+                        "event": {"usage": {"prompt_tokens": 250_000, "completion_tokens": 0}}
+                    })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(fixture.committed(), 0, "the buyer has not paid yet");
+            assert_eq!(fixture.entry.earned_usd(), 0.0, "delivery is not payment");
+            assert_eq!(fixture.entry.pending_usd(), 0.25, "the response owns it");
+            assert!(!fixture.entry.is_closed());
+
+            drop(response);
+            fixture.settled().await;
+            assert_eq!(fixture.entry.earned_usd(), 0.0);
+            assert!(!fixture.entry.is_closed());
+            assert!(
+                fixture
+                    .session
+                    .reserve_delegated_capacity(&fixture.channel, 250_000)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cancelled_per_token_stream_earns_its_committed_prefix() {
+            let fixture = Fixture::new().await;
+            let (response, rid) = fixture.start().await;
+            let (status, _, _) = fixture
+                .worker_call(
+                    Method::POST,
+                    &format!("requests/{rid}/chunks"),
+                    Some(json!({ "chunks": [
+                        {"choices": [{"delta": {"content": "partial"}}],
+                         "usage": {"prompt_tokens": 50_000, "completion_tokens": 0}}
+                    ]})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            let mut body = response.into_body().into_data_stream();
+            let first = body.next().await.unwrap().unwrap();
+            assert!(first.starts_with(b"data: "));
+            let committed = fixture.committed();
+            assert!(committed >= 50_000, "the prefix is paid: {committed}");
+            let paid_usd = committed as f64 / 1e6;
+
+            // The buyer disconnects before the worker finishes.
+            drop(body);
+            fixture.settled().await;
+            assert!((fixture.entry.earned_usd() - paid_usd).abs() < 1e-9);
+            assert_eq!(fixture.entry.pending_usd(), 0.0);
+
+            // The worker's late completion cannot settle it again.
+            let (status, _, _) = fixture
+                .worker_call(
+                    Method::POST,
+                    &format!("requests/{rid}/complete"),
+                    Some(json!({
+                        "event": {"usage": {"prompt_tokens": 250_000, "completion_tokens": 0}}
+                    })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!((fixture.entry.earned_usd() - paid_usd).abs() < 1e-9);
+            assert!(!fixture.entry.is_closed());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn repeated_paid_cancellations_close_the_endpoint_at_its_cap() {
+            let fixture = Fixture::new().await;
+            for _ in 0..5 {
+                let (response, rid) = fixture.start().await;
+                fixture
+                    .worker_call(
+                        Method::POST,
+                        &format!("requests/{rid}/chunks"),
+                        Some(json!({ "chunks": [
+                            {"usage": {"prompt_tokens": 50_000, "completion_tokens": 0}}
+                        ]})),
+                    )
+                    .await;
+                let mut body = response.into_body().into_data_stream();
+                body.next().await.unwrap().unwrap();
+                drop(body);
+                fixture.settled().await;
+            }
+            assert!((fixture.entry.earned_usd() - 0.25).abs() < 1e-9);
+            assert!(
+                fixture.entry.is_closed(),
+                "paid prefixes count toward the cap"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn read_per_token_stream_earns_what_the_session_committed() {
+            let fixture = Fixture::new().await;
+            let (response, rid) = fixture.start().await;
+            let (status, _, _) = fixture
+                .worker_call(
+                    Method::POST,
+                    &format!("requests/{rid}/complete"),
+                    Some(json!({
+                        "event": {"usage": {"prompt_tokens": 100_000, "completion_tokens": 0}}
+                    })),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(body.ends_with(b"data: [DONE]\n\n"));
+            fixture.settled().await;
+            assert_eq!(fixture.committed(), 100_000);
+            assert!((fixture.entry.earned_usd() - 0.1).abs() < 1e-9);
+            assert!(!fixture.entry.is_closed());
+            assert_eq!(fixture.state.registry.len(), 1);
+        }
     }
 }

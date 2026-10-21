@@ -220,17 +220,19 @@ fn is_token_usable_for(
     if !url_is_sub_resource(resource_url, stored_url) {
         return false;
     }
-    let expires_at = sub
-        .authenticate_expires_at
-        .as_deref()
-        .or(sub.expires_at.as_deref());
-    let Some(expires_at) = expires_at else {
-        return true;
-    };
-    match chrono::DateTime::parse_from_rfc3339(expires_at) {
-        Ok(t) => t.with_timezone(&chrono::Utc) > now,
-        Err(_) => false,
-    }
+    // Both the token and the subscription must still be live.
+    [
+        sub.authenticate_expires_at.as_deref(),
+        sub.expires_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(
+        |expires_at| match chrono::DateTime::parse_from_rfc3339(expires_at) {
+            Ok(t) => t.with_timezone(&chrono::Utc) > now,
+            Err(_) => false,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -314,6 +316,31 @@ mod tests {
         let store = store_with(sub);
         let hit = cached_header_for_resource(&store, "https://api.example.com/v1/resource");
         assert_eq!(hit.as_deref(), Some(token));
+    }
+
+    #[test]
+    fn cached_token_is_dropped_once_the_subscription_expires_first() {
+        let token = "Payment eyJfYWtlfQ==";
+        let token_expiry = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let mut sub = make_sub(
+            "DerivedPda",
+            Some("https://api.example.com/v1"),
+            Some(token),
+            Some(&token_expiry),
+            SubscriptionStatus::Active,
+        );
+        sub.expires_at = Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        let lookup = |sub: Subscription| {
+            cached_header_for_resource(&store_with(sub), "https://api.example.com/v1/resource")
+        };
+        assert_eq!(lookup(sub.clone()), None);
+
+        sub.expires_at = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        assert_eq!(lookup(sub.clone()).as_deref(), Some(token));
+        // The later of the two never extends the earlier one.
+        sub.authenticate_expires_at =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        assert_eq!(lookup(sub), None);
     }
 
     #[test]

@@ -29,6 +29,7 @@ use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub use crate::server::gate::UpstreamRoute;
 use crate::server::payment::TrustedPaymentIdentity;
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::{metering, payment, telemetry};
@@ -88,6 +89,17 @@ pub fn upstream_error_for_logging(error: &reqwest::Error) -> String {
     safe
 }
 
+/// HTTP client for every credential-bearing upstream and token request.
+///
+/// Redirects are never followed: a 3xx is returned to the caller as-is so
+/// operator credentials and request bodies cannot reach another origin.
+pub fn upstream_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client with default TLS config must build")
+}
+
 /// Remove query values from an arbitrary error string that may embed `url`.
 pub fn redact_url_in_error(error: &str, url: &reqwest::Url) -> String {
     error.replace(url.as_str(), &upstream_url_for_logging(url))
@@ -107,16 +119,17 @@ const RFC3986_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// so browser payment-link and redirect flows can still inherit the endpoint's
 /// transport behavior even when the browser uses `GET` against a non-GET
 /// metered endpoint.
+///
+/// Endpoint selection mirrors the payment gate: literal paths win over
+/// `{param}` / `{*rest}` patterns, so a concrete request the gate matched
+/// against a pattern also inherits that endpoint's routing override.
+///
+/// Forwarding uses [`UpstreamRoute::routing`] instead, which follows the
+/// endpoint the gate actually selected.
 pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
-    let trimmed = path.trim_start_matches('/');
-    for ep in &api.endpoints {
-        if ep.path == trimmed
-            && let Some(ref r) = ep.routing
-        {
-            return r;
-        }
-    }
-    &api.routing
+    metering::find_endpoint_by_path(api, path.trim_start_matches('/'))
+        .and_then(|ep| ep.routing.as_ref())
+        .unwrap_or(&api.routing)
 }
 
 /// Does the endpoint's upstream auth digest the **request body** (an HMAC /
@@ -126,9 +139,9 @@ pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
 /// The axum path always has the buffered body. The Pingora data plane uses this
 /// signal to select its bounded request-buffering adapter instead of preparing a
 /// signature against an empty placeholder body.
-pub fn routing_signs_request_body(api: &ApiSpec, path: &str) -> bool {
+pub fn routing_signs_request_body(api: &ApiSpec, route: &UpstreamRoute) -> bool {
     use pay_types::metering::{AuthConfig, HmacPrepareValue};
-    let prepares = match resolve_routing(api, path).auth() {
+    let prepares = match route.routing(api).auth() {
         Some(AuthConfig::Hmac { prepare, .. } | AuthConfig::AccessToken { prepare, .. }) => prepare,
         _ => return false,
     };
@@ -150,12 +163,13 @@ pub fn routing_signs_request_body(api: &ApiSpec, path: &str) -> bool {
 #[allow(clippy::result_large_err)]
 pub async fn forward_request(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    forward_request_with_session_metering(api, method, uri, headers, body, None).await
+    forward_request_with_session_metering(api, route, method, uri, headers, body, None).await
 }
 
 /// Forward a request and optionally meter the streamed response against an open
@@ -171,6 +185,7 @@ pub async fn forward_request(
 #[allow(clippy::result_large_err)]
 pub async fn forward_request_with_session_metering(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -179,6 +194,7 @@ pub async fn forward_request_with_session_metering(
 ) -> Result<Response, Response> {
     forward_request_with_session_metering_and_identity(
         api,
+        route,
         method,
         uri,
         headers,
@@ -192,6 +208,7 @@ pub async fn forward_request_with_session_metering(
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
 pub async fn forward_request_with_session_metering_and_identity(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -201,6 +218,7 @@ pub async fn forward_request_with_session_metering_and_identity(
 ) -> Result<Response, Response> {
     let prepared = match prepare_upstream_with_identity(
         api,
+        route,
         &method,
         uri,
         headers,
@@ -213,7 +231,7 @@ pub async fn forward_request_with_session_metering_and_identity(
         UpstreamPlan::Forward(prepared) => prepared,
     };
 
-    let client = reqwest::Client::new();
+    let client = upstream_http_client();
     let mut upstream_req = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
         prepared.url.clone(),
@@ -279,7 +297,9 @@ pub async fn forward_request_with_session_metering_and_identity(
         .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"));
 
     let stream = upstream_resp.bytes_stream();
-    if let Some(meter) = build_session_stream_meter(api, &method, uri, headers, session_context) {
+    if let Some(meter) = build_session_stream_meter(api, &method, uri, headers, session_context)
+        .map(|meter| meter.with_request_body_bytes(body.len() as u64))
+    {
         return Ok(resp
             .body(Body::from_stream(session_stream::meter_response_stream(
                 stream, meter, is_sse,
@@ -307,17 +327,19 @@ pub enum UpstreamPlan {
 #[allow(clippy::result_large_err)]
 pub async fn prepare_upstream(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<UpstreamPlan, Response> {
-    prepare_upstream_with_identity(api, method, uri, headers, body, None).await
+    prepare_upstream_with_identity(api, route, method, uri, headers, body, None).await
 }
 
 #[allow(clippy::result_large_err)]
 pub async fn prepare_upstream_with_identity(
     api: &ApiSpec,
+    route: &UpstreamRoute,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -329,7 +351,25 @@ pub async fn prepare_upstream_with_identity(
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path());
 
-    let routing = resolve_routing(api, uri.path());
+    if crate::server::gate::has_dot_segment(uri.path()) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid request path",
+        ));
+    }
+
+    // Only the gate's admission of this exact request reaches the upstream.
+    if !route.admits(api, method, uri.path()) {
+        return Ok(UpstreamPlan::Respond(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":"not_found"}"#))
+                .unwrap(),
+        ));
+    }
+
+    let routing = route.routing(api);
 
     // Respond mode — no upstream call.
     if routing.is_respond() {
@@ -395,6 +435,10 @@ pub async fn prepare_upstream_with_identity(
                 identity.channel_id.as_deref(),
             );
         }
+        payment::inject_payment_policy_header(
+            &mut trusted_headers,
+            identity.payment_policy.as_deref(),
+        );
         for (name, value) in trusted_headers {
             if let Some(name) = name
                 && let Ok(value) = value.to_str()
@@ -460,7 +504,7 @@ pub async fn prepare_upstream_with_identity(
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
                     return Err(error_response(
                         StatusCode::BAD_GATEWAY,
-                        &format!("OAuth2 token error: {e}"),
+                        "OAuth2 token request failed",
                     ));
                 }
             }
@@ -479,7 +523,8 @@ pub async fn prepare_upstream_with_identity(
                         &upstream_url_for_logging(&prepared.url),
                         &e,
                     );
-                    error_response(StatusCode::BAD_GATEWAY, &e)
+                    tracing::error!(error = %e, "Failed to fetch access token");
+                    error_response(StatusCode::BAD_GATEWAY, "Access token request failed")
                 })?;
         }
         _ => {}
@@ -1150,7 +1195,7 @@ async fn fetch_access_token(fetch: &AccessTokenFetchConfig) -> Result<FetchedTok
         apply_prepared_request_auth(&mut prepared, &method, &[], auth)?;
     }
 
-    let client = reqwest::Client::new();
+    let client = upstream_http_client();
     let mut request = client.request(
         reqwest_method_from_spec(&fetch.method),
         prepared.url.clone(),
@@ -1159,15 +1204,19 @@ async fn fetch_access_token(fetch: &AccessTokenFetchConfig) -> Result<FetchedTok
         request = request.header(name.as_str(), value);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Access token request failed: {e}"))?;
+    let response = request.send().await.map_err(|e| {
+        format!(
+            "Access token request failed: {}",
+            upstream_error_for_logging(&e)
+        )
+    })?;
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Access token response read failed: {e}"))?;
+    let text = response.text().await.map_err(|e| {
+        format!(
+            "Access token response read failed: {}",
+            upstream_error_for_logging(&e)
+        )
+    })?;
     if !status.is_success() {
         return Err(format!("Access token request failed with {status}"));
     }
@@ -1267,13 +1316,19 @@ pub(super) struct FetchedToken {
 /// tuple. The metadata server returns different tokens for different scope
 /// sets (and different audiences in identity mode), and standard OAuth2
 /// providers key tokens by client. Caching them all under a single slot would
-/// cause one upstream's token to evict another's.
+/// cause one upstream's token to evict another's. The client-secret identity
+/// (env name plus a SHA-256 fingerprint of its value) is part of the key so a
+/// token minted with one secret is never served to a route using another, and
+/// rotating a secret invalidates its cached token.
 #[derive(PartialEq, Eq, Hash)]
 struct TokenKey {
     token_url: String,
     scopes: Vec<String>,
     audience: Option<String>,
+    client_id_env: Option<String>,
     client_id: Option<String>,
+    client_secret_env: Option<String>,
+    client_secret_fingerprint: Option<[u8; 32]>,
 }
 
 static OAUTH2_TOKEN_CACHE: std::sync::OnceLock<Arc<RwLock<HashMap<TokenKey, CachedToken>>>> =
@@ -1295,7 +1350,12 @@ async fn oauth2_token(
         token_url: token_url.to_string(),
         scopes: scopes.to_vec(),
         audience: audience.map(str::to_string),
+        client_id_env: client_id_env.map(str::to_string),
         client_id: client_id_env.and_then(|e| std::env::var(e).ok()),
+        client_secret_env: client_secret_env.map(str::to_string),
+        client_secret_fingerprint: client_secret_env
+            .and_then(|e| std::env::var(e).ok())
+            .map(|secret| Sha256::digest(secret.as_bytes()).into()),
     };
 
     // Check cache — require at least 30s of remaining life to avoid races
@@ -1346,7 +1406,7 @@ async fn fetch_oauth2_token(
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
 ) -> Result<FetchedToken, String> {
-    let client = reqwest::Client::new();
+    let client = upstream_http_client();
 
     // Special: GCP metadata server.
     if token_url == "gcp_metadata" {
@@ -1381,12 +1441,19 @@ async fn fetch_oauth2_token(
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("OAuth2 token request failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "OAuth2 token request failed: {}",
+                upstream_error_for_logging(&e)
+            )
+        })?;
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Invalid OAuth2 response: {e}"))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        format!(
+            "Invalid OAuth2 response: {}",
+            upstream_error_for_logging(&e)
+        )
+    })?;
 
     let access_token = body["access_token"]
         .as_str()
@@ -1459,12 +1526,17 @@ async fn fetch_gcp_metadata_token(
         ])
         .send()
         .await
-        .map_err(|e| format!("ADC token refresh failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "ADC token refresh failed: {}",
+                upstream_error_for_logging(&e)
+            )
+        })?;
 
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Invalid token response: {e}"))?;
+        .map_err(|e| format!("Invalid token response: {}", upstream_error_for_logging(&e)))?;
 
     let access_token = body["access_token"]
         .as_str()
@@ -1511,6 +1583,7 @@ pub(super) async fn fetch_gcp_metadata_identity_token_at(
         .send()
         .await
         .map_err(|e| {
+            let e = upstream_error_for_logging(&e);
             format!(
                 "GCP metadata server unreachable ({e}): identity tokens require running on GCP (Cloud Run/GCE); there is no ADC fallback"
             )
@@ -1575,6 +1648,33 @@ mod tests {
         HmacSignatureDestination, HmacStringEncoding, HmacTarget, HmacTargetType,
         HmacTimestampFormat, HttpMethod, RoutingConfig,
     };
+
+    /// Unit tests exercise upstream preparation for an already-admitted request.
+    #[allow(clippy::result_large_err)]
+    async fn forward_request(
+        api: &ApiSpec,
+        method: Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<Response, Response> {
+        let route = UpstreamRoute::for_tests(api, &method, uri.path());
+        super::forward_request(api, &route, method, uri, headers, body).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn prepare_upstream_with_identity(
+        api: &ApiSpec,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        body: &[u8],
+        identity: Option<&TrustedPaymentIdentity>,
+    ) -> Result<UpstreamPlan, Response> {
+        let route = UpstreamRoute::for_tests(api, method, uri.path());
+        super::prepare_upstream_with_identity(api, &route, method, uri, headers, body, identity)
+            .await
+    }
 
     #[test]
     fn upstream_log_url_redacts_every_query_value() {
@@ -1649,15 +1749,19 @@ mod tests {
         // Alibaba-style HMAC includes a Content-MD5 `BodyDigest` prepare binding,
         // so it signs the request body → unsupported on the streaming data plane.
         let api = api_with_auth(Some(alibaba_hmac_auth_config(true)));
-        assert!(routing_signs_request_body(&api, "v1/anything"));
+        assert!(routing_signs_request_body(
+            &api,
+            &UpstreamRoute::for_tests(&api, &Method::POST, "v1/anything")
+        ));
     }
 
     #[test]
     fn routing_signs_request_body_false_when_body_untouched() {
         // No upstream auth at all.
+        let api = make_api("test");
         assert!(!routing_signs_request_body(
-            &make_api("test"),
-            "v1/anything"
+            &api,
+            &UpstreamRoute::for_tests(&api, &Method::POST, "v1/anything")
         ));
         // Header auth never reads the body.
         let header = api_with_auth(Some(AuthConfig::Header {
@@ -1665,7 +1769,10 @@ mod tests {
             prefix: Some("Bearer ".to_string()),
             value_from_env: "_TEST_KEY".to_string(),
         }));
-        assert!(!routing_signs_request_body(&header, "v1/anything"));
+        assert!(!routing_signs_request_body(
+            &header,
+            &UpstreamRoute::for_tests(&header, &Method::POST, "v1/anything")
+        ));
     }
 
     fn alibaba_hmac_auth_config(fixed_values: bool) -> AuthConfig {
@@ -2006,6 +2113,7 @@ mod tests {
             payer: Some("trusted-payer".into()),
             channel_id: Some("trusted-channel".into()),
             original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+            payment_policy: None,
         };
         let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
             &api,
@@ -2036,6 +2144,7 @@ mod tests {
             payer: None,
             channel_id: None,
             original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+            payment_policy: None,
         };
         let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
             &api,
@@ -2055,6 +2164,55 @@ mod tests {
             prepared.header_value("x-pay-original-host"),
             Some("worker.cpu.gcp.gateway-402.com")
         );
+        assert_eq!(prepared.header_value("x-pay-payment-policy"), None);
+    }
+
+    #[tokio::test]
+    async fn admitted_payment_policy_replaces_a_spoofed_policy_header() {
+        let api = make_api("test");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-pay-payment-policy",
+            HeaderValue::from_static(r#"{"version":999}"#),
+        );
+        let admitted =
+            r#"{"deployment":{"hostname":"w.example"},"version":3,"price_micro_usd":10}"#;
+        let identity = TrustedPaymentIdentity {
+            payer: Some("trusted-payer".into()),
+            payment_policy: Some(admitted.into()),
+            ..Default::default()
+        };
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&identity),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(
+            prepared.header_value("x-pay-payment-policy"),
+            Some(admitted)
+        );
+
+        // Without an admitted policy the caller's value never reaches upstream.
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&TrustedPaymentIdentity::default()),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(prepared.header_value("x-pay-payment-policy"), None);
     }
 
     #[test]
@@ -2931,12 +3089,7 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap()
-                .contains("client_id env var not set")
-        );
+        assert_eq!(json["message"], "OAuth2 token request failed");
     }
 
     #[tokio::test]
@@ -2965,12 +3118,7 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap()
-                .contains("oauth2.audience is required")
-        );
+        assert_eq!(json["message"], "OAuth2 token request failed");
     }
 
     // ── jwt_exp_claim ────────────────────────────────────────────────────
@@ -3075,6 +3223,128 @@ mod tests {
         assert!(resolve_routing(&api, "/v1/shared").is_respond());
     }
 
+    fn endpoint_with_routing(
+        path: &str,
+        routing: Option<RoutingConfig>,
+    ) -> pay_types::metering::Endpoint {
+        pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Post,
+            path: path.to_string(),
+            description: None,
+            resource: None,
+            routing,
+            metering: None,
+            subscription: None,
+        }
+    }
+
+    #[test]
+    fn resolve_routing_applies_parameterized_endpoint_override() {
+        let mut api = make_api("test");
+        api.endpoints.push(endpoint_with_routing(
+            "v1/projects/{projectId}/query",
+            Some(RoutingConfig::Respond {}),
+        ));
+        api.endpoints.push(endpoint_with_routing(
+            "v1/jobs/{*rest}",
+            Some(RoutingConfig::Respond {}),
+        ));
+        api.endpoints.push(endpoint_with_routing(
+            "v1beta/models/{modelId}:generate",
+            Some(RoutingConfig::Respond {}),
+        ));
+
+        assert!(resolve_routing(&api, "/v1/projects/acme/query").is_respond());
+        assert!(resolve_routing(&api, "/v1/jobs/42/logs").is_respond());
+        assert!(resolve_routing(&api, "/v1beta/models/flash:generate").is_respond());
+        // Near misses keep the API-level routing.
+        assert!(resolve_routing(&api, "/v1/projects/acme/other").is_proxy());
+        assert!(resolve_routing(&api, "/v1/jobs").is_proxy());
+        assert!(resolve_routing(&api, "/v1beta/models/flash:stream").is_proxy());
+    }
+
+    #[test]
+    fn resolve_routing_prefers_literal_endpoint_over_pattern() {
+        let mut api = make_api("test");
+        api.endpoints.push(endpoint_with_routing(
+            "v1/projects/{projectId}/query",
+            Some(RoutingConfig::Respond {}),
+        ));
+        api.endpoints
+            .push(endpoint_with_routing("v1/projects/public/query", None));
+
+        // The gate selects the literal endpoint, which has no override.
+        assert!(resolve_routing(&api, "/v1/projects/public/query").is_proxy());
+        assert!(resolve_routing(&api, "/v1/projects/acme/query").is_respond());
+    }
+
+    #[tokio::test]
+    async fn forward_request_uses_parameterized_override_upstream_and_credential() {
+        async fn upstream(label: &'static str) -> String {
+            let app = axum::Router::new().fallback(move |req: axum::extract::Request| async move {
+                let key = req
+                    .headers()
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                axum::Json(serde_json::json!({"origin": label, "api_key": key}))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        }
+        fn route(url: String, env: &str) -> RoutingConfig {
+            RoutingConfig::Proxy {
+                url,
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Header {
+                    key: "x-api-key".to_string(),
+                    prefix: None,
+                    value_from_env: env.to_string(),
+                })),
+            }
+        }
+        unsafe {
+            std::env::set_var("_TEST_ROUTE_TOP_KEY", "top-level-secret");
+            std::env::set_var("_TEST_ROUTE_EP_KEY", "endpoint-secret");
+        }
+        let mut api = make_api("test");
+        api.routing = route(upstream("top-level").await, "_TEST_ROUTE_TOP_KEY");
+        api.endpoints.push(endpoint_with_routing(
+            "v1/projects/{projectId}/query",
+            Some(route(upstream("endpoint").await, "_TEST_ROUTE_EP_KEY")),
+        ));
+        api.endpoints.push(endpoint_with_routing("v1/other", None));
+
+        let observe = |path: &'static str| {
+            let api = api.clone();
+            async move {
+                let response = forward_request(
+                    &api,
+                    Method::POST,
+                    &Uri::from_static(path),
+                    &HeaderMap::new(),
+                    Bytes::from_static(b"{}"),
+                )
+                .await
+                .unwrap();
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        let paid = observe("/v1/projects/acme/query?sql=select%201").await;
+        assert_eq!(paid["origin"], "endpoint");
+        assert_eq!(paid["api_key"], "endpoint-secret");
+        let other = observe("/v1/other").await;
+        assert_eq!(other["origin"], "top-level");
+        assert_eq!(other["api_key"], "top-level-secret");
+    }
+
     // ── forward_request with Respond routing ─────────────────────────────
 
     #[tokio::test]
@@ -3139,6 +3409,10 @@ mod tests {
             metering: None,
             subscription: None,
         });
+        api.endpoints.push(declared_endpoint(
+            pay_types::metering::HttpMethod::Get,
+            "v1/proxy-me",
+        ));
 
         // Respond endpoint returns 200 directly
         let uri: Uri = "/v1/respond-only".parse().unwrap();
@@ -3158,5 +3432,452 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
         let body2 = axum::body::to_bytes(resp2.into_body(), 1024).await.unwrap();
         assert_eq!(&body2[..], b"from upstream");
+    }
+
+    /// Upstream that redirects every request to `target`, plus a collector that
+    /// records whether any request (and which credential) reached it.
+    async fn spawn_redirect_and_collector(
+        status: StatusCode,
+    ) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        let hits: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&hits);
+        let collector = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let capture = Arc::clone(&capture);
+            async move {
+                capture.lock().unwrap().push(
+                    headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                );
+                "collected"
+            }
+        });
+        let (collector_url, _collector) = spawn_upstream(collector).await;
+        let location = format!(
+            "{}/capture",
+            collector_url.replace("127.0.0.1", "localhost")
+        );
+        let redirect = axum::Router::new().fallback(move || {
+            let location = location.clone();
+            async move {
+                (
+                    status,
+                    [(axum::http::header::LOCATION, location)],
+                    "redirecting",
+                )
+            }
+        });
+        let (redirect_url, _redirect) = spawn_upstream(redirect).await;
+        (redirect_url, hits)
+    }
+
+    #[tokio::test]
+    async fn forward_request_does_not_follow_cross_origin_redirects() {
+        for status in [
+            StatusCode::MOVED_PERMANENTLY,
+            StatusCode::FOUND,
+            StatusCode::SEE_OTHER,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let (redirect_url, hits) = spawn_redirect_and_collector(status).await;
+            // SAFETY: test-only env mutation scoped to this test.
+            unsafe { std::env::set_var("_TEST_PROXY_REDIRECT_KEY", "operator-secret") };
+            let api = ApiSpec {
+                routing: RoutingConfig::Proxy {
+                    url: redirect_url,
+                    path_rewrites: vec![],
+                    auth: Some(Box::new(AuthConfig::Header {
+                        key: "x-api-key".to_string(),
+                        prefix: None,
+                        value_from_env: "_TEST_PROXY_REDIRECT_KEY".to_string(),
+                    })),
+                },
+                ..make_api("test")
+            };
+
+            let uri: Uri = "/v1/redirect".parse().unwrap();
+            let resp = forward_request(
+                &api,
+                Method::POST,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::from_static(b"paid-protected-body"),
+            )
+            .await
+            .unwrap();
+            unsafe { std::env::remove_var("_TEST_PROXY_REDIRECT_KEY") };
+
+            assert_eq!(resp.status(), status, "3xx must be relayed, not followed");
+            assert!(resp.headers().get("location").is_some());
+            assert!(
+                hits.lock().unwrap().is_empty(),
+                "{status}: redirect target must never receive the request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth2_token_fetch_does_not_follow_redirects() {
+        let (redirect_url, hits) =
+            spawn_redirect_and_collector(StatusCode::TEMPORARY_REDIRECT).await;
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe {
+            std::env::set_var("_TEST_REDIRECT_OAUTH_ID", "client");
+            std::env::set_var("_TEST_REDIRECT_OAUTH_SECRET", "secret");
+        }
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: "http://127.0.0.1:9".to_string(),
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Oauth2 {
+                    token_url: format!("{redirect_url}/token"),
+                    scopes: vec![],
+                    audience: None,
+                    client_id_from_env: Some("_TEST_REDIRECT_OAUTH_ID".to_string()),
+                    client_secret_from_env: Some("_TEST_REDIRECT_OAUTH_SECRET".to_string()),
+                    headers: HashMap::new(),
+                })),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+        unsafe {
+            std::env::remove_var("_TEST_REDIRECT_OAUTH_ID");
+            std::env::remove_var("_TEST_REDIRECT_OAUTH_SECRET");
+        }
+
+        assert_eq!(result.unwrap_err().status(), StatusCode::BAD_GATEWAY);
+        assert!(hits.lock().unwrap().is_empty());
+    }
+
+    async fn error_message(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        json["message"].as_str().unwrap().to_string()
+    }
+
+    fn closed_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn access_token_fetch_failure_never_exposes_token_url_or_query_secret() {
+        let port = closed_local_port();
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe { std::env::set_var("_TEST_NESTED_QUERY_SECRET", "nested-query-secret") };
+        let api = api_with_auth(Some(AuthConfig::AccessToken {
+            prepare: vec![],
+            fetch: AccessTokenFetchConfig {
+                url: format!("http://127.0.0.1:{port}/token?existing=1"),
+                method: HttpMethod::Get,
+                prepare: vec![],
+                auth: Some(Box::new(AuthConfig::QueryParam {
+                    key: "api_key".to_string(),
+                    value_from_env: "_TEST_NESTED_QUERY_SECRET".to_string(),
+                })),
+                response: AccessTokenResponseConfig {
+                    token_json_pointer: "/access_token".to_string(),
+                    expires_at_json_pointer: None,
+                    expires_in_json_pointer: Some("/expires_in".to_string()),
+                    expires_at_format: Default::default(),
+                    refresh_skew_seconds: 0,
+                },
+            },
+            inject: AccessTokenInjectConfig {
+                target: HmacTarget {
+                    kind: HmacTargetType::Header,
+                    name: "X-Access-Token".to_string(),
+                },
+                template: "{token}".to_string(),
+            },
+        }));
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+        unsafe { std::env::remove_var("_TEST_NESTED_QUERY_SECRET") };
+
+        let response = result.unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let message = error_message(response).await;
+        assert_eq!(message, "Access token request failed");
+        assert!(!message.contains("nested-query-secret"));
+        assert!(!message.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn oauth2_token_fetch_failure_never_exposes_token_url() {
+        let port = closed_local_port();
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe {
+            std::env::set_var("_TEST_FAILING_OAUTH_ID", "client");
+            std::env::set_var("_TEST_FAILING_OAUTH_SECRET", "secret");
+        }
+        let api = api_with_auth(Some(AuthConfig::Oauth2 {
+            token_url: format!("http://127.0.0.1:{port}/token?tenant=signed-value"),
+            scopes: vec![],
+            audience: None,
+            client_id_from_env: Some("_TEST_FAILING_OAUTH_ID".to_string()),
+            client_secret_from_env: Some("_TEST_FAILING_OAUTH_SECRET".to_string()),
+            headers: HashMap::new(),
+        }));
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+        unsafe {
+            std::env::remove_var("_TEST_FAILING_OAUTH_ID");
+            std::env::remove_var("_TEST_FAILING_OAUTH_SECRET");
+        }
+
+        let response = result.unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let message = error_message(response).await;
+        assert_eq!(message, "OAuth2 token request failed");
+        assert!(!message.contains("signed-value"));
+    }
+
+    #[tokio::test]
+    async fn nested_token_request_errors_redact_query_values_for_logging() {
+        let port = closed_local_port();
+        let error = upstream_http_client()
+            .get(format!(
+                "http://127.0.0.1:{port}/token?api_key=nested-secret"
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        let safe = upstream_error_for_logging(&error);
+        assert!(!safe.contains("nested-secret"));
+        assert!(safe.contains("api_key=%5BREDACTED%5D"));
+    }
+
+    async fn spawn_secret_bound_oauth_upstream() -> (String, Arc<AtomicUsize>) {
+        let token_requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&token_requests);
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(
+                    move |axum::extract::Form(form): axum::extract::Form<
+                        HashMap<String, String>,
+                    >| {
+                        let counter = Arc::clone(&counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let secret = form.get("client_secret").cloned().unwrap_or_default();
+                            axum::Json(serde_json::json!({
+                                "access_token": format!("token-for-{secret}"),
+                                "expires_in": 3600
+                            }))
+                        }
+                    },
+                ),
+            )
+            .fallback(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string()
+            });
+        let (base_url, _handle) = spawn_upstream(app).await;
+        (base_url, token_requests)
+    }
+
+    fn secret_bound_oauth_api(base_url: &str, client_id_env: &str, secret_env: &str) -> ApiSpec {
+        ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url.to_string(),
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Oauth2 {
+                    token_url: format!("{base_url}/token"),
+                    scopes: vec!["scope.shared".to_string()],
+                    audience: None,
+                    client_id_from_env: Some(client_id_env.to_string()),
+                    client_secret_from_env: Some(secret_env.to_string()),
+                    headers: HashMap::new(),
+                })),
+            },
+            ..make_api("test")
+        }
+    }
+
+    async fn upstream_authorization(api: &ApiSpec) -> String {
+        let uri: Uri = "/upstream".parse().unwrap();
+        let resp = forward_request(api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oauth2_cache_never_shares_tokens_across_client_secrets() {
+        let (base_url, token_requests) = spawn_secret_bound_oauth_upstream().await;
+        // SAFETY: test-only env mutation with names unique to this test.
+        unsafe {
+            std::env::set_var("_TEST_OAUTH_CACHE_SHARED_ID", "client-1");
+            std::env::set_var("_TEST_OAUTH_CACHE_SECRET_A", "secret-a");
+            std::env::set_var("_TEST_OAUTH_CACHE_SECRET_B", "secret-b");
+        }
+        let route_a = secret_bound_oauth_api(
+            &base_url,
+            "_TEST_OAUTH_CACHE_SHARED_ID",
+            "_TEST_OAUTH_CACHE_SECRET_A",
+        );
+        let route_b = secret_bound_oauth_api(
+            &base_url,
+            "_TEST_OAUTH_CACHE_SHARED_ID",
+            "_TEST_OAUTH_CACHE_SECRET_B",
+        );
+
+        assert_eq!(
+            upstream_authorization(&route_a).await,
+            "Bearer token-for-secret-a"
+        );
+        assert_eq!(
+            upstream_authorization(&route_b).await,
+            "Bearer token-for-secret-b"
+        );
+        // Positive control: each route still reuses its own cached token.
+        assert_eq!(
+            upstream_authorization(&route_a).await,
+            "Bearer token-for-secret-a"
+        );
+        assert_eq!(token_requests.load(Ordering::SeqCst), 2);
+
+        // Rotating a secret value invalidates the token minted with the old one.
+        unsafe { std::env::set_var("_TEST_OAUTH_CACHE_SECRET_A", "secret-a2") };
+        assert_eq!(
+            upstream_authorization(&route_a).await,
+            "Bearer token-for-secret-a2"
+        );
+        assert_eq!(token_requests.load(Ordering::SeqCst), 3);
+        unsafe {
+            std::env::remove_var("_TEST_OAUTH_CACHE_SHARED_ID");
+            std::env::remove_var("_TEST_OAUTH_CACHE_SECRET_A");
+            std::env::remove_var("_TEST_OAUTH_CACHE_SECRET_B");
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_request_rejects_encoded_dot_segments_before_upstream() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                uri.path().to_string()
+            }
+        });
+        let (base_url, _handle) = spawn_upstream(app).await;
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url,
+                path_rewrites: vec![],
+                auth: None,
+            },
+            ..make_api("test")
+        };
+
+        for path in ["/v1/%2e%2e", "/v1/%2E%2E/admin", "/v1/../admin"] {
+            let uri: Uri = path.parse().unwrap();
+            let err = forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let uri: Uri = "/v1/item.json".parse().unwrap();
+        let resp = forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"/v1/item.json");
+    }
+
+    fn declared_endpoint(
+        method: pay_types::metering::HttpMethod,
+        path: &str,
+    ) -> pay_types::metering::Endpoint {
+        pay_types::metering::Endpoint {
+            method,
+            path: path.to_string(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+            subscription: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_route_admits_only_the_request_it_was_minted_for() {
+        let observed = Arc::new(Mutex::new(0_usize));
+        let capture = Arc::clone(&observed);
+        let app = axum::Router::new().fallback(move || {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock().unwrap() += 1;
+                "ok"
+            }
+        });
+        let (base_url, _handle) = spawn_upstream(app).await;
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url,
+                path_rewrites: vec![],
+                auth: None,
+            },
+            ..make_api("test")
+        };
+        let other = make_api("other");
+        let route = UpstreamRoute::for_tests(&api, &Method::POST, "/v1/search");
+
+        for (api, method, path) in [
+            (&api, Method::GET, "/v1/search"),
+            (&api, Method::POST, "/v1/search/extra"),
+            (&api, Method::POST, "/v1/other"),
+            (&other, Method::POST, "/v1/search"),
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            let resp = super::forward_request(
+                api,
+                &route,
+                method.clone(),
+                &uri,
+                &HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        assert_eq!(*observed.lock().unwrap(), 0);
+
+        let uri: Uri = "/v1/search".parse().unwrap();
+        let resp = super::forward_request(
+            &api,
+            &route,
+            Method::POST,
+            &uri,
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*observed.lock().unwrap(), 1);
     }
 }

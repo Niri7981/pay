@@ -34,6 +34,9 @@ pub enum Error {
     #[error("invalid payment credential")]
     InvalidPaymentCredential,
 
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     #[error("fee-payer signer is unavailable")]
     FeePayerSigner,
 
@@ -76,6 +79,7 @@ impl Error {
             Self::SendNotConfigured(_) => 503,
             Self::RpcRateLimited => 429,
             Self::InvalidPaymentCredential => 402,
+            Self::Conflict(_) => 409,
             Self::RpcTimeout { .. } => 504,
             _ => 502,
         }

@@ -107,7 +107,14 @@ struct SendChallengeResponse {
 #[derive(Debug, Serialize)]
 struct SendReceiptResponse {
     receipt: Receipt,
+    /// False when a confidential settlement could not check the encrypted
+    /// amount (explicit `send.accept_unverified_confidential_amount`): the
+    /// receipt then attests the transfer, not the challenged amount.
+    #[serde(rename = "amountVerified")]
+    amount_verified: bool,
 }
+
+const AMOUNT_VERIFIED_HEADER: HeaderName = HeaderName::from_static("x-pay-amount-verified");
 
 struct ResolvedSend {
     network: Network,
@@ -216,6 +223,7 @@ async fn verify_paid_send(
     // Confidential settlement runs on the worker for the resolved request
     // network (shared store for that network's orphan guard + replay
     // protection); normal settlement stays on the direct per-request path.
+    let amount_verified = !resolved.confidential || state.confidential_amount_verified;
     let receipt = if resolved.confidential {
         let handle = state
             .confidential
@@ -267,14 +275,29 @@ async fn verify_paid_send(
             }
         }
     };
+    receipt_response(receipt, amount_verified)
+}
+
+fn receipt_response(receipt: Receipt, amount_verified: bool) -> Result<Response, ApiError> {
     let receipt_header = receipt
         .to_header()
         .map_err(|_| ApiError(Error::PaymentChallenge))?;
 
-    let mut response = (StatusCode::OK, Json(SendReceiptResponse { receipt })).into_response();
+    let mut response = (
+        StatusCode::OK,
+        Json(SendReceiptResponse {
+            receipt,
+            amount_verified,
+        }),
+    )
+        .into_response();
     response.headers_mut().insert(
         PAYMENT_RECEIPT_HEADER,
         HeaderValue::from_str(&receipt_header).map_err(|_| ApiError(Error::PaymentChallenge))?,
+    );
+    response.headers_mut().insert(
+        AMOUNT_VERIFIED_HEADER,
+        HeaderValue::from_static(if amount_verified { "true" } else { "false" }),
     );
     Ok(response)
 }
@@ -907,6 +930,7 @@ async fn new_mpp(
         rpc_url: Some(resolved.rpc_url.clone()),
         challenge_binding_secret: state.send.mpp_challenge_binding_secret.clone(),
         realm: Some(state.send.realm.clone()),
+        store: Some(state.charge_store.clone()),
         fee_payer: has_fee_payer_signer,
         fee_payer_signer,
         html: false,
@@ -1380,6 +1404,30 @@ mod tests {
         mint.pack_base();
         mint.init_account_type().expect("account type initializes");
         data
+    }
+
+    async fn receipt_body(amount_verified: bool) -> (HeaderMap, serde_json::Value) {
+        let receipt = Receipt::success("solana", "sig", "challenge");
+        let Ok(response) = receipt_response(receipt, amount_verified) else {
+            panic!("receipt response builds");
+        };
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (headers, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn unverified_confidential_amounts_are_marked_on_the_receipt() {
+        let (headers, body) = receipt_body(false).await;
+        assert_eq!(body["amountVerified"], false);
+        assert_eq!(headers[AMOUNT_VERIFIED_HEADER], "false");
+        assert!(headers.contains_key(PAYMENT_RECEIPT_HEADER));
+
+        let (headers, body) = receipt_body(true).await;
+        assert_eq!(body["amountVerified"], true);
+        assert_eq!(headers[AMOUNT_VERIFIED_HEADER], "true");
     }
 
     #[test]

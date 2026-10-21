@@ -122,7 +122,23 @@ pub fn build_credential_with_override(
     // Reject untrusted hook descriptors before loading a wallet or asking it
     // to sign. The SDK checks the same exact descriptor again when building.
     let channel_hooks = crate::mpp_channel_profile::validate_charge_challenge(&request)?;
-    let amount = format_amount(&request.amount, &request.currency);
+    let amount = crate::client::prompt::payment_display_amount(
+        &request.amount,
+        &request.currency,
+        request
+            .method_details
+            .as_ref()
+            .and_then(|details| details.get("decimals"))
+            .map(|decimals| {
+                decimals
+                    .as_u64()
+                    .ok_or_else(|| {
+                        Error::InvalidChallenge("asset decimals must be an integer".to_string())
+                    })
+                    .and_then(crate::client::prompt::Decimals::new)
+            })
+            .transpose()?,
+    )?;
     let prompt_context = crate::client::prompt::payment_prompt_context(
         charge_prompt_reason(
             request.description.as_deref(),
@@ -212,10 +228,7 @@ pub fn build_credential_with_override(
 
     // Cap the transaction version at what the wallet can sign (a Ledger
     // signs v0 only); the kit negotiates against what the server advertises.
-    let options = BuildChargeTransactionOptions {
-        max_tx_version: signer.max_tx_version(),
-        ..Default::default()
-    };
+    let options = charge_build_options(&network, signer.max_tx_version());
     let header = if let Some(hooks) = channel_hooks {
         // A separate ephemeral voucher key avoids asking hardware wallets to
         // sign arbitrary messages. The payer still signs the complete transaction.
@@ -247,6 +260,21 @@ pub fn build_credential_with_override(
     };
 
     Ok((header, ephemeral_notice))
+}
+
+/// The kit re-checks the challenge against the network the wallet was loaded
+/// for, so a challenge cannot be signed for a cluster other than the selected one.
+fn charge_build_options(
+    network: &str,
+    max_tx_version: Option<pay_kit::core::tx::TxVersion>,
+) -> BuildChargeTransactionOptions {
+    BuildChargeTransactionOptions {
+        max_tx_version,
+        expected_network: Some(network.to_string()),
+        // Split ATA rent would be spent outside the approved amount.
+        allow_payer_funded_ata_creation: false,
+        ..Default::default()
+    }
 }
 
 /// Select a stablecoin charge challenge the configured wallet can actually pay.
@@ -660,82 +688,189 @@ pub(crate) fn check_client_network_intent(
     Ok(())
 }
 
+#[cfg(test)]
 fn format_amount(amount: &str, currency: &str) -> String {
-    let base: u64 = amount.parse().unwrap_or(0);
-    let value = if currency.to_uppercase() == "SOL" {
-        base as f64 / 1_000_000_000.0
-    } else {
-        base as f64 / 1_000_000.0
-    };
-    format!("${}", format_value(value))
-}
-
-fn format_value(v: f64) -> String {
-    if v == 0.0 {
-        "0".to_string()
-    } else if v >= 0.01 && is_cent_exact(v) {
-        format!("{v:.2}")
-    } else if v >= 0.01 {
-        format_precise_value(v, 6)
-    } else if v >= 0.001 {
-        format!("{v:.3}")
-    } else if v >= 0.0001 {
-        format!("{v:.4}")
-    } else {
-        format!("{v:.6}")
-    }
-}
-
-fn is_cent_exact(v: f64) -> bool {
-    let rounded_to_cent = (v * 100.0).round() / 100.0;
-    (v - rounded_to_cent).abs() < 0.0000005
-}
-
-fn format_precise_value(v: f64, decimals: usize) -> String {
-    let mut value = format!("{v:.decimals$}");
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
-    }
-    value
+    crate::client::prompt::payment_display_amount(amount, currency, None).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ephemeral_mainnet_store() -> crate::accounts::MemoryAccountsStore {
+        const KEYPAIR: [u8; 64] = [
+            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
+            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
+            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
+            246, 17, 170, 104, 17, 151, 48,
+        ];
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(KEYPAIR).into_string()),
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        crate::accounts::MemoryAccountsStore::with_file(file)
+    }
+
+    fn split_charge(fee_payer: bool) -> Challenge {
+        let mut details = serde_json::json!({
+            "network": "mainnet",
+            "decimals": 6,
+            "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "recentBlockhash": "11111111111111111111111111111111",
+            "splits": (0..8).map(|i| serde_json::json!({
+                "recipient": solana_pubkey::Pubkey::new_from_array([i + 1; 32]).to_string(),
+                "amount": "1",
+                "ataCreationRequired": true,
+            })).collect::<Vec<_>>(),
+        });
+        if fee_payer {
+            details["feePayer"] = true.into();
+            details["feePayerKey"] = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".into();
+        }
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "9",
+                "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "methodDetails": details,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn charge_options_pin_the_selected_network() {
+        let options = charge_build_options("devnet", None);
+        assert_eq!(options.expected_network.as_deref(), Some("devnet"));
+        assert!(!options.allow_payer_funded_ata_creation);
+    }
+
+    #[test]
+    fn a_challenge_for_another_network_than_the_selected_one_is_not_signed() {
+        let challenge = challenge_for_currency("USDC", "1000");
+        let rpc = RpcClient::new("http://127.0.0.1:9".to_string());
+        let signer = pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(
+            &ed25519_dalek::SigningKey::generate(&mut rand::thread_rng()).to_keypair_bytes(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt
+            .block_on(build_credential_header_with_options(
+                &signer,
+                &rpc,
+                &challenge,
+                charge_build_options("devnet", None),
+            ))
+            .expect_err("a mainnet challenge must not be signed for devnet");
+        assert!(err.to_string().contains("expected_network"), "{err}");
+    }
+
+    #[test]
+    fn absurd_challenge_decimals_are_refused_before_the_wallet() {
+        for decimals in [serde_json::json!(128), serde_json::json!(1.5)] {
+            let mut challenge = split_charge(false);
+            let mut request: serde_json::Value = challenge.request.decode().unwrap();
+            request["currency"] = "Mint111111111111111111111111111111111111111".into();
+            request["methodDetails"]["decimals"] = decimals;
+            challenge.request = pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap();
+            let err = build_credential_with_override(
+                &challenge,
+                &crate::accounts::MemoryAccountsStore::new(),
+                Some("mainnet"),
+                None,
+                None,
+                None,
+            )
+            .expect_err("absurd decimals must be refused");
+            assert!(matches!(err, Error::InvalidChallenge(_)), "{err}");
+        }
+    }
+
+    #[test]
+    fn split_ata_rent_is_never_charged_to_the_payer_outside_the_amount() {
+        let store = ephemeral_mainnet_store();
+        let err = build_credential_with_override(
+            &split_charge(false),
+            &store,
+            Some("mainnet"),
+            None,
+            Some("https://attacker.example/paid"),
+            None,
+        )
+        .expect_err("payer-funded split ATA rent must be refused");
+        assert!(
+            err.to_string().contains("allow_payer_funded_ata_creation"),
+            "{err}"
+        );
+        // Control: with a server fee payer funding the rent, the guard
+        // does not apply (any remaining failure is unrelated, e.g. RPC).
+        let result = build_credential_with_override(
+            &split_charge(true),
+            &store,
+            Some("mainnet"),
+            None,
+            Some("https://merchant.example/paid"),
+            None,
+        );
+        if let Err(err) = result {
+            assert!(
+                !err.to_string().contains("allow_payer_funded_ata_creation"),
+                "{err}"
+            );
+        }
+    }
+
     #[test]
     fn format_value_zero() {
-        assert_eq!(format_value(0.0), "0");
+        assert_eq!(crate::client::prompt::format_value(0.0), "0");
     }
 
     #[test]
     fn format_value_large() {
-        assert_eq!(format_value(1.5), "1.50");
+        assert_eq!(crate::client::prompt::format_value(1.5), "1.50");
     }
 
     #[test]
     fn format_value_preserves_fractional_cent_fees() {
-        assert_eq!(format_value(1.0015), "1.0015");
+        assert_eq!(crate::client::prompt::format_value(1.0015), "1.0015");
     }
 
     #[test]
     fn format_value_cents() {
-        assert_eq!(format_value(0.01), "0.01");
+        assert_eq!(crate::client::prompt::format_value(0.01), "0.01");
     }
 
     #[test]
     fn format_value_milli() {
-        assert_eq!(format_value(0.005), "0.005");
+        assert_eq!(crate::client::prompt::format_value(0.005), "0.005");
     }
 
     #[test]
     fn format_value_micro() {
-        assert_eq!(format_value(0.0005), "0.0005");
+        assert_eq!(crate::client::prompt::format_value(0.0005), "0.0005");
     }
 
     #[test]
     fn format_value_tiny() {
-        assert_eq!(format_value(0.00005), "0.000050");
+        assert_eq!(crate::client::prompt::format_value(0.00005), "0.000050");
     }
 
     #[test]
@@ -752,7 +887,7 @@ mod tests {
     #[test]
     fn format_amount_sol() {
         // 1000000000 = 1.0 SOL
-        assert_eq!(format_amount("1000000000", "SOL"), "$1.00");
+        assert_eq!(format_amount("1000000000", "SOL"), "1 SOL");
     }
 
     #[test]
@@ -768,7 +903,7 @@ mod tests {
     #[test]
     fn format_amount_sol_small() {
         // 1000000 lamports = 0.001 SOL
-        assert_eq!(format_amount("1000000", "SOL"), "$0.001");
+        assert_eq!(format_amount("1000000", "SOL"), "0.001 SOL");
     }
 
     #[test]

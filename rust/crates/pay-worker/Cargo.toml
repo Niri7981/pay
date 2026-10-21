@@ -44,7 +44,7 @@ opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
-redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "tokio-rustls-comp", "connection-manager"] }
 
 # Same PayKit revision as pay-api and the pay proxy (workspace-pinned) — all
 # three speak the same durable Redis channel namespace and wire schema.
@@ -58,3 +58,6 @@ solana-instruction = { workspace = true }
 solana-address = { version = "2", features = ["borsh", "curve25519"] }
 wincode = "0.5"
 spl-token-2022-interface = "2.1.0"
+
+[dev-dependencies]
+async-trait = "0.1"

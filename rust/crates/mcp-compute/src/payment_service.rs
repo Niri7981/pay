@@ -49,6 +49,14 @@ pub struct DeletePaymentPolicyRequest {
     pub expected_version: u64,
 }
 
+/// Durable policy snapshot the payment gate admitted a request under.
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdmittedPolicy {
+    pub deployment: DeploymentIdentity,
+    pub version: u64,
+    pub price_micro_usd: u64,
+}
+
 #[derive(Serialize)]
 pub struct ResolvedPaymentPolicy {
     pub deployment: DeploymentIdentity,
@@ -144,8 +152,10 @@ impl PaymentService {
     }
 
     pub async fn get(&self, tenant: &Tenant, hostname: &str) -> Result<PaymentPolicy> {
-        let deployment = self.google.payment_deployment(hostname, None).await?;
-        require_owner(tenant, &deployment)?;
+        let deployment = self
+            .google
+            .owned_payment_deployment(tenant, hostname)
+            .await?;
         let stored = self.load(&deployment).await?.ok_or_else(|| {
             ComputeError::InvalidRequest("deployment has no payment policy".into())
         })?;
@@ -161,9 +171,8 @@ impl PaymentService {
     ) -> Result<PaymentPolicy> {
         let deployment = self
             .google
-            .payment_deployment(&request.hostname, None)
+            .owned_payment_deployment(tenant, &request.hostname)
             .await?;
-        require_owner(tenant, &deployment)?;
         request.policy.validate(now()?)?;
         let stored = self.load(&deployment).await?;
         if stored.as_ref().is_some_and(|stored| stored.retired) {
@@ -209,9 +218,8 @@ impl PaymentService {
     ) -> Result<Option<PaymentPolicy>> {
         let deployment = self
             .google
-            .payment_deployment(&request.hostname, None)
+            .owned_payment_deployment(tenant, &request.hostname)
             .await?;
-        require_owner(tenant, &deployment)?;
         let Some(stored) = self.load(&deployment).await? else {
             return Ok(None);
         };
@@ -266,6 +274,24 @@ impl PaymentService {
         })
     }
 
+    /// Reject a paid request whose admitted policy is no longer the live
+    /// policy of that exact deployment incarnation.
+    pub async fn require_admitted(&self, admitted: &AdmittedPolicy) -> Result<()> {
+        let stale =
+            || ComputeError::InvalidRequest("admitted payment policy is no longer current".into());
+        let stored = self.load(&admitted.deployment).await?.ok_or_else(stale)?;
+        let policy = stored.policy.as_ref().ok_or_else(stale)?;
+        if stored.retired
+            || policy.deleted
+            || policy.deployment != admitted.deployment
+            || policy.version != admitted.version
+            || policy.spec.price_micro_usd != admitted.price_micro_usd
+        {
+            return Err(stale());
+        }
+        Ok(())
+    }
+
     pub fn router(self) -> Router {
         Router::new()
             .route("/__402/payment-policy", get(resolve))
@@ -292,15 +318,6 @@ async fn resolve(
         )
             .into_response(),
     }
-}
-
-fn require_owner(tenant: &Tenant, deployment: &DeploymentIdentity) -> Result<()> {
-    if tenant.key != deployment.owner_key {
-        return Err(ComputeError::InvalidRequest(
-            "deployment belongs to a different payer".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn configuration(message: &str) -> ComputeError {
@@ -344,7 +361,7 @@ mod tests {
                 if path.starts_with("/v2/") {
                     return Json(json!({
                         "name": resource, "state": "ACTIVE", "createTime": "2026-01-01T00:00:00Z",
-                        "labels": {"pay-tenant": owner, "managed-by": "mcp-compute", "pay-exposure": "gateway"},
+                        "labels": {"pay-tenant": owner, "managed-by": "mcp-compute", "pay-exposure": "gateway", "pay-channel": crate::google::channel_lease_key("channel").unwrap()},
                         "serviceConfig": {"environmentVariables": {"PAY_INTERNAL_PUBLIC_PATHS": "[\"/summary\"]"}}
                     })).into_response();
                 }

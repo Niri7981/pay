@@ -243,12 +243,33 @@ async fn verify_and_broadcast(
 
     validate_paid_cancel_request(&charge_request, &resolved).map_err(ApiError)?;
 
-    let signer = fee_payer_signer(&state)
-        .await
-        .map_err(|_| ApiError(Error::FeePayerSigner))?;
-    let mpp = new_mpp(&state, &resolved, Some(Arc::clone(&signer)))
+    // One sponsored cancellation per subscription at a time, across replicas:
+    // concurrent ones could all pass preflight and burn fee-payer SOL failing
+    // on-chain. Held until it expires unless the attempt provably did not
+    // land, so a duplicate can't race the first one's confirmation.
+    let reservation = reserve_cancel(&state, &resolved.subscription_pda)
         .await
         .map_err(ApiError)?;
+    let release = async || {
+        if let Err(error) = state.cancel_reservations.release(&reservation).await {
+            warn!(%error, "failed to release subscription cancel reservation");
+        }
+    };
+
+    let signer = match fee_payer_signer(&state).await {
+        Ok(signer) => signer,
+        Err(_) => {
+            release().await;
+            return Err(ApiError(Error::FeePayerSigner));
+        }
+    };
+    let mpp = match new_mpp(&state, &resolved, Some(Arc::clone(&signer))).await {
+        Ok(mpp) => mpp,
+        Err(error) => {
+            release().await;
+            return Err(ApiError(error));
+        }
+    };
 
     // ── Verify the USDC charge credential ───────────────────────────────
     let charge_receipt = match mpp.verify(&credential, &charge_request).await {
@@ -261,17 +282,24 @@ async fn verify_and_broadcast(
                 title = %error.title,
                 "subscription cancel: charge verification failed"
             );
+            release().await;
             return Err(ApiError(Error::InvalidPaymentCredential));
         }
     };
 
     // ── Co-sign the cancel_subscription tx as fee-payer ─────────────────
-    let signature = co_sign_and_broadcast(&state, &resolved, signer)
-        .await
-        .map_err(ApiError)?;
+    let signature = match co_sign_and_broadcast(&state, &resolved, signer).await {
+        Ok(signature) => signature,
+        Err(error) => {
+            if !cancel_may_have_landed(&error) {
+                release().await;
+            }
+            return Err(ApiError(error));
+        }
+    };
 
     // ── Wait for confirmation ───────────────────────────────────────────
-    state
+    if let Err(error) = state
         .rpc
         .confirm_signature(
             &resolved.rpc_url,
@@ -279,7 +307,12 @@ async fn verify_and_broadcast(
             Duration::from_secs(state.subscriptions.confirm_timeout_seconds),
         )
         .await
-        .map_err(ApiError)?;
+    {
+        if !cancel_may_have_landed(&error) {
+            release().await;
+        }
+        return Err(ApiError(error));
+    }
 
     info!(
         signature = %signature,
@@ -305,6 +338,42 @@ async fn verify_and_broadcast(
         HeaderValue::from_str(&receipt_header).map_err(|_| ApiError(Error::PaymentChallenge))?,
     );
     Ok(response)
+}
+
+async fn reserve_cancel(
+    state: &AppState,
+    subscription_pda: &Pubkey,
+) -> Result<crate::store::Reservation, Error> {
+    state
+        .cancel_reservations
+        .reserve(
+            &subscription_pda.to_string(),
+            cancel_reservation_ttl(state.subscriptions.confirm_timeout_seconds),
+        )
+        .await
+        .map_err(|error| {
+            warn!(%error, "subscription cancel reservation store unavailable");
+            Error::PaymentChallenge
+        })?
+        .ok_or_else(|| {
+            Error::Conflict("a cancellation for this subscription is already in progress".into())
+        })
+}
+
+/// Covers the confirmation wait plus the cancel blockhash's lifetime, after
+/// which a duplicate fails preflight instead of on-chain.
+fn cancel_reservation_ttl(confirm_timeout_seconds: u64) -> Duration {
+    Duration::from_secs(confirm_timeout_seconds.saturating_add(180).max(300))
+}
+
+/// Whether a failed broadcast or confirmation may still have landed. Only an
+/// RPC rejection (preflight) or an on-chain failure proves it did not.
+fn cancel_may_have_landed(error: &Error) -> bool {
+    !matches!(error, Error::RpcResponse(message) if !message.starts_with("HTTP "))
+        && !matches!(
+            error,
+            Error::FeePayerSigner | Error::PaymentChallenge | Error::InvalidPaymentCredential
+        )
 }
 
 fn resolve_cancel_request(
@@ -593,6 +662,7 @@ async fn new_mpp(
         rpc_url: Some(resolved.rpc_url.clone()),
         challenge_binding_secret: state.subscriptions_challenge_binding_secret.clone(),
         realm: Some(state.subscriptions.realm.clone()),
+        store: Some(state.charge_store.clone()),
         fee_payer: has_fee_payer_signer,
         fee_payer_signer,
         html: false,
@@ -1122,6 +1192,93 @@ mod tests {
             short_address("96WoyH3JmANSMsQLGC3MKyiGiXCymZyM9SLaWjcRrKuD"),
             "96Wo...rKuD"
         );
+    }
+
+    async fn app_state(
+        subscriptions_enabled: bool,
+        store_url: Option<&str>,
+    ) -> Result<AppState, Error> {
+        let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "networks": { "mainnet": { "rpc_url": "http://rpc.invalid" } },
+            "stablecoins": [],
+            "subscriptions": { "enabled": subscriptions_enabled },
+        }))
+        .unwrap();
+        config.mpp_store_url = store_url.map(str::to_string);
+        AppState::new(&config).await
+    }
+
+    #[tokio::test]
+    async fn charge_endpoints_refuse_to_boot_without_a_shared_store() {
+        assert!(matches!(
+            app_state(true, None).await,
+            Err(Error::SendNotConfigured(message)) if message.contains("mpp_store_url")
+        ));
+        assert!(app_state(false, None).await.is_ok());
+        assert!(app_state(true, Some("memory://")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancels_for_one_subscription_conflict_across_replicas() {
+        let Some(redis) = crate::endpoints::redeem::tests::flow::spawn_redis().await else {
+            return;
+        };
+        let url = format!("redis://127.0.0.1:{}/", redis.1);
+        let replica_a = app_state(true, Some(&url)).await.unwrap();
+        let replica_b = app_state(true, Some(&url)).await.unwrap();
+        let pda = Pubkey::new_unique();
+
+        let held = reserve_cancel(&replica_a, &pda).await.unwrap();
+        assert!(matches!(
+            reserve_cancel(&replica_b, &pda).await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(Error::Conflict(String::new()).http_status(), 409);
+        // Other subscriptions are unaffected.
+        reserve_cancel(&replica_b, &Pubkey::new_unique())
+            .await
+            .unwrap();
+
+        replica_a.cancel_reservations.release(&held).await.unwrap();
+        reserve_cancel(&replica_b, &pda).await.unwrap();
+
+        // The charge replay store is shared too.
+        assert!(
+            replica_a
+                .charge_store
+                .put_if_absent("credential", serde_json::json!(1))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !replica_b
+                .charge_store
+                .put_if_absent("credential", serde_json::json!(1))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cancel_reservation_outlives_confirmation_and_blockhash() {
+        assert_eq!(cancel_reservation_ttl(30), Duration::from_secs(300));
+        assert_eq!(cancel_reservation_ttl(600), Duration::from_secs(780));
+    }
+
+    #[test]
+    fn only_provable_non_landing_releases_the_cancel_reservation() {
+        assert!(!cancel_may_have_landed(&Error::RpcResponse(
+            "Transaction simulation failed: SubscriptionAlreadyCancelled".into()
+        )));
+        assert!(!cancel_may_have_landed(&Error::RpcResponse(
+            "Transaction failed on-chain: {}".into()
+        )));
+        assert!(!cancel_may_have_landed(&Error::FeePayerSigner));
+        assert!(cancel_may_have_landed(&Error::RpcResponse(
+            "HTTP 502 Bad Gateway".into()
+        )));
+        assert!(cancel_may_have_landed(&Error::RpcTimeout { timeout_ms: 1 }));
+        assert!(cancel_may_have_landed(&Error::RpcMalformed));
     }
 
     #[test]

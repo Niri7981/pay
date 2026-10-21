@@ -244,6 +244,8 @@ async fn full_payment_flow_with_surfnet() {
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap();
@@ -364,6 +366,8 @@ async fn replayed_authorization_is_rejected() {
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap();
@@ -613,10 +617,11 @@ async fn push_session_full_flow() {
                         .signatures[0]
                             .to_string()
                     ),
+                    // The open lands after the slot observed at verification.
                     "getSignatureStatuses" => serde_json::json!({
-                        "context": { "slot": 34 },
+                        "context": { "slot": 35 },
                         "value": [{
-                            "slot": 34,
+                            "slot": 35,
                             "confirmations": null,
                             "err": null,
                             "confirmationStatus": "finalized",
@@ -625,9 +630,9 @@ async fn push_session_full_flow() {
                     }),
                     "getMultipleAccounts" => {
                         assert_eq!(body["params"][0].as_array().map(Vec::len), Some(1));
-                        assert_eq!(body["params"][1]["minContextSlot"], 34);
+                        assert_eq!(body["params"][1]["minContextSlot"], 35);
                         serde_json::json!({
-                            "context": { "slot": 34 },
+                            "context": { "slot": 35 },
                             "value": [{
                                 "data": [
                                     base64::engine::general_purpose::STANDARD.encode(&channel_data),
@@ -779,7 +784,9 @@ async fn push_session_full_flow() {
     );
 
     // ── Step 3: Voucher (subsequent API call) ──────────────────────────────
-    let voucher_action = active.voucher_action(1_000).await.unwrap(); // 0.001 USDC
+    // Each voucher pays the challenged per-request price.
+    let price: u64 = challenged_request.amount.parse().unwrap();
+    let voucher_action = active.voucher_action(price).await.unwrap();
     let auth =
         format_authorization(&PaymentCredential::new(challenge.to_echo(), voucher_action)).unwrap();
 
@@ -799,7 +806,7 @@ async fn push_session_full_flow() {
     );
 
     // Second voucher — watermark advances
-    let voucher_action = active.voucher_action(1_000).await.unwrap();
+    let voucher_action = active.voucher_action(price).await.unwrap();
     let auth =
         format_authorization(&PaymentCredential::new(challenge.to_echo(), voucher_action)).unwrap();
 
@@ -890,6 +897,8 @@ async fn mpp_build_credential_with_surfnet() {
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap();

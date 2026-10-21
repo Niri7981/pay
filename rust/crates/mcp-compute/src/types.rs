@@ -262,6 +262,9 @@ pub struct InvocationResult {
 #[derive(Clone, Debug)]
 pub struct GatewayInvokeRequest {
     pub deployment_id: String,
+    /// Provider creation identity admitted by the payment gate, when the
+    /// request was priced by a deployment payment policy.
+    pub expected_created_at: Option<String>,
     pub method: String,
     pub path_and_query: String,
     pub headers: BTreeMap<String, String>,

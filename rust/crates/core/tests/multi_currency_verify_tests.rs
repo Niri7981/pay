@@ -62,6 +62,8 @@ fn mainnet_mpp(currency: &str) -> Mpp {
         // Unreachable: every verification must fail before any RPC call.
         rpc_url: Some("http://127.0.0.1:1/never".to_string()),
         challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap()

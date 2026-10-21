@@ -72,7 +72,7 @@ five8 = { workspace = true }
 blake3 = { workspace = true }
 dashmap = "5.5"
 reqwest = { workspace = true, features = ["json"] }
-redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"], optional = true }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "tokio-rustls-comp", "connection-manager"], optional = true }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }
 http-body = { workspace = true }

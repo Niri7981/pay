@@ -659,22 +659,20 @@ pub fn rewrite_urls(doc: &mut Value, public_url: &str) {
     let proxy_root = public_url.trim_end_matches('/').to_string();
     let with_slash = format!("{proxy_root}/");
 
-    if let Some(servers) = doc.get_mut("servers").and_then(|v| v.as_array_mut()) {
-        for entry in servers {
-            let Some(obj) = entry.as_object_mut() else {
+    rewrite_servers(doc.get_mut("servers"), &proxy_root);
+    // Path-item and operation `servers` override the root per OpenAPI 3, so
+    // they must point at the gateway too or clients bypass payment.
+    if let Some(paths) = doc.get_mut("paths").and_then(|v| v.as_object_mut()) {
+        for item in paths.values_mut() {
+            let Some(item) = item.as_object_mut() else {
                 continue;
             };
-            let upstream_path = obj
-                .get("url")
-                .and_then(|v| v.as_str())
-                .map(extract_path_component)
-                .unwrap_or_default();
-            let rewritten = if upstream_path.is_empty() {
-                proxy_root.clone()
-            } else {
-                format!("{proxy_root}/{upstream_path}")
-            };
-            obj.insert("url".to_string(), Value::String(rewritten));
+            rewrite_servers(item.get_mut("servers"), &proxy_root);
+            for operation in item.values_mut() {
+                if let Some(operation) = operation.as_object_mut() {
+                    rewrite_servers(operation.get_mut("servers"), &proxy_root);
+                }
+            }
         }
     }
 
@@ -686,6 +684,30 @@ pub fn rewrite_urls(doc: &mut Value, public_url: &str) {
         if root_obj.contains_key(key) {
             root_obj.insert(key.to_string(), Value::String(with_slash.clone()));
         }
+    }
+}
+
+/// Point every entry of an OpenAPI `servers` array at the gateway, carrying
+/// the upstream base path onto the proxy URL.
+fn rewrite_servers(servers: Option<&mut Value>, proxy_root: &str) {
+    let Some(servers) = servers.and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for entry in servers {
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        let upstream_path = obj
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(extract_path_component)
+            .unwrap_or_default();
+        let rewritten = if upstream_path.is_empty() {
+            proxy_root.to_string()
+        } else {
+            format!("{proxy_root}/{upstream_path}")
+        };
+        obj.insert("url".to_string(), Value::String(rewritten));
     }
 }
 
@@ -1494,6 +1516,56 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .contains_key("lookup")
+        );
+    }
+
+    #[test]
+    fn rewrite_urls_points_path_and_operation_servers_at_the_gateway() {
+        let mut doc = json!({
+            "openapi": "3.1.0",
+            "servers": [{"url": "https://upstream.example"}],
+            "paths": {
+                "/v1/data": {
+                    "servers": [{"url": "https://path-upstream.example/private"}],
+                    "post": {
+                        "servers": [
+                            {"url": "https://operation-upstream.example/private/"},
+                            {"url": "https://{region}.upstream.example",
+                             "variables": {"region": {"default": "us"}}}
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    },
+                    "get": {"responses": {"200": {"description": "removed"}}}
+                },
+                "/v1/removed": {"post": {"responses": {"200": {"description": "removed"}}}}
+            }
+        });
+        let endpoint = Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/data".to_string(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+            subscription: None,
+        };
+
+        filter_to_endpoints(&mut doc, &[endpoint]);
+        rewrite_urls(&mut doc, "https://gateway.example");
+
+        assert_eq!(doc["servers"][0]["url"], "https://gateway.example");
+        let item = &doc["paths"]["/v1/data"];
+        assert_eq!(item["servers"][0]["url"], "https://gateway.example/private");
+        assert_eq!(
+            item["post"]["servers"][0]["url"],
+            "https://gateway.example/private"
+        );
+        assert_eq!(item["post"]["servers"][1]["url"], "https://gateway.example");
+        assert!(
+            !serde_json::to_string(&doc)
+                .unwrap()
+                .contains("upstream.example"),
+            "no served server URL may bypass the gateway"
         );
     }
 

@@ -1463,6 +1463,14 @@ pub struct MeterDimension {
     pub meter: Option<UsageMeter>,
 }
 
+impl MeterDimension {
+    /// Settled from measured usage (`Σ quantity/scale × price`), so a fixed
+    /// per-call scheme cannot know its amount before authorization.
+    pub fn is_aggregate_settled(&self) -> bool {
+        matches!(self.unit, BillingUnit::Tokens | BillingUnit::QuotaUnits) || self.meter.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UsageMeter {
     pub source: UsageMeterSource,
@@ -1748,6 +1756,8 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
             &mut errs,
         );
         validate_price_precision(metering, path, &mut errs);
+        validate_upto_ceiling(metering, path, &mut errs);
+        validate_fixed_scheme_dimensions(metering, path, &mut errs);
     }
 
     // Channel distribution splits from a top-level `session:` block.
@@ -2210,7 +2220,38 @@ fn validate_tier_splits(
     path: &str,
     errs: &mut Vec<String>,
 ) {
-    for dim in &metering.dimensions {
+    let mut sets = vec![(String::new(), metering.dimensions.as_slice())];
+    for variant in &metering.variants {
+        sets.push((
+            format!(" (variant {}={})", variant.param, variant.value),
+            variant.dimensions.as_slice(),
+        ));
+    }
+    for (vlabel, dimensions) in sets {
+        validate_tier_splits_in(dimensions, recipients, path, &vlabel, errs);
+    }
+}
+
+fn validate_tier_splits_in(
+    dimensions: &[MeterDimension],
+    recipients: &std::collections::HashMap<String, RecipientAlias>,
+    path: &str,
+    vlabel: &str,
+    errs: &mut Vec<String>,
+) {
+    // One charge carries one split set, so tier overrides need a single
+    // priced dimension to select it unambiguously.
+    if dimensions.len() > 1
+        && dimensions
+            .iter()
+            .any(|dim| dim.tiers.iter().any(|tier| !tier.splits.is_empty()))
+    {
+        errs.push(format!(
+            "endpoint `{path}`{vlabel}: tier `splits` require a single pricing dimension — \
+             move them to the metering-level `splits`"
+        ));
+    }
+    for dim in dimensions {
         let scale = dim.scale.max(1) as f64;
         for tier in &dim.tiers {
             if tier.splits.is_empty() {
@@ -2223,17 +2264,17 @@ fn validate_tier_splits(
             for split in &tier.splits {
                 if !recipients.contains_key(&split.recipient) {
                     errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split references unknown recipient `{}`",
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): split references unknown recipient `{}`",
                         split.recipient
                     ));
                 }
                 match (split.amount, split.percent) {
                     (Some(_), Some(_)) => errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split for `{}` has both amount and percent",
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): split for `{}` has both amount and percent",
                         split.recipient
                     )),
                     (None, None) => errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split for `{}` has neither amount nor percent",
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): split for `{}` has neither amount nor percent",
                         split.recipient
                     )),
                     _ => {}
@@ -2248,7 +2289,7 @@ fn validate_tier_splits(
                 let total = fixed + pct;
                 if total >= per_unit {
                     errs.push(format!(
-                        "endpoint `{path}` (tier ${per_unit:.6}/unit): tier splits total (${total:.6}) >= \
+                        "endpoint `{path}`{vlabel} (tier ${per_unit:.6}/unit): tier splits total (${total:.6}) >= \
                          per-unit price (${per_unit:.6})"
                     ));
                 }
@@ -2428,6 +2469,55 @@ fn validate_session_splits(
             "session splits must leave a positive primary recipient share (total < 100%)"
                 .to_string(),
         );
+    }
+}
+
+/// Fixed per-call schemes charge before any usage is measured, so they cannot
+/// price aggregate-settled (token, quota-unit, or response-metered) dimensions.
+fn validate_fixed_scheme_dimensions(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    let fixed: Vec<Scheme> = metering
+        .accepted_schemes()
+        .into_iter()
+        .filter(|scheme| {
+            matches!(
+                scheme,
+                Scheme::MppCharge | Scheme::X402Exact | Scheme::X402BatchSettlement
+            )
+        })
+        .collect();
+    if fixed.is_empty() {
+        return;
+    }
+    let aggregate = metering
+        .dimensions
+        .iter()
+        .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter()))
+        .any(MeterDimension::is_aggregate_settled);
+    if aggregate {
+        errs.push(format!(
+            "endpoint `{path}`: usage-metered dimensions (tokens, quota_units, or a `meter`) \
+             cannot be charged per call by {fixed:?}; list only `mpp-session` / `x402-upto` \
+             in `schemes` (omitted schemes default to `mpp-charge`)"
+        ));
+    }
+}
+
+/// A multi-dimension `x402-upto` endpoint needs an explicit `upto.max_usd`:
+/// no single dimension's unit price bounds the summed usage.
+fn validate_upto_ceiling(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    let multi_dimensional =
+        metering.dimensions.len() > 1 || metering.variants.iter().any(|v| v.dimensions.len() > 1);
+    if multi_dimensional
+        && metering.accepted_schemes().contains(&Scheme::X402Upto)
+        && metering
+            .upto
+            .as_ref()
+            .and_then(|upto| upto.max_usd)
+            .is_none()
+    {
+        errs.push(format!(
+            "endpoint `{path}`: x402-upto with several pricing dimensions requires `upto.max_usd`"
+        ));
     }
 }
 
@@ -4219,6 +4309,150 @@ value_from_env: PAY_SIGNER_KEYPAIR
         ]);
         let errs = validate_api_spec(&spec);
         assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn validate_tier_splits_cover_variants_and_reject_multi_dimension_sets() {
+        let spec: ApiSpec = serde_yml::from_str(
+            r#"
+name: t
+subdomain: t
+title: T
+description: T
+category: ai_ml
+version: v1
+routing: {type: respond}
+endpoints:
+  - method: POST
+    path: v1/variant
+    metering:
+      variants:
+        - param: model
+          value: a
+          dimensions:
+            - direction: usage
+              unit: requests
+              scale: 1
+              tiers:
+                - price_usd: 1.0
+                  splits: [{recipient: ghost, percent: 10}]
+  - method: POST
+    path: v1/multi
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 1.0
+              splits: [{recipient: ghost, percent: 10}]
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers: [{price_usd: 1.0}]
+"#,
+        )
+        .unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`v1/variant` (variant model=a)")
+                    && e.contains("unknown recipient `ghost`")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`v1/multi`") && e.contains("single pricing dimension")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_upto_requires_explicit_ceiling_for_multiple_dimensions() {
+        let yaml = |upto: &str| {
+            format!(
+                r#"
+name: t
+subdomain: t
+title: T
+description: T
+category: data
+version: v1
+routing: {{type: respond}}
+endpoints:
+  - method: POST
+    path: v1/paid
+    metering:
+      schemes: [x402-upto]
+{upto}
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers: [{{price_usd: 0.01}}]
+        - direction: output
+          unit: bytes
+          scale: 1
+          meter: {{source: response_header, header: x-usage-bytes}}
+          tiers: [{{price_usd: 1.00}}]
+"#
+            )
+        };
+        let implicit: ApiSpec = serde_yml::from_str(&yaml("")).unwrap();
+        let errs = validate_api_spec(&implicit);
+        assert!(
+            errs.iter().any(|e| e.contains("requires `upto.max_usd`")),
+            "{errs:?}"
+        );
+        let explicit: ApiSpec = serde_yml::from_str(&yaml("      upto: {max_usd: 2.0}")).unwrap();
+        assert!(validate_api_spec(&explicit).is_empty());
+    }
+
+    #[test]
+    fn validate_fixed_schemes_reject_aggregate_dimensions() {
+        let yaml = |schemes: &str, unit: &str| {
+            format!(
+                r#"
+name: t
+subdomain: t
+title: T
+description: T
+category: ai_ml
+version: v1
+routing: {{type: respond}}
+endpoints:
+  - method: POST
+    path: v1/generate
+    metering:
+{schemes}
+      upto: {{max_usd: 1.0}}
+      dimensions:
+        - direction: input
+          unit: {unit}
+          scale: 1000000
+          tiers: [{{price_usd: 1.0}}]
+"#
+            )
+        };
+        let errs_for = |schemes: &str, unit: &str| {
+            validate_api_spec(&serde_yml::from_str::<ApiSpec>(&yaml(schemes, unit)).unwrap())
+        };
+        for schemes in [
+            "",
+            "      schemes: [mpp-charge]",
+            "      schemes: [x402-exact]",
+            "      schemes: [x402-batch-settlement]",
+            "      schemes: [mpp-session, mpp-charge]",
+        ] {
+            let errs = errs_for(schemes, "tokens");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("cannot be charged per call")),
+                "{schemes}: {errs:?}"
+            );
+        }
+        assert!(errs_for("      schemes: [mpp-session, x402-upto]", "tokens").is_empty());
+        assert!(errs_for("", "requests").is_empty());
     }
 
     #[test]

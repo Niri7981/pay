@@ -20,6 +20,12 @@
 port: 8080
 rpc_timeout_ms: 3000
 
+# Shared MPP replay store for every replica (redis:// or rediss://; memory://
+# is an explicit single-process opt-in). Required while send, subscriptions or
+# channels is enabled;
+# PAY_MPP_REDIS_URL is also accepted.
+mpp_store_url: ""
+
 # Supported networks. The map keys must match `Network` variants
 # (mainnet | sandbox). Add a new entry to enable a new network — no code change.
 networks:
@@ -85,6 +91,13 @@ send:
   fee_refund_split:
     label: Fee payer refund
     memo: fee-payer-refund
+  # Confidential sends relay to arbitrary recipients, so the amount is only
+  # enforced with the mint's auditor ElGamal keypair (base64, 64 bytes).
+  # Without it confidential sends are refused unless
+  # accept_unverified_confidential_amount opts in (responses then carry
+  # amountVerified: false).
+  confidential_auditor:
+  accept_unverified_confidential_amount: false
 
 # Sponsored payment-channel lifecycle operations. The payer signs the close
 # request, while pay-api pays SOL gas and receives the equivalent USD fee.

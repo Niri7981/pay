@@ -167,3 +167,10 @@ Lists the single wallet belonging to a CLI bearer token. The corresponding
 `POST /v1/wallets/{id}/sign-transaction` and `sign-message` endpoints verify
 that the requested wallet belongs to that token and sign through the
 server-side Privy driver.
+
+A CLI token is payment authority over that wallet within its spend policy:
+the CLI builds transactions locally from the 402 challenges it answers, so
+pay-connect cannot bind a recipient and does not try to. It only signs
+known-stablecoin `transfer_checked` payments from the wallet's own token
+accounts, reserves their value against the policy, and returns a signature
+only after checking that the provider signed exactly the checked message.

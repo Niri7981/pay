@@ -28,8 +28,9 @@ tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 borsh = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 solana-address = { version = "2", features = ["borsh", "curve25519"] }
 solana-keypair = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "net"] }

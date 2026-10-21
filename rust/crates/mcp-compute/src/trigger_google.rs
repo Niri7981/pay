@@ -89,6 +89,9 @@ impl GoogleTriggerConfig {
     }
 }
 
+/// Proof that a trigger's prepaid budget was written.
+struct FundedBudget(());
+
 #[derive(Clone)]
 pub struct GoogleTriggerDriver {
     config: Arc<GoogleTriggerConfig>,
@@ -153,7 +156,7 @@ impl GoogleTriggerDriver {
         )
     }
 
-    async fn fund_budget(&self, resource: &str, channel: &str) -> Result<()> {
+    async fn fund_budget(&self, resource: &str, channel: &str) -> Result<FundedBudget> {
         let expires_at = unix_seconds()?.saturating_add(BUDGET_LIFETIME_SECONDS);
         let mut connection = self.budgets.clone();
         redis::pipe()
@@ -167,7 +170,21 @@ impl GoogleTriggerDriver {
             )
             .query_async::<()>(&mut connection)
             .await?;
-        Ok(())
+        Ok(FundedBudget(()))
+    }
+
+    /// Create a Scheduler job. Requiring the funded budget means no job can
+    /// exist without one, so a retry after a funding fault takes this path again.
+    async fn create_job(&self, region: &str, body: &Value, _: FundedBudget) -> Result<Value> {
+        self.require(
+            Method::POST,
+            format!(
+                "{}/v1/projects/{}/locations/{region}/jobs",
+                self.config.scheduler_api_base, self.config.project
+            ),
+            Some(body),
+        )
+        .await
     }
 
     async fn consume_budget(&self, resource: &str, channel: &str) -> Result<bool> {
@@ -307,6 +324,7 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
             )
             .await?;
         require_owner(&value, tenant)?;
+        require_funding_channel(&value, tenant)?;
         Ok((region.into(), value))
     }
 
@@ -353,48 +371,61 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
         }
 
         let mut deleted = 0;
+        let mut failure = None;
         for name in resources {
-            let (status, current) = self
-                .request(
-                    Method::GET,
-                    format!("{}/v1/{name}", self.config.scheduler_api_base),
-                    None,
-                )
-                .await?;
-            if status == StatusCode::NOT_FOUND {
-                continue;
-            }
-            if !status.is_success() {
-                return Err(TriggerError::Provider(format!(
-                    "Google API returned {status}: {current}"
-                )));
-            }
-            if !current
-                .get("description")
-                .and_then(Value::as_str)
-                .is_some_and(|description| {
-                    markers.iter().all(|marker| description.contains(marker))
-                })
-            {
-                continue;
-            }
-            let (status, value) = self
-                .request(
-                    Method::DELETE,
-                    format!("{}/v1/{name}", self.config.scheduler_api_base),
-                    None,
-                )
-                .await?;
-            if status.is_success() || status == StatusCode::NOT_FOUND {
-                self.delete_budget(&name).await?;
-                deleted += 1;
-            } else {
-                return Err(TriggerError::Provider(format!(
-                    "Google API returned {status}: {value}"
-                )));
+            match self.revoke_trigger(&name, markers).await {
+                Ok(true) => deleted += 1,
+                Ok(false) => {}
+                // Keep revoking the remaining triggers; the caller retries.
+                Err(error) => failure = failure.or(Some(error)),
             }
         }
-        Ok(deleted)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(deleted),
+        }
+    }
+
+    /// Revoke the budget before deleting the job so a job that survives a
+    /// failed deletion can no longer execute.
+    async fn revoke_trigger(&self, name: &str, markers: &[String]) -> Result<bool> {
+        let (status, current) = self
+            .request(
+                Method::GET,
+                format!("{}/v1/{name}", self.config.scheduler_api_base),
+                None,
+            )
+            .await?;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !status.is_success() {
+            return Err(TriggerError::Provider(format!(
+                "Google API returned {status}: {current}"
+            )));
+        }
+        if !current
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| markers.iter().all(|marker| description.contains(marker)))
+        {
+            return Ok(false);
+        }
+        self.delete_budget(name).await?;
+        let (status, value) = self
+            .request(
+                Method::DELETE,
+                format!("{}/v1/{name}", self.config.scheduler_api_base),
+                None,
+            )
+            .await?;
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            Ok(true)
+        } else {
+            Err(TriggerError::Provider(format!(
+                "Google API returned {status}: {value}"
+            )))
+        }
     }
 }
 
@@ -462,7 +493,17 @@ impl TriggerDriver for GoogleTriggerDriver {
             )
             .await?;
         require_function_owner(&function, tenant)?;
+        let target_channel_lease = function_lease(&tenant.channel_id)?;
+        require_function_lease(&function, &target_channel_lease)?;
         validate_budgeted_function(&function)?;
+        let target_created_at = function
+            .get("createTime")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                TriggerError::Provider("target function omitted its creation identity".into())
+            })?
+            .to_string();
         let physical = self.physical_name(tenant, &request.name)?;
         let resource = self.resource(region, &physical)?;
         let channel = lease_key(&tenant.channel_id)?;
@@ -500,6 +541,8 @@ impl TriggerDriver for GoogleTriggerDriver {
             "trigger_resource": resource,
             "channel_lease": channel,
             "target_resource": function_resource,
+            "target_channel_lease": target_channel_lease,
+            "target_created_at": target_created_at,
             "tenant_key": tenant.key,
             "path": request.target.path,
             "input": request.input,
@@ -526,16 +569,13 @@ impl TriggerDriver for GoogleTriggerDriver {
             self.config.scheduler_api_base
         );
         let (status, value) = self.request(Method::PATCH, url, Some(&body)).await?;
+        // Only a new Scheduler job is a funding event; updates keep the
+        // remaining budget and expiry of the existing incarnation. Funding
+        // precedes creation, so a failed create leaves at most an unbound
+        // budget that the next create overwrites and the TTL reaps.
         let value = if status == StatusCode::NOT_FOUND {
-            self.require(
-                Method::POST,
-                format!(
-                    "{}/v1/projects/{}/locations/{region}/jobs",
-                    self.config.scheduler_api_base, self.config.project
-                ),
-                Some(&body),
-            )
-            .await?
+            let funded = self.fund_budget(&resource, &channel).await?;
+            self.create_job(region, &body, funded).await?
         } else if status.is_success() {
             value
         } else {
@@ -543,16 +583,6 @@ impl TriggerDriver for GoogleTriggerDriver {
                 "Google API returned {status}: {value}"
             )));
         };
-        if let Err(error) = self.fund_budget(&resource, &channel).await {
-            let _ = self
-                .request(
-                    Method::POST,
-                    format!("{}/v1/{resource}:pause", self.config.scheduler_api_base),
-                    Some(&json!({})),
-                )
-                .await;
-            return Err(error);
-        }
         trigger_from_value(&value, region)
     }
 
@@ -579,7 +609,10 @@ impl TriggerDriver for GoogleTriggerDriver {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|value| require_owner(value, tenant).is_ok())
+            .filter(|value| {
+                require_owner(value, tenant).is_ok()
+                    && require_funding_channel(value, tenant).is_ok()
+            })
             .filter_map(|value| trigger_from_value(value, region).ok())
             .collect();
         Ok(TriggerList {
@@ -604,13 +637,13 @@ impl TriggerDriver for GoogleTriggerDriver {
     async fn delete(&self, tenant: &Tenant, request: TriggerRequest) -> Result<()> {
         let (region, _) = self.owned_trigger(tenant, &request).await?;
         let resource = self.resource(&region, &request.id)?;
+        self.delete_budget(&resource).await?;
         self.require(
             Method::DELETE,
             format!("{}/v1/{resource}", self.config.scheduler_api_base),
             None,
         )
         .await?;
-        self.delete_budget(&resource).await?;
         Ok(())
     }
 
@@ -672,24 +705,6 @@ impl TriggerDriver for GoogleTriggerDriver {
                 "executor trigger resource is outside the configured project and region".into(),
             ));
         }
-        if !self
-            .consume_budget(&request.trigger_resource, &request.channel_lease)
-            .await?
-        {
-            let _ = self
-                .request(
-                    Method::POST,
-                    format!(
-                        "{}/v1/{}:pause",
-                        self.config.scheduler_api_base, request.trigger_resource
-                    ),
-                    Some(&json!({})),
-                )
-                .await;
-            return Err(TriggerError::InvalidRequest(
-                "prepaid execution budget is exhausted or expired".into(),
-            ));
-        }
         validate_schedule("* * * * *", "Etc/UTC", &request.path)?;
         let (target_region, target_name) =
             parse_function_resource(&request.target_resource, &self.config.project, None)?;
@@ -710,7 +725,34 @@ impl TriggerDriver for GoogleTriggerDriver {
             )
             .await?;
         require_function_tenant(&function, &request.tenant_key)?;
+        require_function_lease(&function, &request.target_channel_lease)?;
+        if request.target_created_at.is_empty()
+            || function.get("createTime").and_then(Value::as_str)
+                != Some(request.target_created_at.as_str())
+        {
+            return Err(TriggerError::InvalidRequest(
+                "target function was recreated after the trigger was created".into(),
+            ));
+        }
         validate_budgeted_function(&function)?;
+        if !self
+            .consume_budget(&request.trigger_resource, &request.channel_lease)
+            .await?
+        {
+            let _ = self
+                .request(
+                    Method::POST,
+                    format!(
+                        "{}/v1/{}:pause",
+                        self.config.scheduler_api_base, request.trigger_resource
+                    ),
+                    Some(&json!({})),
+                )
+                .await;
+            return Err(TriggerError::InvalidRequest(
+                "prepaid execution budget is exhausted or expired".into(),
+            ));
+        }
         let origin = function
             .pointer("/serviceConfig/uri")
             .and_then(Value::as_str)
@@ -819,6 +861,22 @@ fn require_channel(value: &Value, expected: &str) -> Result<()> {
     }
 }
 
+/// Every control operation is scoped to the channel lease that funds the job.
+fn require_funding_channel(value: &Value, tenant: &Tenant) -> Result<()> {
+    let marker = format!("pay-channel={};", lease_key(&tenant.channel_id)?);
+    if value
+        .get("description")
+        .and_then(Value::as_str)
+        .is_some_and(|description| description.contains(&marker))
+    {
+        Ok(())
+    } else {
+        Err(TriggerError::InvalidRequest(
+            "trigger is funded by a different payment channel".into(),
+        ))
+    }
+}
+
 fn parse_function_resource(
     resource: &str,
     expected_project: &str,
@@ -858,6 +916,24 @@ fn require_function_tenant(value: &Value, tenant_key: &str) -> Result<()> {
     } else {
         Err(TriggerError::InvalidRequest(
             "target function is not owned by the verified payer".into(),
+        ))
+    }
+}
+
+/// Compute deployment lease label for a verified channel.
+fn function_lease(channel_id: &str) -> Result<String> {
+    crate::google::channel_lease_key(channel_id)
+        .map_err(|error| TriggerError::InvalidRequest(error.to_string()))
+}
+
+fn require_function_lease(value: &Value, expected: &str) -> Result<()> {
+    if !expected.is_empty()
+        && value.pointer("/labels/pay-channel").and_then(Value::as_str) == Some(expected)
+    {
+        Ok(())
+    } else {
+        Err(TriggerError::InvalidRequest(
+            "target function is funded by a different payment channel".into(),
         ))
     }
 }
@@ -1038,6 +1114,10 @@ fn provider_error(status: StatusCode, bytes: &[u8]) -> TriggerError {
 mod auth_tests;
 
 #[cfg(test)]
+#[path = "trigger_google_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1119,6 +1199,41 @@ mod tests {
         });
         assert!(require_channel(&value, "old").is_ok());
         assert!(require_channel(&value, "new").is_err());
+    }
+
+    #[test]
+    fn control_operations_require_the_funding_channel() {
+        let owner = Tenant {
+            payer: "payer".into(),
+            key: "0123456789abcdef".into(),
+            channel_id: "channelA".into(),
+        };
+        let value = json!({
+            "description": format!(
+                "managed-by=mcp-compute;resource=trigger;pay-tenant={};pay-channel={};pay-name=weather",
+                owner.key,
+                lease_key("channelA").unwrap()
+            )
+        });
+        assert!(require_funding_channel(&value, &owner).is_ok());
+        let mut sibling = owner.clone();
+        sibling.channel_id = "channelB".into();
+        assert!(require_owner(&value, &sibling).is_ok());
+        assert!(require_funding_channel(&value, &sibling).is_err());
+        sibling.channel_id = String::new();
+        assert!(require_funding_channel(&value, &sibling).is_err());
+        assert!(require_funding_channel(&json!({}), &owner).is_err());
+    }
+
+    #[test]
+    fn trigger_targets_require_the_callers_deployment_lease() {
+        let lease = function_lease("channelA").unwrap();
+        let function = json!({ "labels": { "pay-channel": lease } });
+        assert!(require_function_lease(&function, &lease).is_ok());
+        assert!(require_function_lease(&function, &function_lease("channelB").unwrap()).is_err());
+        assert!(require_function_lease(&function, "").is_err());
+        assert!(require_function_lease(&json!({ "labels": {} }), &lease).is_err());
+        assert!(function_lease("").is_err());
     }
 
     #[test]

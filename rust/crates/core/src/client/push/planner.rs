@@ -333,6 +333,34 @@ pub fn pack_chunks(
     fee_payer: &Pubkey,
     compute_unit_price_micro_lamports: u64,
 ) -> Result<TransactionPlan> {
+    pack_chunks_from(
+        manifest,
+        ata,
+        fee_payer_mode,
+        sender,
+        fee_payer,
+        compute_unit_price_micro_lamports,
+        0,
+    )
+}
+
+/// [`pack_chunks`] numbering chunks from `first_chunk_index`, so a resumed
+/// run never reuses a chunk index already recorded in its journal.
+pub fn pack_chunks_from(
+    manifest: &TransferManifest,
+    ata: &AtaSnapshot,
+    fee_payer_mode: FeePayerMode,
+    sender: &Pubkey,
+    fee_payer: &Pubkey,
+    compute_unit_price_micro_lamports: u64,
+    first_chunk_index: u32,
+) -> Result<TransactionPlan> {
+    let next_index = |chunks: &[PlannedChunk]| -> Result<u32> {
+        u32::try_from(chunks.len())
+            .ok()
+            .and_then(|count| first_chunk_index.checked_add(count))
+            .ok_or_else(|| Error::Config("chunk index overflowed u32".to_string()))
+    };
     if manifest.rows.len() != ata.destinations.len() {
         return Err(Error::Config(
             "ATA snapshot row count does not match the manifest".to_string(),
@@ -353,7 +381,7 @@ pub fn pack_chunks(
 
     for row_index in 0..manifest.rows.len() {
         pending_rows.push(row_index);
-        let chunk_index = chunks.len() as u32;
+        let chunk_index = next_index(&chunks)?;
 
         let gasless_cap_exceeded = matches!(fee_payer_mode, FeePayerMode::Gasless)
             && pending_rows.len() > MAX_GASLESS_TRANSFERS_PER_CHUNK;
@@ -410,7 +438,7 @@ pub fn pack_chunks(
         chunks.push(finalized);
 
         pending_rows = vec![row_index];
-        let next_chunk_index = chunks.len() as u32;
+        let next_chunk_index = next_index(&chunks)?;
         if let Err(e) = build_planned_chunk(
             manifest,
             ata,
@@ -430,7 +458,7 @@ pub fn pack_chunks(
     }
 
     if !pending_rows.is_empty() {
-        let chunk_index = chunks.len() as u32;
+        let chunk_index = next_index(&chunks)?;
         chunks.push(build_planned_chunk(
             manifest,
             ata,
@@ -980,6 +1008,32 @@ mod tests {
         let hash_hex = manifest.hash_hex();
         let prefix = super::super::manifest_hash_prefix(&hash_hex);
         for chunk in &plan.chunks {
+            assert_eq!(
+                chunk.memo,
+                format!("pay-push:v1:{prefix}:{}", chunk.chunk_index)
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_plans_number_chunks_and_memos_from_the_given_index() {
+        let manifest = manifest_with_rows(3, 6);
+        let ata = snapshot_all_missing(&manifest);
+        let sender = Pubkey::new_unique();
+        let plan = pack_chunks_from(
+            &manifest,
+            &ata,
+            FeePayerMode::SelfFunded,
+            &sender,
+            &sender,
+            1,
+            41,
+        )
+        .unwrap();
+        let hash_hex = manifest.hash_hex();
+        let prefix = super::super::manifest_hash_prefix(&hash_hex);
+        for (position, chunk) in plan.chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, 41 + position as u32);
             assert_eq!(
                 chunk.memo,
                 format!("pay-push:v1:{prefix}:{}", chunk.chunk_index)

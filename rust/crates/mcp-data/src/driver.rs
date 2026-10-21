@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::Digest;
 use thiserror::Error;
 
 use crate::types::{
@@ -33,6 +34,20 @@ impl From<reqwest::Error> for DataError {
 }
 
 pub type Result<T> = std::result::Result<T, DataError>;
+
+/// Stable, non-reversible key for the payment channel funding a resource.
+pub fn channel_lease_key(channel_id: &str) -> Result<String> {
+    if channel_id.is_empty() {
+        return Err(DataError::InvalidRequest(
+            "resource access requires a verified payment channel".into(),
+        ));
+    }
+    let digest = sha2::Sha256::digest(channel_id.as_bytes());
+    Ok(digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 
 #[async_trait]
 pub trait DataDriver: Send + Sync {

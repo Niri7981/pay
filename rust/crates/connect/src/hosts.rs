@@ -66,7 +66,19 @@ pub struct HostProfile {
 }
 
 impl HostProfile {
+    /// Whether a code sent to `uri` stays with this host: one of its own
+    /// callbacks, or loopback on the user's machine.
+    fn accepts_redirect(&self, uri: &Url) -> bool {
+        is_loopback(uri) || self.redirects.iter().any(|r| r.matches(uri))
+    }
+
+    /// A name or callback claims a profile only when every registered
+    /// callback belongs to it; a known name beside a foreign callback is
+    /// generic.
     fn claims(&self, client_name: Option<&str>, redirect_uris: &[Url]) -> bool {
+        if redirect_uris.is_empty() || !redirect_uris.iter().all(|u| self.accepts_redirect(u)) {
+            return false;
+        }
         let by_name = client_name
             .map(|n| {
                 self.client_names
@@ -235,6 +247,26 @@ pub fn by_id(id: &str) -> &'static HostProfile {
     HOSTS.iter().find(|h| h.id == id).unwrap_or(&GENERIC)
 }
 
+/// The profile `host_id` names, only if `redirect_uri` is bound to it.
+pub fn verified(host_id: &str, redirect_uri: &str) -> &'static HostProfile {
+    let host = by_id(host_id);
+    match Url::parse(redirect_uri) {
+        Ok(url) if host.accepts_redirect(&url) => host,
+        _ => &GENERIC,
+    }
+}
+
+/// Whether `name` is what a known host calls itself, so showing it for an
+/// unverified client would impersonate that host.
+pub fn names_known_host(name: &str) -> bool {
+    let name = name.trim();
+    HOSTS.iter().any(|h| {
+        h.display_name.eq_ignore_ascii_case(name)
+            || h.id.eq_ignore_ascii_case(name)
+            || h.client_names.iter().any(|c| c.eq_ignore_ascii_case(name))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,9 +286,18 @@ mod tests {
             "grok"
         );
         assert_eq!(
-            identify(Some("grok"), &[]).id,
+            identify(
+                Some("grok"),
+                &uris(&["https://grok.com/connectors/oauth/callback"])
+            )
+            .id,
             "grok",
             "name match is case-insensitive"
+        );
+        assert_eq!(
+            identify(Some("grok"), &uris(&["http://127.0.0.1:4000/cb"])).id,
+            "grok",
+            "loopback keeps the code on the user's machine"
         );
         assert_eq!(
             identify(None, &uris(&["https://claude.ai/api/mcp/auth_callback"])).id,
@@ -296,6 +337,58 @@ mod tests {
         );
         assert_eq!(by_id("claude").display_name, "Claude");
         assert_eq!(by_id("nope").id, "generic");
+    }
+
+    #[test]
+    fn known_names_beside_foreign_callbacks_are_generic() {
+        for name in ["ChatGPT", "Claude", "grok", "Cursor", "Claude Code"] {
+            assert_eq!(
+                identify(Some(name), &uris(&["https://attacker.example/callback"])).id,
+                "generic",
+                "{name}"
+            );
+        }
+        // One foreign callback among genuine ones still taints the set.
+        assert_eq!(
+            identify(
+                Some("ChatGPT"),
+                &uris(&[
+                    "https://chatgpt.com/connector_platform_oauth_redirect",
+                    "https://attacker.example/callback"
+                ])
+            )
+            .id,
+            "generic"
+        );
+        // Lookalike origins do not match an exact or prefix callback.
+        for uri in [
+            "https://chatgpt.com.attacker.example/connector/oauth/x",
+            "https://claude.ai.attacker.example/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback/../../evil",
+        ] {
+            assert_eq!(identify(None, &uris(&[uri])).id, "generic", "{uri}");
+        }
+        assert_eq!(identify(Some("ChatGPT"), &[]).id, "generic");
+    }
+
+    #[test]
+    fn verified_binds_the_profile_to_the_chosen_callback() {
+        assert_eq!(
+            verified("claude", "https://claude.ai/api/mcp/auth_callback").id,
+            "claude"
+        );
+        assert_eq!(verified("claude", "http://localhost:9/cb").id, "claude");
+        assert_eq!(
+            verified("claude", "https://attacker.example/callback").id,
+            "generic"
+        );
+        assert_eq!(verified("claude", "not a url").id, "generic");
+        assert_eq!(
+            verified("generic", "https://agent.example/cb").id,
+            "generic"
+        );
+        assert!(names_known_host(" chatgpt ") && names_known_host("Claude Web"));
+        assert!(!names_known_host("Some Agent"));
     }
 
     #[test]

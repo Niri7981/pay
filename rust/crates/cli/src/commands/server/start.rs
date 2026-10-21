@@ -192,39 +192,122 @@ async fn session_channel_store(
     }
 }
 
-async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
-    let redis_url = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"]
-        .into_iter()
-        .find_map(|var| {
-            std::env::var(var)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        });
+/// Resolve a replay-protection key-value store: durable Redis when an URL is
+/// configured, otherwise in-memory. The flag reports durability.
+async fn replay_store(
+    url_vars: &[&str],
+    prefix: &str,
+    label: &str,
+) -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::Store>, bool)> {
+    let redis_url = url_vars.iter().find_map(|var| {
+        std::env::var(var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
 
     let Some(redis_url) = redis_url else {
-        return Ok(Arc::new(pay_kit::mpp::store::MemoryStore::new()));
+        return Ok((Arc::new(pay_kit::mpp::store::MemoryStore::new()), false));
     };
 
     #[cfg(feature = "redis-session-store")]
     {
-        let store = pay_core::server::subscription::RedisSubscriptionStore::connect(
-            &redis_url,
-            "pay:subscription:v1:",
-        )
-        .await?;
-        tracing::info!("using durable Redis store for subscription proofs");
-        Ok(Arc::new(store))
+        let store =
+            pay_core::server::subscription::RedisSubscriptionStore::connect(&redis_url, prefix)
+                .await?;
+        tracing::info!("using durable Redis store for {label}");
+        Ok((Arc::new(store), true))
     }
 
     #[cfg(not(feature = "redis-session-store"))]
     {
-        let _ = redis_url;
-        Err(pay_core::Error::Config(
-            "an MPP Redis URL is set, but this pay binary was built without the redis-session-store feature"
-                .to_string(),
-        ))
+        let _ = (redis_url, prefix);
+        Err(pay_core::Error::Config(format!(
+            "a {label} Redis URL is set, but this pay binary was built without the \
+             redis-session-store feature"
+        )))
     }
+}
+
+/// Settled x402 `exact` signatures. Replicas must share this store, or one
+/// payment can be served once per replica.
+async fn x402_exact_replay_store() -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::Store>, bool)>
+{
+    replay_store(
+        &[
+            "PAY_X402_REDIS_URL",
+            "PAY_MPP_REDIS_URL",
+            "PAY_SESSION_REDIS_URL",
+        ],
+        "pay:x402:v1:",
+        "x402 exact payments",
+    )
+    .await
+}
+
+fn x402_exact_backend(
+    config: pay_kit::x402::server::Config,
+    replay_store: Arc<dyn pay_kit::mpp::store::Store>,
+) -> std::result::Result<pay_kit::x402::server::X402, pay_kit::x402::Error> {
+    Ok(pay_kit::x402::server::X402::new(config)?
+        .with_store(replay_store)
+        .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
+}
+
+/// Consumed MPP charge signatures. Replicas behind a deployment policy must
+/// share it; a single hosted gateway without Redis is warned that a restart
+/// forgets which payments were already served.
+async fn charge_replay_store(
+    network: &SolanaNetwork,
+    deployment_policy_mode: bool,
+) -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
+    let (store, durable) = replay_store(
+        &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"],
+        "pay:charge:v1:",
+        "MPP charges",
+    )
+    .await?;
+    if !durable && deployment_policy_mode {
+        return Err(pay_core::Error::Config(
+            "deployment gateways need a shared MPP charge replay store; set PAY_MPP_REDIS_URL"
+                .into(),
+        ));
+    }
+    if !durable && requires_durable_store(network, deployment_policy_mode) {
+        eprintln!(
+            "{}",
+            format!(
+                "warning: MPP charges on {} use an in-memory replay store; set PAY_MPP_REDIS_URL \
+                 before running more than one gateway",
+                network.slug()
+            )
+            .yellow()
+        );
+    }
+    Ok(store)
+}
+
+/// Subscription activation and proof records. A hosted gateway that serves
+/// subscriptions refuses to keep them in process memory.
+async fn subscription_store(
+    network: &SolanaNetwork,
+    deployment_policy_mode: bool,
+    serves_subscriptions: bool,
+) -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
+    let (store, durable) = replay_store(
+        &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"],
+        "pay:subscription:v1:",
+        "subscription proofs",
+    )
+    .await?;
+    if !durable && serves_subscriptions && requires_durable_store(network, deployment_policy_mode) {
+        return Err(pay_core::Error::Config(format!(
+            "{} subscriptions need a durable replay store; set PAY_MPP_REDIS_URL and build \
+             with redis-session-store",
+            network.slug()
+        )));
+    }
+    Ok(store)
 }
 
 /// Resolve the channel store backing x402 `batch-settlement`.
@@ -236,8 +319,9 @@ async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::S
 /// takes real money wants `PAY_X402_REDIS_URL` (falling back to the MPP
 /// Redis URL). The legacy session URL remains a final fallback for existing
 /// deployments.
-async fn batch_channel_store()
--> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
+async fn batch_channel_store(
+    network: &SolanaNetwork,
+) -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
     channel_store(
         &[
             "PAY_X402_REDIS_URL",
@@ -245,10 +329,27 @@ async fn batch_channel_store()
             "PAY_SESSION_REDIS_URL",
         ],
         &["PAY_X402_REDIS_PREFIX"],
-        "pay:batch:v1:",
+        &batch_store_default_prefix(network),
         "x402 batch-settlement",
     )
     .await
+}
+
+/// Channel ids do not cover the cluster, so each network gets its own key
+/// namespace. Mainnet keeps the original prefix its records live under.
+fn batch_store_default_prefix(network: &SolanaNetwork) -> String {
+    const PREFIX: &str = "pay:batch:v1:";
+    match network {
+        SolanaNetwork::Mainnet => PREFIX.to_string(),
+        other => format!("{PREFIX}{}:", other.slug()),
+    }
+}
+
+/// Payment state (accepted batch vouchers, consumed exact signatures) lives
+/// only in its store, so a restart or a second replica with a memory store
+/// would re-serve it. Only local test clusters may run that way.
+fn requires_durable_store(network: &SolanaNetwork, deployment_policy_mode: bool) -> bool {
+    deployment_policy_mode || !matches!(network, SolanaNetwork::Devnet | SolanaNetwork::Localnet)
 }
 
 /// The gateway owns session close/settlement until a separately deployed
@@ -1346,7 +1447,7 @@ fn charge_split_recipient_targets(api: &ApiSpec) -> pay_core::Result<Vec<PayoutR
             continue;
         }
 
-        for rule in pay_core::server::metering::resolve_split_rules(meter) {
+        for rule in pay_core::server::metering::all_split_rules(meter) {
             let Some(alias) = api.recipients.get(&rule.recipient) else {
                 return Err(pay_core::Error::Config(format!(
                     "{}: split recipient '{}' not declared",
@@ -1830,7 +1931,12 @@ impl StartCommand {
             // MPP_CHALLENGE_BINDING_SECRET for the subscription middleware —
             // see `payments::init_challenge_binding_secret`.)
             let challenge_binding_secret = payments::init_challenge_binding_secret();
-            let subscription_store = subscription_store().await?;
+            let subscription_store = subscription_store(
+                &network,
+                deployment_policy_mode,
+                api.endpoints.iter().any(|ep| ep.subscription.is_some()),
+            )
+            .await?;
 
             payments::ensure_payout_recipient_token_accounts(
                 &payout_recipients,
@@ -1845,12 +1951,22 @@ impl StartCommand {
             // (see `payments::spawn_blockhash_cache` for why).
             let blockhash_cache = payments::spawn_blockhash_cache(&rpc_url);
 
+            // Charge challenges are scoped to this API, and every currency's
+            // server shares one replay store for the gateway's lifetime.
+            let charge_realm = api
+                .operator
+                .as_ref()
+                .and_then(|operator| operator.realm.clone())
+                .unwrap_or_else(|| api.subdomain.clone());
+            let charge_store = charge_replay_store(&network, deployment_policy_mode).await?;
             let mpps: Vec<Mpp> = payments::build_charge_mpps(
                 &currency_configs,
                 &recipient,
                 network.slug(),
                 &rpc_url,
                 &challenge_binding_secret,
+                &charge_realm,
+                charge_store,
                 fee_payer,
                 fee_payer_signer.clone(),
                 &blockhash_cache,
@@ -2312,14 +2428,29 @@ impl StartCommand {
                         None
                     },
                 };
-                match pay_kit::x402::server::X402::new(cfg) {
-                    Ok(x) => Some(
-                        x.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
-                            .with_blockhash_cache(blockhash_cache.clone()),
-                    ),
-                    Err(e) => {
-                        eprintln!("x402 backend disabled ({e}); x402 schemes won't be offered");
-                        None
+                let (exact_store, durable_exact_store) = x402_exact_replay_store().await?;
+                if !durable_exact_store
+                    && requires_durable_store(&network, deployment_policy_mode)
+                {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "x402 exact disabled: {} payments need a durable replay store; \
+                             set PAY_X402_REDIS_URL",
+                            network.slug()
+                        )
+                        .yellow()
+                    );
+                    None
+                } else {
+                    match x402_exact_backend(cfg, exact_store) {
+                        Ok(x) => Some(x.with_blockhash_cache(blockhash_cache.clone())),
+                        Err(e) => {
+                            eprintln!(
+                                "x402 backend disabled ({e}); x402 schemes won't be offered"
+                            );
+                            None
+                        }
                     }
                 }
             } else {
@@ -2379,8 +2510,22 @@ impl StartCommand {
                 })
             });
             let x402_batch = match (wants_batch, fee_payer_signer.clone()) {
-                (true, Some(signer)) => {
-                    let (batch_store, durable_batch_store) = batch_channel_store().await?;
+                (true, Some(signer)) => 'batch: {
+                    let (batch_store, durable_batch_store) = batch_channel_store(&network).await?;
+                    if !durable_batch_store
+                        && requires_durable_store(&network, deployment_policy_mode)
+                    {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "x402 batch-settlement disabled: {} payments need a durable \
+                                 channel store; set PAY_X402_REDIS_URL",
+                                network.slug()
+                            )
+                            .yellow()
+                        );
+                        break 'batch None;
+                    }
                     if !durable_batch_store {
                         eprintln!(
                             "{}",
@@ -2688,15 +2833,18 @@ impl StartCommand {
                     let api = api.clone();
                     async move {
                         let (parts, body) = req.into_parts();
-                        // 404 for paths not listed in the spec — prevents OAuth2
-                        // token fetches for browser auto-requests like /favicon.ico.
-                        let path = parts.uri.path().trim_start_matches('/');
-                        if pay_core::server::metering::find_endpoint_by_path(&api, path).is_none() {
+                        // Only a request the payment gate routed to the API
+                        // reaches the upstream.
+                        let Some(route) = parts
+                            .extensions
+                            .get::<pay_core::server::proxy::UpstreamRoute>()
+                            .cloned()
+                        else {
                             return axum::response::IntoResponse::into_response((
                                 axum::http::StatusCode::NOT_FOUND,
                                 axum::Json(serde_json::json!({"error": "not_found"})),
                             ));
-                        }
+                        };
                         let session_context = parts
                             .extensions
                             .get::<pay_core::server::session_stream::SessionStreamContext>()
@@ -2710,6 +2858,7 @@ impl StartCommand {
                             .unwrap_or_default();
                         pay_core::server::proxy::forward_request_with_session_metering_and_identity(
                             &api,
+                            &route,
                             parts.method,
                             &parts.uri,
                             &parts.headers,
@@ -3103,7 +3252,7 @@ async fn ensure_subscription_plans(
     use dialoguer::Confirm;
     use dialoguer::theme::ColorfulTheme;
     use pay_core::server::subscription::{
-        PlanStatus, check_plan_exists, compute_plan_id_numeric, fetch_plan_created_at, publish_plan,
+        PlanRoute, PlanStatus, check_plan_exists, fetch_plan, publish_plan,
     };
     use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
     use solana_pubkey::Pubkey;
@@ -3144,6 +3293,8 @@ async fn ensure_subscription_plans(
     let program_id = default_program_id();
 
     let mut publications: Vec<pay_core::server::subscription::PublishedPlan> = Vec::new();
+    let api_subdomain = api.subdomain.clone();
+    let mut plans_in_use = HashMap::new();
 
     for endpoint in api.endpoints.iter_mut() {
         let Some(sub_spec) = endpoint.subscription.as_mut() else {
@@ -3165,13 +3316,21 @@ async fn ensure_subscription_plans(
             );
         }
 
-        // Stable id derived from `(operator, endpoint.path)`. Reuse the
-        // value persisted in YAML if present so manual edits stick.
+        // Stable id derived from the route (operator, API, method, path).
+        // Reuse the value persisted in YAML if present so manual edits stick.
+        let route = PlanRoute::new(&endpoint.method, &endpoint.path);
         let plan_id_numeric = sub_spec
             .plan_id_numeric
-            .unwrap_or_else(|| compute_plan_id_numeric(operator_pubkey_str, &endpoint.path));
+            .unwrap_or_else(|| route.plan_id_numeric(operator_pubkey_str, &api_subdomain));
         let seed = plan_id_seed(plan_id_numeric);
         let (plan_pda, plan_bump) = find_plan_pda(&operator, &seed, &program_id);
+        // A Plan authorizes every route it is attached to, so one per route.
+        if let Some(other) = plans_in_use.insert(plan_pda, route.clone()) {
+            return Err(pay_core::Error::Config(format!(
+                "endpoints `{other}` and `{route}` resolve to the same subscription Plan \
+                 `{plan_pda}`; give each its own plan_id_numeric"
+            )));
+        }
 
         // Treat a YAML-pinned plan_id that disagrees with our derivation
         // as a configuration error — the operator probably edited the
@@ -3195,7 +3354,13 @@ async fn ensure_subscription_plans(
                     plan = %plan_pda,
                     "subscription Plan already on-chain — reusing",
                 );
-                let plan_created_at = fetch_plan_created_at(rpc_url, &plan_pda).await?;
+                let plan = fetch_plan(rpc_url, &plan_pda).await?;
+                plan.require_terms(sub_spec, &operator).map_err(|error| {
+                    pay_core::Error::Config(format!(
+                        "endpoint `{route}` cannot reuse Plan `{plan_pda}`: {error}"
+                    ))
+                })?;
+                let plan_created_at = plan.created_at;
                 sub_spec.plan_id = Some(plan_pda.to_string());
                 sub_spec.plan_id_numeric = Some(plan_id_numeric);
                 sub_spec.plan_bump = Some(plan_bump);
@@ -3205,7 +3370,7 @@ async fn ensure_subscription_plans(
                 // Persist the hydrated fields so this launch and subsequent
                 // launches emit a complete, settle-able challenge.
                 publications.push(pay_core::server::subscription::PublishedPlan {
-                    endpoint_path: endpoint.path.clone(),
+                    route,
                     plan_id_numeric,
                     plan_pda: plan_pda.to_string(),
                     plan_bump,
@@ -3268,16 +3433,20 @@ async fn ensure_subscription_plans(
                 }
 
                 eprintln!("Publishing Plan…");
-                let mut published =
-                    publish_plan(sub_spec, &operator, signer, rpc_url, plan_id_numeric)
-                        .await
-                        .map_err(|e| {
-                            pay_core::Error::Config(format!(
-                                "create_plan broadcast failed for `{}`: {e}",
-                                endpoint.path
-                            ))
-                        })?;
-                published.endpoint_path = endpoint.path.clone();
+                let published = publish_plan(
+                    sub_spec,
+                    &operator,
+                    signer,
+                    rpc_url,
+                    route.clone(),
+                    plan_id_numeric,
+                )
+                .await
+                .map_err(|e| {
+                    pay_core::Error::Config(format!(
+                        "create_plan broadcast failed for `{route}`: {e}"
+                    ))
+                })?;
                 eprintln!(
                     "  {} {}",
                     "✓".green(),
@@ -3311,7 +3480,14 @@ async fn ensure_subscription_plans(
                 spec_path
             ))
         })?;
-        let updated = write_back_published_plans(&raw, &publications);
+        let (updated, missing) = write_back_published_plans(&raw, &publications);
+        for route in missing {
+            tracing::warn!(
+                endpoint = %route,
+                "could not locate the subscription block to persist its Plan; \
+                 the next start re-derives and reuses the same Plan"
+            );
+        }
         std::fs::write(expanded.as_ref(), updated).map_err(|e| {
             pay_core::Error::Config(format!("Failed to write spec {}: {e}", spec_path))
         })?;
@@ -3321,125 +3497,27 @@ async fn ensure_subscription_plans(
 }
 
 /// In-place YAML rewrite of `plan_id` / `plan_id_numeric` / `plan_bump`
-/// / `plan_created_at` under each freshly-published subscription block.
-/// Preserves comments and key ordering — line-based rewrite rather than
-/// a full serde round-trip.
+/// / `plan_created_at` under each freshly-published route's subscription
+/// block. Routes the rewrite cannot locate are returned.
 fn write_back_published_plans(
     yaml: &str,
     publications: &[pay_core::server::subscription::PublishedPlan],
-) -> String {
-    use std::collections::HashMap;
-    // Lookup by endpoint path.
-    let by_path: HashMap<&str, &pay_core::server::subscription::PublishedPlan> = publications
+) -> (String, Vec<pay_core::server::subscription::PlanRoute>) {
+    let updates = publications
         .iter()
-        .map(|p| (p.endpoint_path.as_str(), p))
+        .map(|p| {
+            (
+                p.route.clone(),
+                vec![
+                    ("plan_id", p.plan_pda.clone()),
+                    ("plan_id_numeric", p.plan_id_numeric.to_string()),
+                    ("plan_bump", p.plan_bump.to_string()),
+                    ("plan_created_at", p.plan_created_at.to_string()),
+                ],
+            )
+        })
         .collect();
-
-    let mut out = String::with_capacity(yaml.len() + 512);
-    let mut current_path: Option<String> = None;
-    let mut current_published: Option<&pay_core::server::subscription::PublishedPlan> = None;
-    let mut inside_subscription = false;
-    let mut subscription_indent: Option<usize> = None;
-    let mut wrote_fields = false;
-
-    for line in yaml.lines() {
-        let stripped = line.trim_start();
-        let indent = line.len() - stripped.len();
-
-        // Track current endpoint via `path:`.
-        if let Some(rest) = stripped.strip_prefix("path:") {
-            let path_value = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-            current_published = by_path.get(path_value.as_str()).copied();
-            current_path = Some(path_value);
-            inside_subscription = false;
-            subscription_indent = None;
-            wrote_fields = false;
-        } else if stripped.starts_with("subscription:") {
-            inside_subscription = true;
-            subscription_indent = Some(indent);
-        } else if inside_subscription
-            && let Some(block_indent) = subscription_indent
-            && indent > block_indent
-        {
-            // Drop any pre-existing entries for the fields we're about to (re)write.
-            if let Some(published) = current_published {
-                let trimmed = stripped.trim_end();
-                if trimmed.starts_with("plan_id:")
-                    || trimmed.starts_with("plan_id_numeric:")
-                    || trimmed.starts_with("plan_bump:")
-                    || trimmed.starts_with("plan_created_at:")
-                {
-                    // Skip the existing line; we'll emit fresh ones below
-                    // when we leave the subscription block.
-                    let _ = published;
-                    continue;
-                }
-            }
-        } else if inside_subscription
-            && let Some(block_indent) = subscription_indent
-            && indent <= block_indent
-            && !stripped.is_empty()
-            && !stripped.starts_with('#')
-        {
-            // Leaving the subscription block — emit the published fields
-            // immediately before the closing line.
-            if let Some(published) = current_published
-                && !wrote_fields
-            {
-                let field_indent = " ".repeat(block_indent + 2);
-                out.push_str(&field_indent);
-                out.push_str("plan_id: ");
-                out.push_str(&published.plan_pda);
-                out.push('\n');
-                out.push_str(&field_indent);
-                out.push_str("plan_id_numeric: ");
-                out.push_str(&published.plan_id_numeric.to_string());
-                out.push('\n');
-                out.push_str(&field_indent);
-                out.push_str("plan_bump: ");
-                out.push_str(&published.plan_bump.to_string());
-                out.push('\n');
-                out.push_str(&field_indent);
-                out.push_str("plan_created_at: ");
-                out.push_str(&published.plan_created_at.to_string());
-                out.push('\n');
-                wrote_fields = true;
-            }
-            inside_subscription = false;
-            subscription_indent = None;
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    // Trailing subscription block at EOF.
-    if inside_subscription
-        && let Some(published) = current_published
-        && !wrote_fields
-        && let Some(block_indent) = subscription_indent
-    {
-        let field_indent = " ".repeat(block_indent + 2);
-        out.push_str(&field_indent);
-        out.push_str("plan_id: ");
-        out.push_str(&published.plan_pda);
-        out.push('\n');
-        out.push_str(&field_indent);
-        out.push_str("plan_id_numeric: ");
-        out.push_str(&published.plan_id_numeric.to_string());
-        out.push('\n');
-        out.push_str(&field_indent);
-        out.push_str("plan_bump: ");
-        out.push_str(&published.plan_bump.to_string());
-        out.push('\n');
-        out.push_str(&field_indent);
-        out.push_str("plan_created_at: ");
-        out.push_str(&published.plan_created_at.to_string());
-        out.push('\n');
-    }
-
-    let _ = current_path;
-    out
+    super::plan_yaml::rewrite_subscription_fields(yaml, &updates)
 }
 
 fn resolve_operator_currencies(op: Option<&OperatorConfig>, cli_currency: &str) -> Vec<String> {
@@ -3801,7 +3879,7 @@ fn ensure_static_split_recipient_accounts_valid(
         let Some(meter) = ep.metering.as_ref() else {
             continue;
         };
-        for rule in pay_core::server::metering::resolve_split_rules(meter) {
+        for rule in pay_core::server::metering::all_split_rules(meter) {
             let endpoint = ep.path.as_str();
             let recipient = rule.recipient.as_str();
             let Some(alias) = api.recipients.get(recipient) else {
@@ -4007,7 +4085,11 @@ async fn gateway_verify(
                     }
                 };
                 match mpp
-                    .verify_credential_with_expected(&credential, &expected)
+                    .verify_credential_for_route(
+                        &credential,
+                        &expected,
+                        &gateway_charge_route(&req),
+                    )
                     .await
                 {
                     Ok(receipt) => {
@@ -4102,11 +4184,17 @@ fn gateway_charge_challenges(
                     description: req.description.as_deref(),
                     external_id: req.external_id.as_deref(),
                     splits: splits.clone(),
+                    route: Some(&gateway_charge_route(req)),
                     ..Default::default()
                 },
             )
         })
         .collect()
+}
+
+/// The protected route a gateway charge is bound to.
+fn gateway_charge_route(req: &GatewayVerifyRequest) -> String {
+    format!("{} {}", req.method.to_ascii_uppercase(), req.path)
 }
 
 #[cfg(test)]
@@ -4130,6 +4218,172 @@ mod tests {
     use solana_pubkey::Pubkey;
     use std::collections::HashMap;
     use std::str::FromStr;
+
+    #[test]
+    fn payment_state_needs_a_durable_store_outside_test_clusters() {
+        use crate::network::SolanaNetwork;
+        assert!(super::requires_durable_store(
+            &SolanaNetwork::Mainnet,
+            false
+        ));
+        assert!(super::requires_durable_store(
+            &SolanaNetwork::Unknown("custom".into()),
+            false
+        ));
+        assert!(super::requires_durable_store(&SolanaNetwork::Devnet, true));
+        assert!(!super::requires_durable_store(
+            &SolanaNetwork::Devnet,
+            false
+        ));
+        assert!(!super::requires_durable_store(
+            &SolanaNetwork::Localnet,
+            false
+        ));
+    }
+
+    fn exact_replica(
+        store: std::sync::Arc<dyn pay_kit::mpp::store::Store>,
+    ) -> pay_kit::x402::server::X402 {
+        super::x402_exact_backend(
+            pay_kit::x402::server::Config {
+                recipient: Pubkey::new_unique().to_string(),
+                currencies: vec![pay_kit::x402::server::CurrencyConfig {
+                    currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                    decimals: 6,
+                    token_program: None,
+                }],
+                network: "mainnet".to_string(),
+                rpc_url: Some("http://127.0.0.1:1".to_string()),
+                resource: "api".to_string(),
+                description: None,
+                max_age: Some(300),
+                fee_payer_key: None,
+            },
+            store,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn batch_store_prefixes_never_share_a_namespace_across_networks() {
+        let networks = [
+            SolanaNetwork::Mainnet,
+            SolanaNetwork::Devnet,
+            SolanaNetwork::Localnet,
+            SolanaNetwork::Unknown("custom".into()),
+        ];
+        let prefixes: std::collections::HashSet<_> = networks
+            .iter()
+            .map(super::batch_store_default_prefix)
+            .collect();
+        assert_eq!(prefixes.len(), networks.len());
+        // Existing mainnet records and pay-worker's default stay addressable.
+        assert_eq!(
+            super::batch_store_default_prefix(&SolanaNetwork::Mainnet),
+            "pay:batch:v1:"
+        );
+        assert_eq!(
+            super::batch_store_default_prefix(&SolanaNetwork::Devnet),
+            "pay:batch:v1:devnet:"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_subscriptions_refuse_a_process_local_store() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let mainnet = super::subscription_store(&SolanaNetwork::Mainnet, false, true).await;
+        let custom =
+            super::subscription_store(&SolanaNetwork::Unknown("custom".into()), false, true).await;
+        let deployment = super::subscription_store(&SolanaNetwork::Devnet, true, true).await;
+        let devnet = super::subscription_store(&SolanaNetwork::Devnet, false, true).await;
+        let localnet = super::subscription_store(&SolanaNetwork::Localnet, false, true).await;
+        let no_subscriptions =
+            super::subscription_store(&SolanaNetwork::Mainnet, true, false).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        for refused in [mainnet, custom, deployment] {
+            let Err(error) = refused else {
+                panic!("a hosted subscription store fell back to memory");
+            };
+            assert!(
+                error.to_string().contains("durable replay store"),
+                "{error}"
+            );
+        }
+        devnet.unwrap();
+        localnet.unwrap();
+        no_subscriptions.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn x402_exact_signatures_are_consumed_across_replicas() {
+        use pay_kit::x402::server::VerifiedExactPayment;
+        let names = [
+            "PAY_X402_REDIS_URL",
+            "PAY_MPP_REDIS_URL",
+            "PAY_SESSION_REDIS_URL",
+        ];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let resolved = super::x402_exact_replay_store().await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        let (store, durable) = resolved.unwrap();
+        // Without Redis the store is process-local, which hosted networks refuse.
+        assert!(!durable);
+        assert!(super::requires_durable_store(
+            &SolanaNetwork::Mainnet,
+            false
+        ));
+
+        let fee_payer = pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&{
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let mut bytes = [0u8; 64];
+            bytes[..32].copy_from_slice(&key.to_bytes());
+            bytes[32..].copy_from_slice(key.verifying_key().as_bytes());
+            bytes
+        })
+        .unwrap();
+        // Construction probes the RPC with a blocking client.
+        let (replica_a, replica_b) = tokio::task::spawn_blocking(move || {
+            (exact_replica(store.clone()), exact_replica(store))
+        })
+        .await
+        .unwrap();
+        let signature = solana_signature::Signature::from([9u8; 64]).to_string();
+        let settle = |x402: &pay_kit::x402::server::X402, signature: &str| {
+            let x402 = x402.clone();
+            let signature = signature.to_string();
+            let fee_payer = &fee_payer;
+            async move {
+                x402.settle_exact(VerifiedExactPayment::Signature(signature), fee_payer)
+                    .await
+            }
+        };
+
+        assert_eq!(settle(&replica_a, &signature).await.unwrap(), signature);
+        let replay = settle(&replica_b, &signature).await.unwrap_err();
+        assert!(replay.to_string().contains("already consumed"), "{replay}");
+        let replay = settle(&replica_a, &signature).await.unwrap_err();
+        assert!(replay.to_string().contains("already consumed"), "{replay}");
+
+        let other = solana_signature::Signature::from([10u8; 64]).to_string();
+        assert_eq!(settle(&replica_b, &other).await.unwrap(), other);
+    }
 
     #[tokio::test]
     #[serial]
@@ -5292,6 +5546,65 @@ endpoints:
         assert!(
             msg.contains("backend: account"),
             "missing alt-backend hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn write_back_keeps_get_and_post_plans_on_the_same_path_apart() {
+        use pay_core::server::subscription::{PlanRoute, PublishedPlan};
+        use pay_types::metering::HttpMethod;
+
+        let yaml = "\
+name: t
+subdomain: t
+title: t
+description: t
+category: ai_ml
+version: v1
+routing:
+  type: proxy
+  url: https://example.com
+endpoints:
+  - method: GET
+    path: v1/feed
+    subscription:
+      period: 30d
+      currency: USDC
+  - method: POST
+    path: v1/feed
+    subscription:
+      period: 30d
+      currency: USDC
+";
+        let published = |method, numeric, pda: &str| PublishedPlan {
+            route: PlanRoute::new(&method, "v1/feed"),
+            plan_id_numeric: numeric,
+            plan_pda: pda.to_string(),
+            plan_bump: 254,
+            plan_created_at: 1_780_000_000,
+            broadcast_signature: None,
+        };
+        let publications = [
+            published(HttpMethod::Get, 11, "GetPlan"),
+            published(HttpMethod::Post, 22, "PostPlan"),
+        ];
+
+        let (out, missing) = super::write_back_published_plans(yaml, &publications);
+        assert!(missing.is_empty(), "{missing:?}");
+
+        // Reloading must see one Plan per route, not the last one twice.
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(&out).unwrap();
+        let plans: Vec<_> = api
+            .endpoints
+            .iter()
+            .map(|ep| {
+                let sub = ep.subscription.as_ref().unwrap();
+                (sub.plan_id.clone().unwrap(), sub.plan_id_numeric.unwrap())
+            })
+            .collect();
+        assert_eq!(
+            plans,
+            [("GetPlan".to_string(), 11), ("PostPlan".to_string(), 22)]
         );
     }
 }

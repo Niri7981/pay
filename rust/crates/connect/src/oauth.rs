@@ -81,6 +81,8 @@ pub struct PendingAuthorization {
     pub scope: String,
     /// Display-only endpoint context, bound to this pending request.
     pub resource_uri: Option<String>,
+    /// The upstream login session an interrupted approval began in.
+    session: Option<String>,
     created_at: Instant,
 }
 
@@ -92,6 +94,8 @@ struct CodeGrant {
     code_challenge: String,
     subject: String,
     scope: String,
+    /// The upstream login session the approval came from, if any.
+    session: Option<String>,
     created_at: Instant,
 }
 
@@ -108,6 +112,10 @@ struct TokenRecord {
     client_id: String,
     subject: String,
     scope: String,
+    session: Option<String>,
+    /// The authorization grant this pair descends from; revoking any token
+    /// of the family revokes all of it.
+    family: String,
     expires_at: Instant,
 }
 
@@ -122,6 +130,9 @@ pub struct Store {
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     codes: Mutex<HashMap<String, CodeGrant>>,
     tokens: Mutex<HashMap<String, TokenRecord>>,
+    /// Rotated-out refresh tokens, by hash: their family and expiry, so a
+    /// replay revokes the family.
+    retired: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 /// Why a token request failed, in RFC 6749 vocabulary.
@@ -205,6 +216,7 @@ impl Store {
             pending: Mutex::default(),
             codes: Mutex::default(),
             tokens: Mutex::default(),
+            retired: Mutex::default(),
         }
     }
 
@@ -351,8 +363,24 @@ impl Store {
     /// Consume the pending request and mint a code for `subject`.
     /// Returns the code, or `None` when the request is unknown or expired.
     pub fn approve(&self, id: &str, subject: &str) -> Option<(PendingAuthorization, String)> {
+        self.approve_in_session(id, subject, None)
+    }
+
+    /// [`Store::approve`], binding the code and every token derived from it
+    /// to the upstream login `session`, so [`Store::revoke_session`] ends them.
+    pub fn approve_in_session(
+        &self,
+        id: &str,
+        subject: &str,
+        session: Option<&str>,
+    ) -> Option<(PendingAuthorization, String)> {
         let request = self.pending.lock().unwrap().remove(id)?;
         if self.now().saturating_duration_since(request.created_at) > REQUEST_TTL {
+            return None;
+        }
+        let session = session.or(request.session.as_deref());
+        let client = self.client(&request.client_id)?;
+        if !host_bound(&client, &request.redirect_uri) {
             return None;
         }
         let code = random_token();
@@ -362,6 +390,7 @@ impl Store {
             code_challenge: request.code_challenge.clone(),
             subject: subject.to_string(),
             scope: request.scope.clone(),
+            session: session.map(str::to_string),
             created_at: self.now(),
         };
         let now = self.now();
@@ -370,6 +399,17 @@ impl Store {
             now.saturating_duration_since(g.created_at) > CODE_TTL
         })
         .then_some((request, code))
+    }
+
+    /// Remember the login session of an approval that continues later (after
+    /// funding), so the code it ends with is still bound to it.
+    pub fn attach_session(&self, id: &str, session: Option<&str>) -> Option<()> {
+        let mut pending = self.pending.lock().unwrap();
+        let request = pending.get_mut(id)?;
+        if let Some(session) = session {
+            request.session = Some(session.to_string());
+        }
+        Some(())
     }
 
     /// Consume the pending request without issuing anything.
@@ -422,7 +462,13 @@ impl Store {
                 "code_verifier does not match code_challenge",
             ));
         }
-        match self.issue(&grant.client_id, &grant.subject, &grant.scope) {
+        match self.issue(
+            &grant.client_id,
+            &grant.subject,
+            &grant.scope,
+            grant.session.as_deref(),
+            &random_token(),
+        ) {
             Ok(tokens) => Ok(tokens),
             Err(err) => {
                 // Capacity is transient; do not burn a valid code when no
@@ -442,9 +488,17 @@ impl Store {
     ) -> Result<TokenResponse, TokenError> {
         let mut tokens = self.tokens.lock().unwrap();
         let refresh_hash = sha256_hex(refresh_token);
-        let record = tokens
-            .remove(&refresh_hash)
-            .ok_or_else(|| TokenError::invalid_grant("unknown or already used refresh token"))?;
+        let Some(record) = tokens.remove(&refresh_hash) else {
+            // A rotated-out token coming back means it leaked: end its family.
+            let retired = self.retired.lock().unwrap().remove(&refresh_hash);
+            if let Some((family, _)) = retired {
+                tokens.retain(|_, token| token.family != family);
+                tracing::warn!("refresh token reused; its grant family is revoked");
+            }
+            return Err(TokenError::invalid_grant(
+                "unknown or already used refresh token",
+            ));
+        };
         if record.kind != TokenKind::Refresh {
             return Err(TokenError::invalid_grant("not a refresh token"));
         }
@@ -462,8 +516,20 @@ impl Store {
             &record.client_id,
             &record.subject,
             &record.scope,
+            record.session.as_deref(),
+            &record.family,
         ) {
-            Ok(tokens) => Ok(tokens),
+            Ok(issued) => {
+                let now = self.now();
+                let mut retired = self.retired.lock().unwrap();
+                insert_bounded(
+                    &mut retired,
+                    refresh_hash,
+                    (record.family.clone(), record.expires_at),
+                    |(_, expires_at)| now > *expires_at,
+                );
+                Ok(issued)
+            }
             Err(err) => {
                 tokens.insert(refresh_hash, record);
                 Err(err)
@@ -476,6 +542,8 @@ impl Store {
         client_id: &str,
         subject: &str,
         scope: &str,
+        session: Option<&str>,
+        family: &str,
     ) -> Result<TokenResponse, TokenError> {
         Self::issue_into(
             &mut self.tokens.lock().unwrap(),
@@ -483,6 +551,8 @@ impl Store {
             client_id,
             subject,
             scope,
+            session,
+            family,
         )
     }
 
@@ -492,6 +562,8 @@ impl Store {
         client_id: &str,
         subject: &str,
         scope: &str,
+        session: Option<&str>,
+        family: &str,
     ) -> Result<TokenResponse, TokenError> {
         tokens.retain(|_, token| now <= token.expires_at);
         if tokens.len() > MAX_ROWS.saturating_sub(2) {
@@ -512,6 +584,8 @@ impl Store {
                     client_id: client_id.to_string(),
                     subject: subject.to_string(),
                     scope: scope.to_string(),
+                    session: session.map(str::to_string),
+                    family: family.to_string(),
                     expires_at: now + ttl,
                 },
             );
@@ -525,9 +599,38 @@ impl Store {
         })
     }
 
-    /// Forget a token of either kind. Unknown tokens are fine (RFC 7009).
+    /// End every code and token issued to `subject`.
+    pub fn revoke_subject(&self, subject: &str) {
+        self.codes
+            .lock()
+            .unwrap()
+            .retain(|_, grant| grant.subject != subject);
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|_, token| token.subject != subject);
+    }
+
+    /// End every code and token approved in the upstream login `session`.
+    pub fn revoke_session(&self, session: &str) {
+        let ours = |s: &Option<String>| s.as_deref() == Some(session);
+        self.codes
+            .lock()
+            .unwrap()
+            .retain(|_, grant| !ours(&grant.session));
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|_, token| !ours(&token.session));
+    }
+
+    /// Revoke a token of either kind and every token of its grant family
+    /// (RFC 7009 §2.1). Unknown tokens are fine.
     pub fn revoke(&self, token: &str) {
-        self.tokens.lock().unwrap().remove(&sha256_hex(token));
+        let mut tokens = self.tokens.lock().unwrap();
+        if let Some(record) = tokens.remove(&sha256_hex(token)) {
+            tokens.retain(|_, other| other.family != record.family);
+        }
     }
 
     /// The tenant an access token stands for, if it is live.
@@ -711,6 +814,12 @@ pub async fn authorize(
             ));
         }
     };
+    if !host_bound(&client, &redirect_uri) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "redirect_uri does not belong to this client's host.",
+        ));
+    }
     let state_param = q.state.as_deref().filter(|s| !s.is_empty());
     let fail = |error: &str, description: &str| {
         Ok(error_redirect(
@@ -765,6 +874,7 @@ pub async fn authorize(
         code_challenge: code_challenge.to_string(),
         scope: SCOPE.to_string(),
         resource_uri: q.resource_uri,
+        session: None,
         created_at: Instant::now(),
     };
     let id = request.id.clone();
@@ -837,20 +947,30 @@ pub async fn pending_view(
         .tenants()
         .subject_from_cookie(&headers)
         .and_then(|s| state.tenants().get(&s));
+    let host = crate::hosts::verified(client.host, &request.redirect_uri);
+    // A client name is display data; a known host's name is shown only
+    // when that host's callback receives the code.
+    let client_name = client
+        .client_name
+        .clone()
+        .filter(|name| host.id != crate::hosts::GENERIC.id || !crate::hosts::names_known_host(name))
+        .unwrap_or_else(|| host.display_name.to_string());
     Ok(Json(PendingView {
-        client_name: client
-            .client_name
-            .clone()
-            .unwrap_or_else(|| crate::hosts::by_id(client.host).display_name.to_string()),
+        client_name,
         redirect_host,
         scope: request.scope,
         resource_uri: request.resource_uri,
         has_wallet: wallet.is_some(),
         wallet_address: wallet.map(|w| w.pubkey.clone()),
         providers: Vec::new(),
-        host: client.host,
+        host: host.id,
         privy: privy_login(&state),
     }))
+}
+
+/// A recognized client's code may go only to that host's callbacks.
+fn host_bound(client: &Client, redirect_uri: &str) -> bool {
+    crate::hosts::verified(client.host, redirect_uri).id == client.host
 }
 
 /// The client's redirect URI with the code and the echoed state.
@@ -933,10 +1053,10 @@ pub async fn approve(
         })
         .into_response());
     }
-    let (subject, fresh_login, bound) = match bearer {
+    let (subject, fresh_login, bound, session) = match bearer {
         Some(token) => {
-            let (subject, bound) = approve_with_privy(&state, token).await?;
-            (subject, true, bound)
+            let approval = approve_with_privy(&state, token).await?;
+            (approval.subject, true, approval.bound, approval.session)
         }
         None => (
             state
@@ -951,6 +1071,7 @@ pub async fn approve(
                     )
                 })?,
             false,
+            None,
             None,
         ),
     };
@@ -973,6 +1094,9 @@ pub async fn approve(
         && (bound == Some(Bound::Created) || state.wallet_probe().holds_nothing(&address).await);
     if needs_funding {
         store.pending(&id).ok_or_else(unknown_request)?;
+        store
+            .attach_session(&id, session.as_deref())
+            .ok_or_else(unknown_request)?;
         tracing::info!(%subject, %address, "empty wallet: funding before approval");
         let mut response = Json(DecisionResponse {
             redirect: None,
@@ -987,7 +1111,9 @@ pub async fn approve(
         }
         return Ok(response);
     }
-    let (request, code) = store.approve(&id, &subject).ok_or_else(unknown_request)?;
+    let (request, code) = store
+        .approve_in_session(&id, &subject, session.as_deref())
+        .ok_or_else(unknown_request)?;
     tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved");
     let mut response = Json(DecisionResponse {
         redirect: Some(code_redirect(&request, &code)),
@@ -1010,6 +1136,13 @@ pub(crate) enum Bound {
     Existing,
 }
 
+/// Who a Privy sign-in approved as, and in which Privy session.
+pub(crate) struct PrivyApproval {
+    pub subject: String,
+    pub bound: Option<Bound>,
+    pub session: Option<String>,
+}
+
 /// A Privy access token → a bound tenant subject, and how the tenant was
 /// bound when this sign-in did it (`None` for a tenant already known).
 /// Verifies the token, then binds the user's Solana wallet on first
@@ -1020,14 +1153,14 @@ pub(crate) enum Bound {
 pub(crate) async fn approve_with_privy(
     state: &AppState,
     token: &str,
-) -> Result<(String, Option<Bound>), ApiError> {
+) -> Result<PrivyApproval, ApiError> {
     let privy = state.privy().ok_or_else(|| {
         ApiError::bad_request(
             "login_unavailable",
             "This server does not offer Privy login.",
         )
     })?;
-    let identity = privy.verify(token).map_err(|why| {
+    let identity = privy.authenticate(token).await.map_err(|why| {
         tracing::info!(%why, "privy access token refused");
         ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -1036,63 +1169,131 @@ pub(crate) async fn approve_with_privy(
         )
     })?;
     let subject = crate::privy::subject_for_user(&identity.user_id);
-    let mut bound = None;
-    if state.tenants().get(&subject).is_none() {
-        let _claim = state
-            .tenants()
-            .claim_provisioning(&subject)
-            .ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::CONFLICT,
-                    "provisioning",
-                    "This wallet is already being prepared. Try again in a moment.",
-                )
-            })?;
-        // A previous claimant may have completed between our first lookup
-        // and this reservation.
-        if state.tenants().get(&subject).is_none() {
-            let wallet = match privy.solana_wallet(&identity.user_id).await {
-                Ok(Some(existing)) => {
-                    bound = Some(Bound::Existing);
-                    Ok(existing)
-                }
-                Ok(None) => {
-                    bound = Some(Bound::Created);
-                    privy.create_wallet(&identity.user_id).await
-                }
-                Err(e) => Err(e),
-            }
-            .map_err(|e| {
-                tracing::warn!(error = %e, "privy wallet lookup failed");
-                ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", e.to_string())
-            })?;
-            if !wallet.pay_can_sign {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "signer_required",
-                    format!(
-                        "Your Privy wallet {} does not let pay sign yet. Add pay as a signer, then approve again.",
-                        wallet.address
-                    ),
-                )
-                .with_details(serde_json::json!({
-                    "address": wallet.address,
-                    "signer_id": privy.signer_id(),
-                    "policy_id": privy.policy_id(),
-                })));
-            }
-            tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
-            state.tenants().bind(privy.tenant_record(&subject, &wallet));
+    let provider_error = |e: crate::privy::PrivyError| {
+        tracing::warn!(error = %e, "privy wallet lookup failed");
+        ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", e.to_string())
+    };
+    // Every sign-in rechecks the user's wallet at Privy: a binding is only
+    // as current as the provider says it is.
+    let mut current = privy
+        .solana_wallet(&identity.user_id)
+        .await
+        .map_err(provider_error)?;
+    if let Some(existing) = state.tenants().get(&subject) {
+        let unchanged = current.as_ref().is_some_and(|wallet| {
+            wallet.id == existing.wallet_id
+                && wallet.address == existing.pubkey
+                && wallet.pay_can_sign
+        });
+        if unchanged {
+            seed_spend(state, &existing).await?;
+            return Ok(PrivyApproval {
+                subject,
+                bound: None,
+                session: identity.session_id,
+            });
         }
+        invalidate_wallet_binding(state, &existing);
     }
-    Ok((subject, bound))
+    let mut bound = None;
+    let _claim = state
+        .tenants()
+        .claim_provisioning(&subject)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "provisioning",
+                "This wallet is already being prepared. Try again in a moment.",
+            )
+        })?;
+    // A previous claimant may have completed between our first lookup and
+    // this reservation.
+    if state.tenants().get(&subject).is_none() {
+        let wallet = match current.take() {
+            Some(existing) => {
+                bound = Some(Bound::Existing);
+                existing
+            }
+            None => {
+                bound = Some(Bound::Created);
+                privy
+                    .create_wallet(&identity.user_id)
+                    .await
+                    .map_err(provider_error)?
+            }
+        };
+        if !wallet.pay_can_sign {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "signer_required",
+                format!(
+                    "Your Privy wallet {} does not let pay sign yet. Add pay as a signer, then approve again.",
+                    wallet.address
+                ),
+            )
+            .with_details(serde_json::json!({
+                "address": wallet.address,
+                "signer_id": privy.signer_id(),
+                "policy_id": privy.policy_id(),
+            })));
+        }
+        let record = privy.tenant_record(&subject, &wallet);
+        seed_spend(state, &record).await?;
+        tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
+        state.tenants().bind(record);
+    }
+    Ok(PrivyApproval {
+        subject,
+        bound,
+        session: identity.session_id,
+    })
+}
+
+/// Count what the wallet already spent today before it can sign here.
+#[cfg(feature = "privy")]
+async fn seed_spend(
+    state: &AppState,
+    record: &crate::tenants::TenantRecord,
+) -> Result<(), ApiError> {
+    state
+        .tenants()
+        .seed_spend(record, state.spend_history())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, wallet = %record.pubkey, "wallet spend history unavailable");
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "spend_history_unavailable",
+                "Your wallet's spending today could not be checked. Try again shortly.",
+            )
+        })
+}
+
+/// A wallet binding the provider no longer confirms: unbind every subject
+/// on that wallet and revoke every credential they hold.
+#[cfg(feature = "privy")]
+fn invalidate_wallet_binding(state: &AppState, stale: &crate::tenants::TenantRecord) {
+    for subject in state
+        .tenants()
+        .remove_wallet(&stale.provider, &stale.wallet_id)
+    {
+        if let Some(store) = state.oauth() {
+            store.revoke_subject(&subject);
+        }
+        state.cli().revoke_subject(&subject);
+    }
+    tracing::warn!(
+        wallet = %stale.wallet_id,
+        address = %stale.pubkey,
+        "privy wallet binding changed; tenant credentials revoked"
+    );
 }
 
 #[cfg(not(feature = "privy"))]
 pub(crate) async fn approve_with_privy(
     _state: &AppState,
     _token: &str,
-) -> Result<(String, Option<Bound>), ApiError> {
+) -> Result<PrivyApproval, ApiError> {
     Err(ApiError::bad_request(
         "login_unavailable",
         "This server does not offer Privy login.",
@@ -1383,7 +1584,7 @@ pub async fn link_complete(
         .claim_link(&ticket)
         .ok_or_else(unknown_link)?;
     let guest = claim.subject().to_string();
-    let (subject, bound) = approve_with_privy(&state, token).await?;
+    let PrivyApproval { subject, bound, .. } = approve_with_privy(&state, token).await?;
     let record = state.tenants().get(&subject).ok_or_else(unknown_request)?;
     let mut linked = (*record).clone();
     linked.subject = guest.clone();
@@ -1408,7 +1609,27 @@ pub async fn link_complete(
 
 /// `POST /api/session/logout`: forget this browser's wallet cookie, so the
 /// consent page asks for a sign-in again. The tenant itself is untouched.
-pub async fn sign_out(State(state): State<AppState>) -> Response {
+/// With the Privy access token as bearer, that Privy session is signed out
+/// here too: it cannot approve again, and every connector and CLI token
+/// approved in it is revoked.
+pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    #[cfg(feature = "privy")]
+    if let Some(privy) = state.privy()
+        && let Some(token) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().strip_prefix("Bearer "))
+        && let Ok(Some(session)) = privy.verify(token).map(|identity| identity.session_id)
+    {
+        privy.revoke_session(&session);
+        if let Some(store) = state.oauth() {
+            store.revoke_session(&session);
+        }
+        state.cli().revoke_session(&session);
+        tracing::info!("privy session signed out; derived tokens revoked");
+    }
+    #[cfg(not(feature = "privy"))]
+    let _ = headers;
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
@@ -1456,8 +1677,150 @@ mod tests {
             code_challenge: pkce_challenge(VERIFIER),
             scope: SCOPE.to_string(),
             resource_uri: None,
+            session: None,
             created_at: Instant::now(),
         }
+    }
+
+    fn issued_pair(store: &Store, client: &Client) -> TokenResponse {
+        let request = pending_for(client);
+        let id = request.id.clone();
+        store.create_pending(request).unwrap();
+        let (_, code) = store.approve(&id, "sub_1").unwrap();
+        store
+            .exchange_code(&client.client_id, &code, VERIFIER, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn revoking_either_token_revokes_the_whole_grant_family() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+
+        // Revoking the access token kills its refresh token.
+        let pair = issued_pair(&store, &client);
+        let other = issued_pair(&store, &client);
+        store.revoke(&pair.access_token);
+        assert!(store.authenticate(&pair.access_token).is_none());
+        assert!(
+            store
+                .refresh(&client.client_id, &pair.refresh_token)
+                .is_err()
+        );
+        assert!(
+            store.authenticate(&other.access_token).is_some(),
+            "other grants live"
+        );
+
+        // Revoking the refresh token kills its access token.
+        let pair = issued_pair(&store, &client);
+        store.revoke(&pair.refresh_token);
+        assert!(store.authenticate(&pair.access_token).is_none());
+
+        // The family survives rotation: revoking a descendant ends the
+        // original access token too.
+        let pair = issued_pair(&store, &client);
+        let rotated = store
+            .refresh(&client.client_id, &pair.refresh_token)
+            .unwrap();
+        store.revoke(&rotated.access_token);
+        assert!(store.authenticate(&pair.access_token).is_none());
+        assert!(
+            store
+                .refresh(&client.client_id, &rotated.refresh_token)
+                .is_err()
+        );
+        assert!(store.authenticate(&other.access_token).is_some());
+    }
+
+    #[test]
+    fn a_replayed_refresh_token_revokes_its_family() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let pair = issued_pair(&store, &client);
+        let rotated = store
+            .refresh(&client.client_id, &pair.refresh_token)
+            .unwrap();
+        assert!(store.authenticate(&rotated.access_token).is_some());
+        assert!(
+            store
+                .refresh(&client.client_id, &pair.refresh_token)
+                .is_err()
+        );
+        assert!(store.authenticate(&rotated.access_token).is_none());
+        assert!(
+            store
+                .refresh(&client.client_id, &rotated.refresh_token)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn revoking_a_session_ends_its_codes_and_tokens_only() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let mut issued = Vec::new();
+        for session in [Some("sess_a"), Some("sess_b"), None] {
+            let request = pending_for(&client);
+            let id = request.id.clone();
+            store.create_pending(request).unwrap();
+            let (_, code) = store.approve_in_session(&id, "sub_1", session).unwrap();
+            let tokens = store
+                .exchange_code(&client.client_id, &code, VERIFIER, None)
+                .unwrap();
+            // Rotation keeps the binding.
+            let tokens = store
+                .refresh(&client.client_id, &tokens.refresh_token)
+                .unwrap();
+            issued.push(tokens);
+        }
+        let pending = pending_for(&client);
+        let id = pending.id.clone();
+        store.create_pending(pending).unwrap();
+        let (_, unused_code) = store
+            .approve_in_session(&id, "sub_1", Some("sess_a"))
+            .unwrap();
+
+        store.revoke_session("sess_a");
+        assert!(store.authenticate(&issued[0].access_token).is_none());
+        assert!(
+            store
+                .refresh(&client.client_id, &issued[0].refresh_token)
+                .is_err()
+        );
+        assert!(
+            store
+                .exchange_code(&client.client_id, &unused_code, VERIFIER, None)
+                .is_err()
+        );
+        assert!(store.authenticate(&issued[1].access_token).is_some());
+        assert!(store.authenticate(&issued[2].access_token).is_some());
+    }
+
+    #[test]
+    fn a_known_host_name_with_a_foreign_callback_registers_as_generic() {
+        let store = Store::new("https://cloud.test/");
+        let mut spoof = grok_registration();
+        spoof.client_name = Some("ChatGPT".to_string());
+        spoof.redirect_uris = vec!["https://attacker.example/callback".to_string()];
+        let (client, _) = store.register(spoof).unwrap();
+        assert_eq!(client.host, "generic");
+    }
+
+    #[test]
+    fn approval_refuses_a_code_for_a_callback_outside_the_host() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let mut foreign = pending_for(&client);
+        foreign.redirect_uri = "https://attacker.example/callback".to_string();
+        let id = foreign.id.clone();
+        store.create_pending(foreign).unwrap();
+        assert!(store.approve(&id, "sub_victim").is_none());
+
+        let genuine = pending_for(&client);
+        let id = genuine.id.clone();
+        store.create_pending(genuine).unwrap();
+        assert!(store.approve(&id, "sub_victim").is_some());
     }
 
     #[test]
@@ -1528,6 +1891,7 @@ mod tests {
         store.codes.lock().unwrap().insert(
             sha256_hex(&code),
             CodeGrant {
+                session: None,
                 client_id: client.client_id.clone(),
                 redirect_uri: GROK_REDIRECT.to_string(),
                 code_challenge: pkce_challenge(VERIFIER),
@@ -1542,10 +1906,12 @@ mod tests {
             tokens.insert(
                 format!("token_{i}"),
                 TokenRecord {
+                    session: None,
                     kind: TokenKind::Access,
                     client_id: client.client_id.clone(),
                     subject: "sub_other".to_string(),
                     scope: SCOPE.to_string(),
+                    family: format!("family_{i}"),
                     expires_at,
                 },
             );
@@ -2023,6 +2389,54 @@ mod tests {
         );
     }
 
+    async fn consent_view_for(app: &Router, name: &str, callback: &str) -> Value {
+        let reply = post_json(
+            app,
+            "/oauth/register",
+            json!({ "client_name": name, "redirect_uris": [callback] }),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
+        let mut url = Url::parse("https://cloud.test/oauth/authorize").unwrap();
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client_id)
+            .append_pair("redirect_uri", callback)
+            .append_pair("code_challenge", &pkce_challenge(VERIFIER))
+            .append_pair("code_challenge_method", "S256");
+        let reply = get(app, &format!("{}?{}", url.path(), url.query().unwrap())).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        let request = reply.query("request").unwrap();
+        let view = get(app, &format!("/api/oauth/authorize/{request}")).await;
+        assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+        view.json()
+    }
+
+    #[tokio::test]
+    async fn the_consent_page_never_shows_a_spoofed_host_identity() {
+        let app = app();
+        let view = consent_view_for(&app, "ChatGPT", "https://attacker.example/callback").await;
+        assert_eq!(view["host"], "generic");
+        assert_eq!(view["client_name"], "An MCP client");
+        assert_eq!(view["redirect_host"], "attacker.example");
+
+        // The genuine host keeps its identity.
+        let view = consent_view_for(
+            &app,
+            "ChatGPT",
+            "https://chatgpt.com/connector_platform_oauth_redirect",
+        )
+        .await;
+        assert_eq!(view["host"], "chatgpt");
+        assert_eq!(view["client_name"], "ChatGPT");
+
+        // An unknown client keeps the name it registered.
+        let view = consent_view_for(&app, "Some Agent", "https://agent.example/cb").await;
+        assert_eq!(view["host"], "generic");
+        assert_eq!(view["client_name"], "Some Agent");
+    }
+
     /// Start an authorization for `client_id` and return the pending id.
     async fn start_authorization(app: &Router, client_id: &str, cookie: Option<&str>) -> String {
         let reply = get_as(app, &authorize_path(client_id, &[]), cookie).await;
@@ -2455,7 +2869,8 @@ mod tests {
             let fake = FakeApp::new(&base);
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
-                .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap());
+                .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(std::sync::Arc::new(crate::tenants::FixedHistory(0)));
             (crate::router(state.clone()), state, fake, mock)
         }
 
@@ -2554,6 +2969,201 @@ mod tests {
             assert_eq!(mock.created.lock().unwrap().len(), 1);
         }
 
+        /// Code and tokens for `token`'s Privy user, through the funding detour.
+        async fn privy_tokens(app: &Router, client_id: &str, token: &str) -> (String, String) {
+            let request_id = start_authorization(app, client_id, None).await;
+            let approved = post_json_with(
+                app,
+                &approve_path(&request_id),
+                json!({}),
+                None,
+                Some(token),
+            )
+            .await;
+            assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+            let approved = if approved.json()["fund"].is_object() {
+                let cookie = cookie_of(&approved);
+                post_json_as(app, &approve_path(&request_id), json!({}), Some(&cookie)).await
+            } else {
+                approved
+            };
+            let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+            let code = redirect
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            let tokens = post_form(
+                app,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", client_id),
+                    ("code", &code),
+                    ("code_verifier", VERIFIER),
+                    ("redirect_uri", GROK_REDIRECT),
+                ],
+            )
+            .await;
+            assert_eq!(tokens.status, StatusCode::OK, "{}", tokens.body);
+            let json = tokens.json();
+            (
+                json["access_token"].as_str().unwrap().to_string(),
+                json["refresh_token"].as_str().unwrap().to_string(),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_wallet_bound_after_a_restart_keeps_todays_spend() {
+            struct Down;
+            #[async_trait::async_trait]
+            impl crate::tenants::SpendHistory for Down {
+                async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+                    Err("rpc down".into())
+                }
+            }
+            for (history, cap_left) in [
+                (
+                    Arc::new(crate::tenants::FixedHistory(100_000))
+                        as Arc<dyn crate::tenants::SpendHistory>,
+                    false,
+                ),
+                (Arc::new(crate::tenants::FixedHistory(0)), true),
+            ] {
+                let mock = Arc::new(MockPrivy::default());
+                let fake = FakeApp::new(&mock_privy(mock.clone()).await);
+                let state = AppState::new("https://cloud.test")
+                    .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                    .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                    .with_spend_history(history);
+                let app = crate::router(state.clone());
+                let client_id = register_grok(&app).await;
+                privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+                let tenant = state
+                    .tenants()
+                    .get(&crate::privy::subject_for_user(USER))
+                    .unwrap();
+                assert_eq!(
+                    state
+                        .tenants()
+                        .reserve_cli_transaction(&tenant, 100)
+                        .is_ok(),
+                    cap_left
+                );
+            }
+
+            // Unknown history: the sign-in fails closed.
+            let mock = Arc::new(MockPrivy::default());
+            let fake = FakeApp::new(&mock_privy(mock.clone()).await);
+            let state = AppState::new("https://cloud.test")
+                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(Arc::new(Down));
+            let app = crate::router(state.clone());
+            let client_id = register_grok(&app).await;
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let refused = post_json_with(
+                &app,
+                &approve_path(&request_id),
+                json!({}),
+                None,
+                Some(&fake.token_for(USER)),
+            )
+            .await;
+            assert_eq!(
+                refused.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+                refused.body
+            );
+            assert!(state.tenants().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_reassigned_wallet_invalidates_the_stale_binding() {
+            let (app, state, fake, mock) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let token = fake.token_for(USER);
+            let (access, _) = privy_tokens(&app, &client_id, &token).await;
+            let subject = crate::privy::subject_for_user(USER);
+            let wallet = state.tenants().get(&subject).unwrap().wallet_id.clone();
+            state.tenants().bind({
+                let mut guest = (*state.tenants().get(&subject).unwrap()).clone();
+                guest.subject = "guest_linked".to_string();
+                guest
+            });
+            let cli_token = state.cli().issue_token(subject.clone(), None).unwrap();
+
+            // An unchanged wallet keeps every credential.
+            let (second, _) = privy_tokens(&app, &client_id, &token).await;
+            let oauth = state.oauth().unwrap();
+            assert!(oauth.authenticate(&access).is_some());
+            assert!(state.cli().authenticate(&cli_token).is_some());
+
+            // Privy moves the wallet to another user.
+            {
+                let mut wallets = mock.wallets.lock().unwrap();
+                let entry = wallets.remove(USER).unwrap();
+                wallets.insert("did:privy:someone_else".to_string(), entry);
+            }
+            let (fresh, _) = privy_tokens(&app, &client_id, &token).await;
+            for stale in [&access, &second] {
+                assert!(oauth.authenticate(stale).is_none(), "stale bearer revoked");
+            }
+            assert!(state.cli().authenticate(&cli_token).is_none());
+            assert!(
+                state.tenants().get("guest_linked").is_none(),
+                "aliases unbound"
+            );
+            let rebound = state.tenants().get(&subject).unwrap();
+            assert_ne!(rebound.wallet_id, wallet, "a new wallet for the user");
+            assert_eq!(oauth.authenticate(&fresh).unwrap().id, subject);
+        }
+
+        #[tokio::test]
+        async fn signing_out_a_privy_session_revokes_what_it_approved() {
+            let (app, state, fake, _) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let token = fake.token_for(USER);
+            let (access, refresh) = privy_tokens(&app, &client_id, &token).await;
+            let oauth = state.oauth().unwrap();
+            assert!(oauth.authenticate(&access).is_some());
+
+            // Signing out without the Privy token only clears the cookie.
+            let out = post_json(&app, "/api/session/logout", json!({})).await;
+            assert_eq!(out.status, StatusCode::NO_CONTENT);
+            assert!(oauth.authenticate(&access).is_some());
+
+            let out =
+                post_json_with(&app, "/api/session/logout", json!({}), None, Some(&token)).await;
+            assert_eq!(out.status, StatusCode::NO_CONTENT);
+            assert!(oauth.authenticate(&access).is_none(), "access revoked");
+            assert!(
+                oauth.refresh(&client_id, &refresh).is_err(),
+                "refresh revoked"
+            );
+
+            // The still-unexpired Privy token cannot approve a new client.
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let replay = post_json_with(
+                &app,
+                &approve_path(&request_id),
+                json!({}),
+                None,
+                Some(&token),
+            )
+            .await;
+            assert_eq!(replay.status, StatusCode::UNAUTHORIZED, "{}", replay.body);
+
+            // A new Privy session for the same user still works.
+            let fresh = fake.token(json!({
+                "sub": USER, "aud": "app_test", "iss": "privy.io", "sid": "sess_2",
+                "exp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600
+            }));
+            let (access, _) = privy_tokens(&app, &client_id, &fresh).await;
+            assert!(oauth.authenticate(&access).is_some());
+        }
+
         /// A wallet created during sign-in is funded
         /// before the host gets its code: Approve answers with the address
         /// and the still-open request, and the funding page approves by
@@ -2566,6 +3176,7 @@ mod tests {
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(std::sync::Arc::new(crate::tenants::FixedHistory(0)))
                 // Once created, the wallet is treated as funded.
                 .with_wallet_probe(Arc::new(crate::FixedProbe(false)));
             let app = crate::router(state.clone());
@@ -2743,6 +3354,7 @@ mod tests {
             let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_spend_history(std::sync::Arc::new(crate::tenants::FixedHistory(0)))
                 .with_wallet_probe(Arc::new(crate::FixedProbe(true)));
             let app = crate::router(state.clone());
             let client_id = register_grok(&app).await;

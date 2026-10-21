@@ -27,7 +27,7 @@ use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 use pay_kit::x402::server::{
     BatchAccess, BatchOutcome, ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto,
 };
-use pay_types::metering::Scheme;
+use pay_types::metering::{ApiSpec, Endpoint, RoutingConfig, Scheme};
 use serde_json::json;
 
 use crate::PaymentState;
@@ -56,13 +56,23 @@ pub const MAX_BATCH_CACHED_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Convert a wire path to the gate's static-route convention without collapsing
 /// distinct upstream paths. Reject ambiguous paths before policy resolution.
 pub fn gate_path(path: &str) -> Result<&str, GateResponse> {
-    if path.starts_with("//") {
+    if path.starts_with("//") || has_dot_segment(path) {
         return Err(GateResponse::json(
             StatusCode::BAD_REQUEST,
             Bytes::from_static(br#"{"error":"invalid_request_path"}"#),
         ));
     }
     Ok(path.strip_prefix('/').unwrap_or(path))
+}
+
+/// Whether `path` has a `.` or `..` segment in any spelling (including
+/// percent-encoded dots). URL parsers resolve these before the upstream sees
+/// the request, so the matched endpoint and the forwarded path would differ.
+pub fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        let decoded = segment.replace("%2e", ".").replace("%2E", ".");
+        decoded == "." || decoded == ".."
+    })
 }
 
 /// Everything the gate needs from a request. No body — the decision is made
@@ -133,6 +143,13 @@ pub struct PaidRequestTelemetry {
     pub payment: Option<telemetry::PaymentAmount>,
 }
 
+/// Whether a protected handler completed and its delegated session must be
+/// charged: any 2xx, and for static sessions any 3xx, since a redirect can
+/// follow a completed side effect. Deployment leases charge only 2xx.
+pub fn session_response_served(status: StatusCode, deployment: bool) -> bool {
+    status.is_success() || (!deployment && status.is_redirection())
+}
+
 /// Streaming media types handled consistently by both HTTP adapters.
 pub fn is_streaming_response(headers: &HeaderMap) -> bool {
     headers
@@ -170,6 +187,12 @@ pub struct SessionForward {
     /// Payer identity verified by the reusable session proof. Internal
     /// upstream services use this as their tenant boundary.
     pub verified_payer: Option<String>,
+    /// Exact size of the request body the adapter forwarded upstream, when it
+    /// buffered it: the bound for input usage the provider does not report.
+    pub request_body_bytes: Option<u64>,
+    /// Deployment policy snapshot the request was admitted under, forwarded
+    /// upstream as `x-pay-payment-policy`.
+    pub payment_policy: Option<String>,
     /// Releases the exclusive capacity reservation on every terminal path.
     pub(crate) _reservation: Option<DelegatedCapacityLease>,
 }
@@ -223,6 +246,8 @@ impl SessionForward {
             available_base_units: capacity_base_units.0,
             authorized_base_units: capacity_base_units.1,
             verified_payer: Some(verified_payer),
+            request_body_bytes: None,
+            payment_policy: None,
             _reservation: Some(reservation),
         }
     }
@@ -423,15 +448,86 @@ pub enum GateDecision {
     /// opened channel the adapter settles *after* the response; `batch` does the
     /// same for x402 `batch-settlement`, whose voucher commits post-serve.
     Forward {
+        route: UpstreamRoute,
         session: Option<Box<SessionForward>>,
         receipt: Option<ReceiptAnnotation>,
         upto: Option<Box<UptoForward>>,
         batch: Option<Box<BatchForward>>,
         paid_request: Option<PaidRequestTelemetry>,
     },
-    /// Not gated (discovery / free / unknown) — let normal routing handle it
-    /// (forward to the default upstream, or serve a control-plane route).
-    Passthrough,
+    /// Unpaid route to the API upstream: a free endpoint declared for this
+    /// method, or any route of an API that declares no endpoints.
+    Passthrough(UpstreamRoute),
+    /// Not an API route (control plane, discovery, undeclared): served by a
+    /// local route or 404. Never forwarded upstream.
+    Local,
+}
+
+/// Upstream admission minted only by [`PaymentGate::evaluate`] for the API,
+/// method and path it resolved. Upstream preparation requires one, so a
+/// request the gate did not route to the API never reaches it.
+#[derive(Clone, Debug)]
+pub struct UpstreamRoute {
+    subdomain: String,
+    method: Method,
+    path: String,
+    /// Index of the endpoint the gate selected (and billed) for this request.
+    endpoint: Option<usize>,
+}
+
+impl UpstreamRoute {
+    fn new(api: &ApiSpec, req: &GateRequest<'_>, endpoint: Option<&Endpoint>) -> Self {
+        Self {
+            subdomain: api.subdomain.clone(),
+            method: req.method.clone(),
+            path: req.path.to_string(),
+            endpoint: endpoint_index(api, endpoint),
+        }
+    }
+
+    /// Routing of the endpoint the gate selected, else the API default, so
+    /// forwarding can never use a different endpoint than billing did.
+    pub(crate) fn routing<'a>(&self, api: &'a ApiSpec) -> &'a RoutingConfig {
+        self.endpoint
+            .and_then(|i| api.endpoints.get(i))
+            .and_then(|ep| ep.routing.as_ref())
+            .unwrap_or(&api.routing)
+    }
+
+    /// Whether this admission covers `method` on the wire path `path` of `api`.
+    pub(crate) fn admits(&self, api: &ApiSpec, method: &Method, path: &str) -> bool {
+        self.subdomain == api.subdomain
+            && self.method == *method
+            && path.strip_prefix('/').unwrap_or(path) == self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(api: &ApiSpec, method: &Method, path: &str) -> Self {
+        let path = path.strip_prefix('/').unwrap_or(path);
+        let endpoint = metering::find_endpoint(api, method.as_str(), path)
+            .or_else(|| metering::find_endpoint_by_path(api, path));
+        Self {
+            subdomain: api.subdomain.clone(),
+            method: method.clone(),
+            path: path.to_string(),
+            endpoint: endpoint_index(api, endpoint),
+        }
+    }
+}
+
+fn endpoint_index(api: &ApiSpec, endpoint: Option<&Endpoint>) -> Option<usize> {
+    let endpoint = endpoint?;
+    api.endpoints
+        .iter()
+        .position(|ep| std::ptr::eq(ep, endpoint))
+}
+
+/// The API a request host selects: by subdomain, or the only configured API.
+pub fn resolve_api<'a>(apis: &'a [ApiSpec], host: Option<&str>) -> Option<&'a ApiSpec> {
+    let subdomain = host.unwrap_or("").split('.').next().unwrap_or("");
+    apis.iter()
+        .find(|api| api.subdomain == subdomain)
+        .or_else(|| if apis.len() == 1 { apis.first() } else { None })
 }
 
 /// The framework-agnostic payment gate, parameterized over the host's
@@ -513,7 +609,17 @@ impl<S: PaymentState> PaymentGate<S> {
                     if credential.challenge.intent.as_str() == "session"
                         && credential.challenge.method.as_str() == "solana" =>
                 {
-                    return session_authorized(
+                    let Some(api) = resolve_api(self.state.apis(), req.host) else {
+                        return GateDecision::Respond(GateResponse::json(
+                            StatusCode::NOT_FOUND,
+                            Bytes::from_static(br#"{"error":"not_found"}"#),
+                        ));
+                    };
+                    let path = req.path.trim_start_matches('/');
+                    let endpoint = metering::find_endpoint(api, req.method.as_str(), path)
+                        .or_else(|| metering::find_endpoint_by_path(api, path));
+                    let route = UpstreamRoute::new(api, req, endpoint);
+                    let mut decision = session_authorized(
                         &session,
                         Some(Arc::clone(&session)),
                         credential,
@@ -521,8 +627,17 @@ impl<S: PaymentState> PaymentGate<S> {
                         req,
                         hostname,
                         req.path,
+                        route,
                     )
                     .await;
+                    if let GateDecision::Forward {
+                        session: Some(forward),
+                        ..
+                    } = &mut decision
+                    {
+                        forward.payment_policy = Some(policy.binding_identity());
+                    }
+                    return decision;
                 }
                 Err(_) => {
                     return GateDecision::Respond(GateResponse::json(
@@ -554,7 +669,7 @@ impl<S: PaymentState> PaymentGate<S> {
         // Cloud Run probes this local-only control-plane response using its
         // internal Host. It never forwards to a deployment or authorizes work.
         if req.method == Method::GET && path == "__402/health" && req.query.is_none() {
-            return GateDecision::Passthrough;
+            return GateDecision::Local;
         }
         if let Some(resolver) = self.deployment_policy_resolver.as_deref() {
             match req.host.map(|host| resolver.classify_host(host)) {
@@ -574,18 +689,14 @@ impl<S: PaymentState> PaymentGate<S> {
         // Control-plane + discovery surfaces stay unauthenticated.
         if path.starts_with("__402/") || path == "openapi.json" || path.starts_with(".well-known/")
         {
-            return GateDecision::Passthrough;
+            return GateDecision::Local;
         }
 
         let subdomain = req.host.unwrap_or("").split('.').next().unwrap_or("");
         let accepts_html = req.accept.is_some_and(mpp_html::accepts_html);
 
-        let apis = self.state.apis();
-        let api = match apis.iter().find(|a| a.subdomain == subdomain) {
-            Some(api) => api,
-            // Single-API mode: one configured API serves any subdomain.
-            None if apis.len() == 1 => &apis[0],
-            None => return GateDecision::Passthrough,
+        let Some(api) = resolve_api(self.state.apis(), req.host) else {
+            return GateDecision::Local;
         };
 
         // Service worker for the HTML payment-link UI — before metering lookup
@@ -654,8 +765,14 @@ impl<S: PaymentState> PaymentGate<S> {
                     Bytes::from_static(br#"{"error":"not_found","message":"method not allowed"}"#),
                 ));
             }
-            return GateDecision::Passthrough;
+            // Path-only resolution exists to render or verify a payment; it
+            // never admits another method to a free endpoint.
+            if exact_match.is_some() || api.endpoints.is_empty() {
+                return GateDecision::Passthrough(UpstreamRoute::new(api, req, endpoint));
+            }
+            return GateDecision::Local;
         }
+        let route = UpstreamRoute::new(api, req, endpoint);
 
         // Custom PaymentState implementations can bypass CLI startup validation.
         // Never advertise or process payments for an unavailable credit provider.
@@ -678,7 +795,7 @@ impl<S: PaymentState> PaymentGate<S> {
         if let Some(spec) = subscription_config {
             let description = endpoint.and_then(|e| e.description.as_deref());
             return self
-                .evaluate_subscription(api, spec, description, req, subdomain, path)
+                .evaluate_subscription(api, spec, description, req, subdomain, path, route)
                 .await;
         }
         let meter = metering_config.expect("gated endpoint has metering");
@@ -719,6 +836,7 @@ impl<S: PaymentState> PaymentGate<S> {
                             req,
                             subdomain,
                             path,
+                            route,
                         )
                         .await;
                     }
@@ -738,6 +856,7 @@ impl<S: PaymentState> PaymentGate<S> {
                                 subdomain,
                                 path,
                                 req,
+                                route,
                             )
                             .await;
                     }
@@ -769,7 +888,9 @@ impl<S: PaymentState> PaymentGate<S> {
             {
                 let resource = endpoint.and_then(|e| e.resource.as_deref());
                 return self
-                    .x402_exact_verify(x402, meter, req, path, pay_header, subdomain, resource)
+                    .x402_exact_verify(
+                        x402, meter, req, path, pay_header, subdomain, resource, route,
+                    )
                     .await;
             }
             if wants(pay_kit::x402::batch_settlement::BATCH_SETTLEMENT_SCHEME)
@@ -778,7 +899,9 @@ impl<S: PaymentState> PaymentGate<S> {
             {
                 let resource = endpoint.and_then(|e| e.resource.as_deref());
                 return self
-                    .x402_batch_verify(batch, meter, req, path, pay_header, subdomain, resource)
+                    .x402_batch_verify(
+                        batch, meter, req, path, pay_header, subdomain, resource, route,
+                    )
                     .await;
             }
             if wants(pay_kit::x402::upto::UPTO_SCHEME)
@@ -786,7 +909,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 && let Some(upto) = self.state.x402_upto()
             {
                 return self
-                    .x402_upto_verify(upto, meter, req, path, pay_header, subdomain)
+                    .x402_upto_verify(upto, meter, req, path, pay_header, subdomain, route)
                     .await;
             }
         }
@@ -840,15 +963,19 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
+        // Fixed per-call schemes are dropped (fail closed) when the meter
+        // cannot be priced before authorization.
+        let fixed_price = metering::resolve_fixed_price(meter, &props, variant.as_deref())
+            .inspect_err(|e| telemetry::record_challenge_error("mpp/charge", "configured", e))
+            .ok();
+        let split_rules = metering::resolve_split_rules(meter, &props, variant.as_deref());
 
         let mut challenge_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
         let mut advertised: Vec<&str> = Vec::new();
 
         if accepted.contains(&Scheme::MppSession) && !session_mpps.is_empty() {
             for sm in session_mpps {
-                let unit_amount = price.as_ref().map(|price| {
-                    crate::server::payment::price_unit_base_amount(price, sm.decimals())
-                });
+                let unit_amount = session_unit_amount(price.as_ref(), sm);
                 match sm.challenge_header(unit_amount) {
                     Ok(h) => {
                         if let Ok(v) = HeaderValue::from_str(&h) {
@@ -868,15 +995,18 @@ impl<S: PaymentState> PaymentGate<S> {
             advertised.push("mpp/session");
         }
 
-        if accepted.contains(&Scheme::MppCharge) {
+        if accepted.contains(&Scheme::MppCharge)
+            && let Some(fixed_price) = &fixed_price
+        {
             let mpps = self.state.mpps();
             if !mpps.is_empty() {
-                let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+                let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
                 let uri = reconstruct_uri(path, req.query);
                 let external_id = crate::server::payment::resource_memo_with_nonce(
                     resource,
                     pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES,
                 );
+                let route = charge_route(req, subdomain, path);
                 let mut challenges = Vec::with_capacity(mpps.len());
                 for mpp in &mpps {
                     match crate::mpp_channel_profile::charge_with_options(
@@ -884,12 +1014,17 @@ impl<S: PaymentState> PaymentGate<S> {
                         &amount,
                         ChargeOptions {
                             description,
+                            route: Some(&route),
                             // The main recipient's settlement memo is the endpoint
                             // resource plus a per-challenge suffix, so repeated
                             // same-route payments don't rely on blockhash uniqueness.
                             external_id: external_id.as_deref(),
                             splits: crate::server::payment::resolve_charge_splits(
-                                mpp, meter, api, &uri, &amount,
+                                mpp,
+                                split_rules,
+                                api,
+                                &uri,
+                                &amount,
                             ),
                             ..Default::default()
                         },
@@ -931,9 +1066,10 @@ impl<S: PaymentState> PaymentGate<S> {
         }
 
         if accepted.contains(&Scheme::X402Exact)
+            && let Some(fixed_price) = &fixed_price
             && let Some(x402) = self.state.x402()
         {
-            let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+            let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
             // Parity with MPP charge external_id: resource plus per-challenge
             // suffix, so repeated same-route payments are distinct on-chain.
             let memo = crate::server::payment::resource_memo_with_nonce(
@@ -974,8 +1110,14 @@ impl<S: PaymentState> PaymentGate<S> {
             // configs, or the legacy metered charge for older configs. The
             // client funds a channel with this as the deposit; settlement later
             // debits actual usage and refunds the rest.
-            let amount = format!("{}", metering::upto_max_usd(meter, price.as_ref()));
-            match upto.payment_required_header(&amount) {
+            let amount = metering::upto_max_usd(meter, price.as_ref())
+                .map(|usd| format!("{usd}"))
+                .ok_or_else(|| "x402-upto with several dimensions requires upto.max_usd".into());
+            let route = upto_route(req, path);
+            match amount.and_then(|amount| {
+                upto.payment_required_header_for_route(&amount, Some(&route))
+                    .map_err(|e| e.to_string())
+            }) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
                         HeaderName::from_bytes(name.as_bytes()),
@@ -986,15 +1128,16 @@ impl<S: PaymentState> PaymentGate<S> {
                     }
                 }
                 Err(e) => {
-                    telemetry::record_challenge_error("x402/upto", "configured", &e.to_string());
+                    telemetry::record_challenge_error("x402/upto", "configured", &e);
                 }
             }
         }
 
         if accepted.contains(&Scheme::X402BatchSettlement)
+            && let Some(fixed_price) = &fixed_price
             && let Some(batch) = self.state.x402_batch()
         {
-            let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+            let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
             match batch.payment_required_header(&amount, resource) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
@@ -1022,10 +1165,10 @@ impl<S: PaymentState> PaymentGate<S> {
             ));
         }
 
-        let amount_usd = price
+        let amount_usd = fixed_price
             .as_ref()
-            .and_then(|p| p.dimensions.first())
-            .map(|d| d.price_usd / d.scale.max(1) as f64);
+            .and_then(Option::as_ref)
+            .map(metering::per_call_usd);
         let challenge_protocol = if advertised.len() == 1 {
             advertised[0]
         } else {
@@ -1080,15 +1223,17 @@ impl<S: PaymentState> PaymentGate<S> {
         pay_header: &str,
         subdomain: &str,
         resource: Option<&str>,
+        upstream: UpstreamRoute,
     ) -> GateDecision {
         let props = metering::RequestProperties {
             body_size: req.content_length,
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
-        );
+        let amount = match fixed_charge_amount(meter, &props, variant.as_deref()) {
+            Ok(amount) => amount,
+            Err(response) => return GateDecision::Respond(response),
+        };
         let payment = amount
             .parse()
             .ok()
@@ -1149,6 +1294,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     headers.push((n, v));
                 }
                 GateDecision::Forward {
+                    route: upstream,
                     session: None,
                     receipt: Some(ReceiptAnnotation {
                         headers,
@@ -1172,6 +1318,7 @@ impl<S: PaymentState> PaymentGate<S> {
     /// channel is settled *after* the response by the adapter ([`UptoForward`]) —
     /// the metered amount on a successful serve, `0` (full refund) on failure.
     /// On a verification failure, re-challenge with 402.
+    #[allow(clippy::too_many_arguments)]
     async fn x402_upto_verify(
         &self,
         upto: &X402Upto,
@@ -1180,6 +1327,7 @@ impl<S: PaymentState> PaymentGate<S> {
         path: &str,
         pay_header: &str,
         subdomain: &str,
+        upstream: UpstreamRoute,
     ) -> GateDecision {
         let props = metering::RequestProperties {
             body_size: req.content_length,
@@ -1187,8 +1335,21 @@ impl<S: PaymentState> PaymentGate<S> {
         };
         let variant = variant_hint_from_path(path);
         let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
-        let amount = format!("{}", metering::upto_max_usd(meter, price.as_ref()));
-        match upto.verify_open(pay_header, &amount).await {
+        let Some(ceiling) = metering::upto_max_usd(meter, price.as_ref()) else {
+            return GateDecision::Respond(GateResponse::json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Bytes::from_static(
+                    br#"{"error":"payment_configuration_error","message":"x402-upto with several dimensions requires upto.max_usd"}"#,
+                ),
+            ));
+        };
+        let amount = format!("{ceiling}");
+        // The challenge bound the authorization to this route.
+        let route = upto_route(req, path);
+        match upto
+            .verify_open_for_route(pay_header, &amount, Some(&route))
+            .await
+        {
             Ok(open) => {
                 let ceiling_usd: f64 = amount.parse().unwrap_or(0.0);
                 let settle_amount =
@@ -1202,6 +1363,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         inferred_usage: None,
                     });
                 GateDecision::Forward {
+                    route: upstream,
                     session: None,
                     receipt: None,
                     batch: None,
@@ -1261,15 +1423,17 @@ impl<S: PaymentState> PaymentGate<S> {
         pay_header: &str,
         subdomain: &str,
         resource: Option<&str>,
+        upstream: UpstreamRoute,
     ) -> GateDecision {
         let props = metering::RequestProperties {
             body_size: req.content_length,
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
-        );
+        let amount = match fixed_charge_amount(meter, &props, variant.as_deref()) {
+            Ok(amount) => amount,
+            Err(response) => return GateDecision::Respond(response),
+        };
         let payment = amount
             .parse()
             .ok()
@@ -1403,6 +1567,7 @@ impl<S: PaymentState> PaymentGate<S> {
         }
 
         GateDecision::Forward {
+            route: upstream,
             session: None,
             receipt: None,
             upto: None,
@@ -1425,6 +1590,7 @@ impl<S: PaymentState> PaymentGate<S> {
     /// Subscription endpoint: no auth → subscription 402; `subscription`
     /// activation or bearer proof → live-state verification → forward / 402.
     /// Legacy `authenticate` credentials remain accepted during migration.
+    #[allow(clippy::too_many_arguments)]
     async fn evaluate_subscription(
         &self,
         api: &pay_types::metering::ApiSpec,
@@ -1433,6 +1599,7 @@ impl<S: PaymentState> PaymentGate<S> {
         req: &GateRequest<'_>,
         subdomain: &str,
         path: &str,
+        upstream: UpstreamRoute,
     ) -> GateDecision {
         use crate::server::{authenticate, subscription as sub};
 
@@ -1465,7 +1632,9 @@ impl<S: PaymentState> PaymentGate<S> {
         let realm = operator
             .and_then(|o| o.realm.as_deref())
             .or(Some(subdomain));
-        let canonical = format!("https://{subdomain}/");
+        // Authenticate tokens pin the resource they were issued for: this
+        // endpoint, not just the API.
+        let canonical = format!("https://{subdomain}/{}", path.trim_start_matches('/'));
         let defaults = sub::OperatorDefaults {
             puller: &puller,
             recipient: &recipient,
@@ -1548,13 +1717,26 @@ impl<S: PaymentState> PaymentGate<S> {
             }
         };
 
-        // authenticate-intent: stateless SIWMPP verify, no broadcast.
+        // authenticate-intent: SIWMPP identity proof plus an on-chain check
+        // that the wallet holds a live, paid subscription.
         if credential.challenge.intent.as_str() == "authenticate" {
-            if let Ok(Some(server)) =
-                authenticate::build_handler(spec, defaults.clone(), subdomain, &canonical)
-                && server.verify(&credential).is_ok()
+            let verified = authenticate::verify_live_subscriber(
+                spec,
+                defaults.clone(),
+                subdomain,
+                &canonical,
+                description,
+                &credential,
+            )
+            .await;
+            if let Ok(authenticate::LegacyAuthentication::NotSubscribed { message, retryable }) =
+                &verified
             {
+                return challenge_402(Some((message, *retryable)));
+            }
+            if let Ok(authenticate::LegacyAuthentication::Live(_)) = verified {
                 return GateDecision::Forward {
+                    route: upstream,
                     session: None,
                     receipt: None,
                     upto: None,
@@ -1594,6 +1776,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     headers.push((HeaderName::from_static(PAYMENT_RECEIPT_HEADER), v));
                 }
                 GateDecision::Forward {
+                    route: upstream,
                     session: None,
                     receipt: Some(ReceiptAnnotation {
                         headers,
@@ -1635,6 +1818,7 @@ impl<S: PaymentState> PaymentGate<S> {
         subdomain: &str,
         path: &str,
         req: &GateRequest<'_>,
+        upstream: UpstreamRoute,
     ) -> GateDecision {
         let mpps = self.state.mpps();
         if mpps.is_empty() {
@@ -1665,11 +1849,13 @@ impl<S: PaymentState> PaymentGate<S> {
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
-        );
+        let amount = match fixed_charge_amount(meter, &props, variant.as_deref()) {
+            Ok(amount) => amount,
+            Err(response) => return GateDecision::Respond(response),
+        };
         // Reconstruct a URI for split-rule query params (splits price off the request).
         let uri = reconstruct_uri(path, req.query);
+        let split_rules = metering::resolve_split_rules(meter, &props, variant.as_deref());
         let external_id = match mpp_charge_payment_external_id(&credential, resource) {
             Ok(external_id) => external_id,
             Err(e) => {
@@ -1732,6 +1918,7 @@ impl<S: PaymentState> PaymentGate<S> {
             ));
         }
 
+        let route = charge_route(req, subdomain, path);
         let mut last_error = None;
         for mpp in matching {
             // Audit: verify against the challenge WE would issue (rebuilt from our
@@ -1746,7 +1933,11 @@ impl<S: PaymentState> PaymentGate<S> {
                     // credential, including the per-challenge suffix.
                     external_id: external_id.as_deref(),
                     splits: crate::server::payment::resolve_charge_splits(
-                        mpp, meter, api, &uri, &amount,
+                        mpp,
+                        split_rules,
+                        api,
+                        &uri,
+                        &amount,
                     ),
                     ..Default::default()
                 },
@@ -1768,7 +1959,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 }
             };
             match mpp
-                .verify_credential_with_expected(&credential, &expected)
+                .verify_credential_for_route(&credential, &expected, &route)
                 .await
             {
                 Ok(receipt) => {
@@ -1802,6 +1993,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         headers.push((HeaderName::from_static(PAYMENT_RECEIPT_HEADER), v));
                     }
                     return GateDecision::Forward {
+                        route: upstream,
                         session: None,
                         receipt: Some(ReceiptAnnotation {
                             headers,
@@ -1990,31 +2182,30 @@ fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
 /// No on-chain transaction is involved for a steady-state voucher — the
 /// operator redeems accumulated vouchers in batches out of band. A `deposit`
 /// broadcasts its `open`/`top_up` here, which is why this can fail after the
-/// resource was already served; that loss is logged, not surfaced.
+/// resource was already served. A failed commit is returned as `Err`; the
+/// adapter must withhold the successful response, and the handler-succeeded
+/// authorization is retained (not released) so a retry can only resume it.
 pub async fn settle_batch<S: PaymentState>(
     state: &S,
     forward: BatchForward,
     served_ok: bool,
     cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
-) -> Option<(HeaderName, HeaderValue)> {
+) -> Result<Option<(HeaderName, HeaderValue)>, String> {
     if !served_ok {
         release_batch(state, forward).await;
-        return None;
+        return Ok(None);
     }
-    let header = commit_batch(state, &forward).await;
-    if let Some(cached) = cached {
-        cache_batch_response(state, &forward, cached).await;
-    }
-    header
+    settle_batch_confirmed(state, forward, cached).await
 }
 
 /// Commit a successfully served batch authorization while retaining its
 /// outcome long enough for a streaming adapter to cache the completed body.
+/// `Err` means the charge is unconfirmed and the response must not be released.
 pub async fn commit_batch<S: PaymentState>(
     state: &S,
     forward: &BatchForward,
-) -> Option<(HeaderName, HeaderValue)> {
-    commit_batch_result(state, forward).await.ok().flatten()
+) -> Result<Option<(HeaderName, HeaderValue)>, String> {
+    commit_batch_result(state, forward).await
 }
 
 /// Keep confirmed charging distinct from optional receipt encoding.
@@ -2189,22 +2380,17 @@ pub async fn cache_batch_response<S: PaymentState>(
 /// serve, refunds the full deposit (settle `0`) on failure, and returns the
 /// `PAYMENT-RESPONSE` receipt header to set on the response.
 ///
-/// Routes through the shared batched-settlement worker (`settle_actual_deferred`):
-/// concurrent settlements pack into one operator-signed tx that is **sent
-/// without waiting for confirmation**, with the background worker confirming +
-/// retrying. This takes the multi-second confirm poll off the response path —
-/// the client's funds are locked by the confirmed `open`, so a late or failed
-/// background confirm is an operator-retry concern (the channel store sweeps
-/// it), not a client error. Settlement errors are logged, not surfaced (the
-/// resource was already served).
+/// Routes through the shared batched-settlement worker
+/// (`settle_actual_deferred`), which confirms the settlement before returning.
+/// `Err` means a served response owing a non-zero amount was not paid: the
+/// adapter must withhold it. A failed refund is only logged.
 pub async fn settle_upto<S: PaymentState>(
     state: &S,
     open: VerifiedUptoOpen,
     settle_amount: u64,
     served_ok: bool,
     telemetry_context: UptoPaymentTelemetry,
-) -> Option<(HeaderName, HeaderValue)> {
-    let upto = state.x402_upto()?;
+) -> Result<Option<(HeaderName, HeaderValue)>, crate::Error> {
     // Settle the configured voucher (clamped to the ceiling) on success, full
     // refund (`0`) on failure.
     let amount = if served_ok {
@@ -2212,41 +2398,48 @@ pub async fn settle_upto<S: PaymentState>(
     } else {
         0
     };
+    let unpaid = |message: String| {
+        telemetry::record_settlement_error(
+            "x402/upto",
+            &telemetry_context.subdomain,
+            &telemetry_context.path,
+            &message,
+            true,
+        );
+        unsettled_upto(amount, message)
+    };
+    let Some(upto) = state.x402_upto() else {
+        return unpaid("x402 upto backend is not configured".to_string());
+    };
     let amount_usd = served_ok
         .then(|| upto_collected_amount_usd(telemetry_context.ceiling_usd, amount, open.max_amount))
         .flatten();
-    match upto.settle_actual_deferred(&open, amount).await {
-        Ok(settlement) => {
-            tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
-            if let Some(ui_amount) = amount_usd {
-                telemetry::record_payment_collected(
-                    "x402/upto",
-                    &telemetry_context.subdomain,
-                    &telemetry_context.path,
-                    Some(&telemetry::PaymentAmount {
-                        currency: "USD".to_string(),
-                        ui_amount,
-                    }),
-                    &settlement.transaction,
-                );
-            }
-            match upto.settlement_header(&settlement) {
-                Ok((name, value)) => Some((
-                    HeaderName::from_bytes(name.as_bytes()).ok()?,
-                    HeaderValue::from_str(&value).ok()?,
-                )),
-                Err(e) => {
-                    telemetry::record_settlement_error(
-                        "x402/upto",
-                        &telemetry_context.subdomain,
-                        &telemetry_context.path,
-                        &e.to_string(),
-                        true,
-                    );
-                    None
-                }
-            }
-        }
+    let outcome = upto
+        .settle_actual_deferred(&open, amount)
+        .await
+        .map_err(|e| e.to_string());
+    let settlement = match confirmed_upto_settlement(outcome) {
+        Ok(settlement) => settlement,
+        Err(message) => return unpaid(message),
+    };
+    tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
+    if let Some(ui_amount) = amount_usd {
+        telemetry::record_payment_collected(
+            "x402/upto",
+            &telemetry_context.subdomain,
+            &telemetry_context.path,
+            Some(&telemetry::PaymentAmount {
+                currency: "USD".to_string(),
+                ui_amount,
+            }),
+            &settlement.transaction,
+        );
+    }
+    // Settled: a receipt that fails to encode is logged, not unpaid.
+    match upto.settlement_header(&settlement) {
+        Ok((name, value)) => Ok(HeaderName::from_bytes(name.as_bytes())
+            .ok()
+            .zip(HeaderValue::from_str(&value).ok())),
         Err(e) => {
             telemetry::record_settlement_error(
                 "x402/upto",
@@ -2255,8 +2448,39 @@ pub async fn settle_upto<S: PaymentState>(
                 &e.to_string(),
                 true,
             );
-            None
+            Ok(None)
         }
+    }
+}
+
+/// A settle attempt counts only when it reports success with a signature.
+fn confirmed_upto_settlement(
+    outcome: Result<pay_kit::x402::upto::UptoSettlementResponse, String>,
+) -> Result<pay_kit::x402::upto::UptoSettlementResponse, String> {
+    let settlement = outcome?;
+    if !settlement.success {
+        return Err(settlement
+            .error_reason
+            .unwrap_or_else(|| "settlement was not successful".to_string()));
+    }
+    if settlement.transaction.is_empty() {
+        return Err("settlement returned no transaction signature".to_string());
+    }
+    Ok(settlement)
+}
+
+/// An unsettled charge leaves a served response unpaid; an unsettled refund
+/// (nothing owed) does not.
+fn unsettled_upto(
+    amount: u64,
+    message: String,
+) -> Result<Option<(HeaderName, HeaderValue)>, crate::Error> {
+    if amount > 0 {
+        Err(crate::Error::PaymentRejected(format!(
+            "x402 upto settlement failed: {message}"
+        )))
+    } else {
+        Ok(None)
     }
 }
 
@@ -2264,7 +2488,7 @@ pub async fn settle_upto<S: PaymentState>(
 ///
 /// When the response did not successfully serve, this always settles `0`
 /// (refund). When usage extraction fails under `missing_usage: error`, it also
-/// refunds so funds are not stranded.
+/// refunds so funds are not stranded. Errors as [`settle_upto`].
 pub async fn settle_upto_metered<S: PaymentState>(
     state: &S,
     open: VerifiedUptoOpen,
@@ -2273,7 +2497,7 @@ pub async fn settle_upto_metered<S: PaymentState>(
     response_headers: &http::HeaderMap,
     response_body: Option<&[u8]>,
     telemetry_context: UptoPaymentTelemetry,
-) -> Option<(HeaderName, HeaderValue)> {
+) -> Result<Option<(HeaderName, HeaderValue)>, crate::Error> {
     if !served_ok {
         return settle_upto(state, open, 0, false, telemetry_context).await;
     }
@@ -2310,6 +2534,25 @@ fn upto_collected_amount_usd(
 }
 
 /// Reconstruct a minimal URI from path + query for split-rule resolution.
+/// The protected route an MPP charge challenge is bound to: method, API and
+/// path with query, so a credential for one route never runs another's
+/// handler even when their payment terms are equal.
+fn charge_route(req: &GateRequest<'_>, subdomain: &str, path: &str) -> String {
+    let query = req.query.map(|q| format!("?{q}")).unwrap_or_default();
+    format!(
+        "{} {subdomain}/{}{query}",
+        req.method,
+        path.trim_start_matches('/')
+    )
+}
+
+/// The request identity an x402 `upto` authorization is bound to: method,
+/// path and query. The host is client-supplied and left out.
+fn upto_route(req: &GateRequest<'_>, path: &str) -> String {
+    let query = req.query.map(|q| format!("?{q}")).unwrap_or_default();
+    format!("{} /{}{query}", req.method, path.trim_start_matches('/'))
+}
+
 fn reconstruct_uri(path: &str, query: Option<&str>) -> http::Uri {
     format!(
         "/{}{}",
@@ -2395,6 +2638,28 @@ fn x402_payment_scheme(header: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The per-call amount for MPP charge / x402 exact / x402 batch, or a 500 when
+/// the meter cannot be priced before authorization.
+fn fixed_charge_amount(
+    meter: &pay_types::metering::Metering,
+    props: &metering::RequestProperties,
+    variant: Option<&str>,
+) -> Result<String, GateResponse> {
+    match metering::resolve_fixed_price(meter, props, variant) {
+        Ok(price) => Ok(crate::server::payment::charge_amount_from_price(
+            price.as_ref(),
+        )),
+        Err(message) => Err(GateResponse::json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::to_vec(&json!({
+                "error": "payment_configuration_error",
+                "message": message,
+            }))
+            .unwrap_or_default(),
+        )),
+    }
+}
+
 fn variant_hint_from_path(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
@@ -2427,6 +2692,11 @@ fn deployment_policy_unavailable() -> GateDecision {
     ))
 }
 
+/// The per-request amount a route's session challenge carries.
+fn session_unit_amount(price: Option<&metering::ResolvedPrice>, sm: &SessionMpp) -> Option<u64> {
+    price.map(|price| crate::server::payment::price_unit_base_amount(price, sm.decimals()))
+}
+
 #[derive(Clone, Copy)]
 enum SessionPricing<'a> {
     Metered(&'a pay_types::metering::Metering),
@@ -2434,6 +2704,7 @@ enum SessionPricing<'a> {
 }
 
 /// Process a session credential and map the outcome to a [`GateDecision`].
+#[allow(clippy::too_many_arguments)]
 async fn session_authorized(
     sm: &SessionMpp,
     handle: Option<Arc<SessionMpp>>,
@@ -2442,8 +2713,24 @@ async fn session_authorized(
     req: &GateRequest<'_>,
     subdomain: &str,
     path: &str,
+    upstream: UpstreamRoute,
 ) -> GateDecision {
-    match sm.process_credential(credential).await {
+    let route_amount = match pricing {
+        SessionPricing::Metered(meter) => {
+            let props = metering::RequestProperties {
+                body_size: req.content_length,
+                ..Default::default()
+            };
+            let variant = variant_hint_from_path(path);
+            let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
+            session_unit_amount(price.as_ref(), sm)
+        }
+        SessionPricing::Fixed(_) => None,
+    };
+    match sm
+        .process_credential_for_route(credential, route_amount)
+        .await
+    {
         Ok(SessionOutcome::Active { state, signature }) => {
             if sm.voucher_signer() == pay_kit::mpp::SessionVoucherSigner::Client {
                 let mut response = GateResponse::json(
@@ -2539,6 +2826,7 @@ async fn session_authorized(
                 }
             };
             GateDecision::Forward {
+                route: upstream,
                 session: Some(Box::new(SessionForward {
                     handle,
                     channel_id: state.channel_id,
@@ -2547,6 +2835,8 @@ async fn session_authorized(
                     available_base_units: per_request_base_units,
                     authorized_base_units: state.deposit,
                     verified_payer: Some(state.payer.clone()),
+                    request_body_bytes: None,
+                    payment_policy: None,
                     _reservation: Some(reservation),
                 })),
                 receipt: signature
@@ -2565,6 +2855,7 @@ async fn session_authorized(
             cumulative,
             verified_payer,
         }) => GateDecision::Forward {
+            route: upstream,
             session: handle.map(|h| {
                 Box::new(SessionForward {
                     handle: h,
@@ -2574,6 +2865,8 @@ async fn session_authorized(
                     available_base_units: 0,
                     authorized_base_units: cumulative,
                     verified_payer,
+                    request_body_bytes: None,
+                    payment_policy: None,
                     _reservation: None,
                 })
             }),
@@ -2633,6 +2926,112 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    fn upto_settlement(
+        success: bool,
+        transaction: &str,
+    ) -> pay_kit::x402::upto::UptoSettlementResponse {
+        pay_kit::x402::upto::UptoSettlementResponse {
+            success,
+            error_reason: (!success).then(|| "distribute failed".to_string()),
+            payer: None,
+            transaction: transaction.to_string(),
+            network: "solana:devnet".to_string(),
+            amount: "500".to_string(),
+        }
+    }
+
+    #[test]
+    fn upto_route_binds_method_path_and_query() {
+        let get = Method::GET;
+        let post = Method::POST;
+        let route = |method: &Method, path: &str, query: Option<&str>| {
+            let mut request = req(method, path);
+            request.query = query;
+            request.host = Some("attacker.example");
+            upto_route(&request, path)
+        };
+        assert_eq!(route(&get, "reports", Some("id=7")), "GET /reports?id=7");
+        assert_eq!(route(&get, "/reports", None), "GET /reports");
+        assert_ne!(route(&get, "route-a", None), route(&get, "route-b", None));
+        assert_ne!(route(&get, "orders", None), route(&post, "orders", None));
+        assert_ne!(
+            route(&get, "reports", Some("id=7")),
+            route(&get, "reports", Some("id=8"))
+        );
+    }
+
+    #[test]
+    fn only_a_confirmed_upto_settlement_counts_as_paid() {
+        assert!(confirmed_upto_settlement(Ok(upto_settlement(true, "sig"))).is_ok());
+        assert_eq!(
+            confirmed_upto_settlement(Ok(upto_settlement(false, "sig"))).unwrap_err(),
+            "distribute failed"
+        );
+        assert!(confirmed_upto_settlement(Ok(upto_settlement(true, ""))).is_err());
+        assert!(confirmed_upto_settlement(Err("confirmation timed out".into())).is_err());
+    }
+
+    #[test]
+    fn an_unsettled_upto_charge_withholds_the_response() {
+        assert!(matches!(
+            unsettled_upto(1, "rpc down".into()),
+            Err(crate::Error::PaymentRejected(_))
+        ));
+        // A failed refund owes nothing, so the error response still goes out.
+        assert!(matches!(unsettled_upto(0, "rpc down".into()), Ok(None)));
+    }
+
+    #[test]
+    fn gate_path_rejects_dot_segments_in_every_spelling() {
+        for path in [
+            "/v1/%2e%2e",
+            "/v1/%2E%2E/admin",
+            "/v1/.%2e/admin",
+            "/v1/%2e./admin",
+            "/v1/%2e",
+            "/v1/../admin",
+            "/v1/./x",
+            "/..",
+        ] {
+            let response = gate_path(path).expect_err(path);
+            assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
+        }
+    }
+
+    #[test]
+    fn delegated_sessions_charge_completed_redirects_only_with_successes() {
+        for status in [200, 201, 204, 301, 302, 303, 307, 308] {
+            assert!(session_response_served(
+                StatusCode::from_u16(status).unwrap(),
+                false
+            ));
+        }
+        for status in [400, 402, 404, 429, 500, 502, 504] {
+            assert!(!session_response_served(
+                StatusCode::from_u16(status).unwrap(),
+                false
+            ));
+        }
+        assert!(session_response_served(StatusCode::OK, true));
+        assert!(!session_response_served(StatusCode::FOUND, true));
+    }
+
+    #[test]
+    fn gate_path_accepts_dots_inside_segments() {
+        for (path, expected) in [
+            ("/v1/file.json", "v1/file.json"),
+            ("/v1/%2e%2efoo", "v1/%2e%2efoo"),
+            ("/v1/...", "v1/..."),
+            (
+                "/.well-known/pay-skills.json",
+                ".well-known/pay-skills.json",
+            ),
+            ("/", ""),
+        ] {
+            assert_eq!(gate_path(path).ok(), Some(expected), "{path}");
+        }
+    }
 
     /// A client that lost a successful batch response gets the payment result
     /// back, not a conflict.
@@ -3053,7 +3452,7 @@ mod tests {
         }
     }
 
-    // A PaymentState with no APIs → everything is Passthrough.
+    // A PaymentState with no APIs → everything is Local.
     #[derive(Clone)]
     struct EmptyState;
     impl PaymentState for EmptyState {
@@ -3066,7 +3465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_and_control_plane_passthrough() {
+    async fn discovery_and_control_plane_stay_local() {
         let gate = PaymentGate::new(EmptyState);
         for path in [
             "__402/health",
@@ -3075,7 +3474,7 @@ mod tests {
         ] {
             assert!(matches!(
                 gate.evaluate(&req(&Method::GET, path)).await,
-                GateDecision::Passthrough
+                GateDecision::Local
             ));
         }
     }
@@ -3098,10 +3497,7 @@ mod tests {
         ] {
             let mut probe = req(&Method::GET, "__402/health");
             probe.host = host;
-            assert!(matches!(
-                gate.evaluate(&probe).await,
-                GateDecision::Passthrough
-            ));
+            assert!(matches!(gate.evaluate(&probe).await, GateDecision::Local));
         }
 
         for (method, path, query) in [
@@ -3129,6 +3525,8 @@ mod tests {
             network: "mainnet".to_string(),
             rpc_url: Some("http://127.0.0.1:1/never".to_string()),
             challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+            realm: Some("test-realm".to_string()),
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap()
@@ -3151,11 +3549,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_subdomain_passthrough() {
+    async fn unknown_subdomain_stays_local() {
         let gate = PaymentGate::new(EmptyState);
         assert!(matches!(
             gate.evaluate(&req(&Method::GET, "v1/anything")).await,
-            GateDecision::Passthrough
+            GateDecision::Local
         ));
     }
 }

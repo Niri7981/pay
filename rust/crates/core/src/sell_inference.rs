@@ -691,6 +691,8 @@ mod gate_tests {
             fee_payer: true,
             fee_payer_signer: Some(signer.clone()),
             html: false,
+            realm: Some("test-realm".to_string()),
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap()

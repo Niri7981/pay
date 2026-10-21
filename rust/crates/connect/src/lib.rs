@@ -68,6 +68,9 @@ pub struct AppState {
     /// Answers "does this wallet hold anything to pay with" after a sign-in.
     #[cfg(feature = "mcp")]
     wallet_probe: Arc<dyn WalletProbe>,
+    /// What a wallet already spent today, read when it is bound.
+    #[cfg(feature = "mcp")]
+    spend_history: Arc<dyn tenants::SpendHistory>,
     /// `sell_inference` endpoints; `None` until an operator is configured.
     #[cfg(feature = "sell")]
     sell: Option<Arc<sell::Operator>>,
@@ -130,6 +133,28 @@ impl WalletProbe for PayApiProbe {
             }
         }
     }
+}
+
+#[cfg(all(feature = "mcp", feature = "privy"))]
+fn default_spend_history() -> Arc<dyn tenants::SpendHistory> {
+    Arc::new(privy::OnChainSpendHistory::new(
+        pay_core::client::subscription::default_rpc_url_for_network(
+            pay_core::accounts::MAINNET_NETWORK,
+        ),
+    ))
+}
+
+/// Without Privy no wallet is ever bound, so nothing is read.
+#[cfg(all(feature = "mcp", not(feature = "privy")))]
+fn default_spend_history() -> Arc<dyn tenants::SpendHistory> {
+    struct Unavailable;
+    #[async_trait::async_trait]
+    impl tenants::SpendHistory for Unavailable {
+        async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+            Err("no spend history in this build".into())
+        }
+    }
+    Arc::new(Unavailable)
 }
 
 #[cfg(feature = "mcp")]
@@ -211,6 +236,8 @@ impl AppState {
             privy: None,
             #[cfg(feature = "mcp")]
             wallet_probe: Arc::new(PayApiProbe),
+            #[cfg(feature = "mcp")]
+            spend_history: default_spend_history(),
             #[cfg(feature = "sell")]
             sell: None,
         }
@@ -233,6 +260,18 @@ impl AppState {
     #[cfg(feature = "mcp")]
     pub fn wallet_probe(&self) -> &dyn WalletProbe {
         self.wallet_probe.as_ref()
+    }
+
+    /// Read wallets' prior spend differently (tests).
+    #[cfg(feature = "mcp")]
+    pub fn with_spend_history(mut self, history: Arc<dyn tenants::SpendHistory>) -> Self {
+        self.spend_history = history;
+        self
+    }
+
+    #[cfg(feature = "mcp")]
+    pub fn spend_history(&self) -> &dyn tenants::SpendHistory {
+        self.spend_history.as_ref()
     }
 
     /// Offer Privy login on the consent page, with the user's Privy wallet

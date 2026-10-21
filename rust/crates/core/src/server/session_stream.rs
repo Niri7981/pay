@@ -13,11 +13,12 @@ use futures_util::{Stream, StreamExt};
 use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering};
 use serde_json::Value;
 
+use crate::server::completion_stream::MeteredSettlement;
 use crate::server::gate::SessionForward;
 use crate::server::metering::{
     RequestProperties, provider_token_quantity, quota_tokens_per_unit, resolve_variant,
 };
-use crate::server::session::SessionMpp;
+use crate::server::session::{DelegatedUsageAuthorization, SessionMpp};
 use crate::server::session_metering::{
     GateMode, Result as MeteringResult, SessionGateDecision, SessionMeterDimension,
     SessionMeterSpec, SessionMeteringContext, SessionUsageGate, StablecoinSettlement,
@@ -84,6 +85,9 @@ impl SessionStreamContext {
 #[derive(Debug, Clone, Default)]
 pub struct SessionUsageHints {
     quota_units: Vec<QuotaUnitHint>,
+    /// Request body size: an upper bound on prompt tokens when the provider
+    /// never reports input usage.
+    request_body_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,7 +117,10 @@ impl SessionUsageHints {
             })
             .collect();
 
-        Self { quota_units }
+        Self {
+            quota_units,
+            request_body_bytes: request_properties.body_size,
+        }
     }
 
     fn tokens_per_quota_unit(&self, direction: MeterDirection) -> Option<u64> {
@@ -168,6 +175,17 @@ pub struct DelegatedSessionStreamMeter {
     clamp_reprice_to_authorized: bool,
     authorization_exhausted: bool,
     next_lifecycle_touch: Instant,
+    observer: Option<MeteredSettlement>,
+    /// This stream's charge in progress. It runs detached, so a cancelled
+    /// stream still learns whether it landed before charging again.
+    in_flight: Option<InFlightCharge>,
+}
+
+/// One delegated charge for this stream, running to completion on its own
+/// task whatever happens to the stream that started it.
+struct InFlightCharge {
+    amount: u64,
+    commit: tokio::task::JoinHandle<crate::Result<DelegatedUsageAuthorization>>,
 }
 
 impl DelegatedSessionStreamMeter {
@@ -206,7 +224,21 @@ impl DelegatedSessionStreamMeter {
             clamp_reprice_to_authorized: false,
             authorization_exhausted: false,
             next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
+            observer: None,
+            in_flight: None,
         })
+    }
+
+    /// Use the exact forwarded request body size as the missing-input bound.
+    pub fn with_request_body_bytes(mut self, bytes: u64) -> Self {
+        self.accumulator.hints.request_body_bytes = Some(bytes);
+        self
+    }
+
+    /// Report every committed usage increment to the handler's observer.
+    pub fn with_observer(mut self, observer: Option<MeteredSettlement>) -> Self {
+        self.observer = observer;
+        self
     }
 
     pub fn supports(forward: &SessionForward) -> bool {
@@ -251,9 +283,13 @@ impl DelegatedSessionStreamMeter {
     }
 
     fn finish(&mut self, is_sse: bool) -> MeteringResult<Option<SessionGateDecision>> {
-        if !is_sse && self.accumulator.finish_ndjson()? {
+        if self.accumulator.finish_stream(is_sse)? {
             self.current = self.accumulator.observation();
         }
+        self.final_decision()
+    }
+
+    fn final_decision(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
         if !self.accumulator.has_observation() || self.authorization_exhausted {
             return Ok(None);
         }
@@ -263,6 +299,7 @@ impl DelegatedSessionStreamMeter {
     }
 
     async fn settle(&mut self, decision: SessionGateDecision) -> Result<(), BoxError> {
+        self.resolve_in_flight().await?;
         let clamp_reprice_to_authorized = std::mem::take(&mut self.clamp_reprice_to_authorized);
         if !decision.requires_voucher() {
             return Ok(());
@@ -290,14 +327,41 @@ impl DelegatedSessionStreamMeter {
             self.authorization_exhausted |= exhausted_by_reprice;
             return Ok(());
         }
-        let accepted = self
-            .forward
-            .handle
-            .authorize_delegated_usage(&self.forward.channel_id, amount)
-            .await
-            .map_err(box_error)?;
-        self.gate.record_commit(accepted.cumulative);
+        let handle = Arc::clone(&self.forward.handle);
+        let channel_id = self.forward.channel_id.clone();
+        self.in_flight = Some(InFlightCharge {
+            amount,
+            commit: tokio::spawn(async move {
+                handle.commit_delegated_usage(&channel_id, amount).await
+            }),
+        });
+        self.resolve_in_flight().await?;
         self.authorization_exhausted |= exhausted_by_reprice;
+        self.forward
+            .handle
+            .touch_after_delegated_usage(&self.forward.channel_id)
+            .await
+            .map_err(box_error)
+    }
+
+    /// Wait for this stream's charge in progress and account for it. The
+    /// stream's own commits are additive: another stream's charges on the
+    /// same channel never count toward this one.
+    async fn resolve_in_flight(&mut self) -> Result<(), BoxError> {
+        let Some(in_flight) = self.in_flight.as_mut() else {
+            return Ok(());
+        };
+        // Awaiting a join handle is cancel-safe: dropping this future leaves
+        // the charge running and recorded here for the next attempt.
+        let joined = (&mut in_flight.commit).await;
+        let amount = in_flight.amount;
+        self.in_flight = None;
+        joined.map_err(box_error)?.map_err(box_error)?;
+        self.gate
+            .record_commit(self.gate.committed_base_units().saturating_add(amount));
+        if let Some(observer) = &self.observer {
+            observer.record(amount, self.forward.handle.decimals());
+        }
         Ok(())
     }
 
@@ -368,6 +432,61 @@ impl DelegatedSessionStreamMeter {
         }
         Ok(())
     }
+
+    /// Persist the usage a stream that ended early implies.
+    async fn abort_stream(&mut self) -> Result<(), BoxError> {
+        self.resolve_in_flight().await?;
+        if self.accumulator.abort_stream()? {
+            self.current = self.accumulator.observation();
+        }
+        if let Some(decision) = self.final_decision()? {
+            self.settle(decision).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Owns a delegated meter for one response body. Dropped before the stream
+/// completed — client disconnect, upstream or metering error — it settles
+/// the usage already released, missing-usage bounds included, so no exit
+/// path skips the final charge.
+struct DelegatedStreamFinalizer {
+    meter: Option<DelegatedSessionStreamMeter>,
+}
+
+impl DelegatedStreamFinalizer {
+    fn meter(&mut self) -> &mut DelegatedSessionStreamMeter {
+        self.meter
+            .as_mut()
+            .expect("the meter is held until the stream completes")
+    }
+
+    async fn finish(&mut self, is_sse: bool) -> Result<(), BoxError> {
+        self.meter().finish_stream(is_sse).await?;
+        self.meter = None;
+        Ok(())
+    }
+}
+
+impl Drop for DelegatedStreamFinalizer {
+    fn drop(&mut self) {
+        let Some(mut meter) = self.meter.take() else {
+            return;
+        };
+        let channel_id = meter.forward.channel_id.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = meter.abort_stream().await {
+                        tracing::error!(%error, %channel_id, "failed to settle an interrupted delegated stream");
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::error!(%channel_id, "interrupted delegated stream dropped outside a runtime; usage not settled");
+            }
+        }
+    }
 }
 
 impl SessionStreamMeter {
@@ -392,6 +511,12 @@ impl SessionStreamMeter {
         })
     }
 
+    /// Use the exact forwarded request body size as the missing-input bound.
+    pub fn with_request_body_bytes(mut self, bytes: u64) -> Self {
+        self.accumulator.hints.request_body_bytes = Some(bytes);
+        self
+    }
+
     pub fn observe_chunk(
         &mut self,
         chunk: &[u8],
@@ -408,7 +533,7 @@ impl SessionStreamMeter {
     }
 
     pub fn finish(&mut self, is_sse: bool) -> MeteringResult<Option<SessionGateDecision>> {
-        if !is_sse && self.accumulator.finish_ndjson()? {
+        if self.accumulator.finish_stream(is_sse)? {
             self.current = self.accumulator.observation();
         }
         if !self.accumulator.has_observation() {
@@ -444,20 +569,42 @@ where
 {
     async_stream::try_stream! {
         futures_util::pin_mut!(stream);
+        // Bytes whose usage is below the voucher threshold are held, not
+        // released, until a commit covers them: a disconnect or upstream error
+        // must never leave delivered usage unpaid.
+        let mut held: Vec<Bytes> = Vec::new();
+        let mut held_target = 0;
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
             meter.touch_channel_if_due();
             let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
-            if let Some(decision) = decision {
-                settle_decision(&mut meter, decision).await?;
+            held.push(chunk);
+            match decision {
+                Some(decision) if decision.requires_voucher() => {
+                    // Do not release the bytes that crossed the voucher
+                    // threshold until the cumulative commit is durable.
+                    settle_decision(&mut meter, decision).await?;
+                }
+                Some(decision) if decision.outstanding_base_units() > 0 => {
+                    held_target = decision.target_cumulative_base_units();
+                }
+                _ => {}
             }
-            // Do not release the bytes that crossed the voucher threshold
-            // until the corresponding cumulative commit is durable.
-            yield chunk;
+            let committed = meter.context.committed_base_units();
+            if committed >= held_target {
+                meter.record_commit(committed);
+                held_target = 0;
+                for chunk in held.drain(..) {
+                    yield chunk;
+                }
+            }
         }
 
         if let Some(decision) = meter.finish(is_sse).map_err(box_error)? {
             settle_decision(&mut meter, decision).await?;
+        }
+        for chunk in held.drain(..) {
+            yield chunk;
         }
     }
 }
@@ -465,26 +612,28 @@ where
 /// Wrap a delegated-session response stream without buffering it.
 ///
 /// Chargeable chunks remain behind the payment gate until the gateway's
-/// cumulative voucher has been persisted. Dropping the returned stream drops
-/// the owned meter and releases its exclusive capacity lease.
+/// cumulative voucher has been persisted. Dropping the returned stream early
+/// settles the usage already released, then releases the meter's exclusive
+/// capacity lease.
 pub(crate) fn meter_delegated_response_stream<S, E>(
     stream: S,
-    mut meter: DelegatedSessionStreamMeter,
+    meter: DelegatedSessionStreamMeter,
     is_sse: bool,
 ) -> impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: StdError + Send + Sync + 'static,
 {
+    let mut meter = DelegatedStreamFinalizer { meter: Some(meter) };
     async_stream::try_stream! {
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            meter.authorize_chunk(&chunk, is_sse).await?;
+            meter.meter().authorize_chunk(&chunk, is_sse).await?;
             yield chunk;
         }
 
-        meter.finish_stream(is_sse).await?;
+        meter.finish(is_sse).await?;
     }
 }
 
@@ -537,8 +686,13 @@ struct StreamUsageAccumulator {
     output_bytes: u64,
     output_chars: u64,
     output_words: u64,
+    /// UTF-8 bytes of streamed text: an upper bound on its tokenizer units.
+    output_text_bytes: u64,
     input_tokens: u64,
     output_tokens: u64,
+    provider_output_tokens: bool,
+    provider_input_tokens: bool,
+    finished: bool,
     request_seen: bool,
     observed: bool,
 }
@@ -554,8 +708,12 @@ impl StreamUsageAccumulator {
             output_bytes: 0,
             output_chars: 0,
             output_words: 0,
+            output_text_bytes: 0,
             input_tokens: 0,
             output_tokens: 0,
+            provider_output_tokens: false,
+            provider_input_tokens: false,
+            finished: false,
             request_seen: false,
             observed: false,
         }
@@ -571,7 +729,7 @@ impl StreamUsageAccumulator {
         }
 
         if is_sse {
-            changed |= self.observe_sse_chunk(chunk);
+            changed |= self.observe_sse_chunk(chunk)?;
         } else {
             changed |= self.observe_ndjson_chunk(chunk)?;
             if observes_unit(&self.spec, BillingUnit::Characters) {
@@ -586,11 +744,12 @@ impl StreamUsageAccumulator {
         Ok(changed)
     }
 
-    fn observe_sse_chunk(&mut self, chunk: &[u8]) -> bool {
-        let Ok(events) = self.sse.push_chunk(chunk) else {
-            return false;
-        };
+    fn observe_sse_chunk(&mut self, chunk: &[u8]) -> MeteringResult<bool> {
+        let events = self.sse.push_chunk(chunk)?;
+        Ok(self.observe_sse_events(events))
+    }
 
+    fn observe_sse_events(&mut self, events: impl IntoIterator<Item = SseUsageEvent>) -> bool {
         let mut changed = false;
         for event in events {
             let Some(data) = event.data else {
@@ -607,6 +766,50 @@ impl StreamUsageAccumulator {
         }
 
         changed
+    }
+
+    /// Flush decoder state at end of stream. Returns whether usage changed.
+    fn finish_stream(&mut self, is_sse: bool) -> MeteringResult<bool> {
+        let changed = if is_sse {
+            let event = self.sse.finish()?;
+            self.observe_sse_events(event)
+        } else {
+            self.finish_ndjson()?
+        };
+        let bounded = self.settle_missing_usage()?;
+        self.observed |= changed;
+        Ok(changed || bounded)
+    }
+
+    /// The stream was cut short (disconnect, upstream or metering error):
+    /// settle the missing-usage bounds for what it carried. Partial input is
+    /// not flushed.
+    fn abort_stream(&mut self) -> MeteringResult<bool> {
+        if !self.request_seen {
+            return Ok(false);
+        }
+        self.settle_missing_usage()
+    }
+
+    /// From here on, missing provider usage rates at its upper bounds.
+    fn settle_missing_usage(&mut self) -> MeteringResult<bool> {
+        self.finished = true;
+        let mut changed = !self.provider_output_tokens && self.output_text_bytes > 0;
+        if !self.provider_input_tokens
+            && let Some(unit) = self.charged_input_token_unit()
+        {
+            let Some(body_bytes) = self.hints.request_body_bytes else {
+                return Err(
+                    crate::server::session_metering::SessionMeteringError::MissingRequiredObservation {
+                        direction: MeterDirection::Input,
+                        unit,
+                    },
+                );
+            };
+            changed |= body_bytes > self.input_tokens;
+        }
+        self.observed |= changed;
+        Ok(changed)
     }
 
     fn observe_ndjson_chunk(&mut self, chunk: &[u8]) -> MeteringResult<bool> {
@@ -638,17 +841,59 @@ impl StreamUsageAccumulator {
             self.output_words = self
                 .output_words
                 .saturating_add(streamed_text_word_count(value));
+            self.output_text_bytes = self
+                .output_text_bytes
+                .saturating_add(streamed_text_byte_count(value));
             changed = true;
         }
         if let Some(input) = provider_token_quantity(value, MeterDirection::Input) {
             self.input_tokens = self.input_tokens.max(input);
+            self.provider_input_tokens = true;
             changed = true;
         }
         if let Some(output) = provider_token_quantity(value, MeterDirection::Output) {
             self.output_tokens = self.output_tokens.max(output);
+            self.provider_output_tokens = true;
             changed = true;
         }
         changed
+    }
+
+    /// Input tokens to rate. Without a provider observation by end of stream,
+    /// the request body size bounds the prompt from above.
+    fn input_token_amount(&self) -> u64 {
+        if self.finished && !self.provider_input_tokens {
+            self.input_tokens
+                .max(self.hints.request_body_bytes.unwrap_or(0))
+        } else {
+            self.input_tokens
+        }
+    }
+
+    fn charged_input_token_unit(&self) -> Option<BillingUnit> {
+        self.spec
+            .dimensions
+            .iter()
+            .find(|dimension| {
+                dimension.direction == MeterDirection::Input
+                    && matches!(
+                        dimension.unit,
+                        BillingUnit::Tokens | BillingUnit::QuotaUnits
+                    )
+            })
+            .map(|dimension| dimension.unit)
+    }
+
+    /// Output tokens to rate. Whitespace words are only a live lower bound;
+    /// a stream that ends without provider usage settles the text byte count,
+    /// which no tokenizer unit count can exceed.
+    fn output_token_amount(&self) -> u64 {
+        let floor = self.output_tokens.max(self.output_words);
+        if self.finished && !self.provider_output_tokens {
+            floor.max(self.output_text_bytes)
+        } else {
+            floor
+        }
     }
 
     fn observation(&self) -> UsageObservation {
@@ -665,17 +910,17 @@ impl StreamUsageAccumulator {
             (MeterDirection::Usage, BillingUnit::Requests) => u64::from(self.request_seen),
             (MeterDirection::Output, BillingUnit::Bytes) => self.output_bytes,
             (MeterDirection::Output, BillingUnit::Characters) => self.output_chars,
-            (MeterDirection::Input, BillingUnit::Tokens) => self.input_tokens,
-            (MeterDirection::Output, BillingUnit::Tokens) => {
-                self.output_tokens.max(self.output_words)
+            (MeterDirection::Input, BillingUnit::Tokens) => self.input_token_amount(),
+            (MeterDirection::Output, BillingUnit::Tokens) => self.output_token_amount(),
+            (MeterDirection::Input, BillingUnit::QuotaUnits) => {
+                let input_tokens = self.input_token_amount();
+                self.hints
+                    .tokens_per_quota_unit(MeterDirection::Input)
+                    .map(|scale| ceil_div_u64(input_tokens, scale))
+                    .unwrap_or(input_tokens)
             }
-            (MeterDirection::Input, BillingUnit::QuotaUnits) => self
-                .hints
-                .tokens_per_quota_unit(MeterDirection::Input)
-                .map(|scale| ceil_div_u64(self.input_tokens, scale))
-                .unwrap_or(self.input_tokens),
             (MeterDirection::Output, BillingUnit::QuotaUnits) => {
-                let output_tokens = self.output_tokens.max(self.output_words);
+                let output_tokens = self.output_token_amount();
                 self.hints
                     .tokens_per_quota_unit(MeterDirection::Output)
                     .map(|scale| ceil_div_u64(output_tokens, scale))
@@ -694,13 +939,17 @@ impl StreamUsageAccumulator {
     }
 
     fn reconfigure(&mut self, spec: SessionMeterSpec, hints: SessionUsageHints) {
+        let request_body_bytes = self.hints.request_body_bytes;
         self.spec = spec;
         self.hints = hints;
+        self.hints.request_body_bytes = request_body_bytes.or(self.hints.request_body_bytes);
     }
 }
 
 #[derive(Debug, Clone, Default)]
 struct SseUsageDecoder {
+    /// Undecoded bytes: an incomplete UTF-8 sequence or a trailing `\r`.
+    pending: Vec<u8>,
     buffer: String,
 }
 
@@ -776,10 +1025,24 @@ fn count_stream_utf8_chars(tail: &mut Vec<u8>, chunk: &[u8]) -> MeteringResult<u
 }
 
 impl SseUsageDecoder {
-    fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseUsageEvent>, std::str::Utf8Error> {
-        let text = std::str::from_utf8(chunk)?;
-        self.buffer
-            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+    fn push_chunk(&mut self, chunk: &[u8]) -> MeteringResult<Vec<SseUsageEvent>> {
+        self.pending.extend_from_slice(chunk);
+        let mut valid = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => {
+                return Err(
+                    crate::server::session_metering::SessionMeteringError::InvalidStream(
+                        error.to_string(),
+                    ),
+                );
+            }
+        };
+        // A `\r` may be the first half of a `\r\n` split across chunks.
+        if valid > 0 && self.pending[valid - 1] == b'\r' {
+            valid -= 1;
+        }
+        self.decode(valid);
 
         let mut events = vec![];
         while let Some(index) = self.buffer.find("\n\n") {
@@ -788,6 +1051,29 @@ impl SseUsageDecoder {
             events.push(parse_sse_event(&block));
         }
         Ok(events)
+    }
+
+    /// Parse a final event that was not terminated by a blank line. Released
+    /// bytes are always metered, so a stream ending mid-character is invalid.
+    fn finish(&mut self) -> MeteringResult<Option<SseUsageEvent>> {
+        if std::str::from_utf8(&self.pending).is_err() {
+            return Err(
+                crate::server::session_metering::SessionMeteringError::InvalidStream(
+                    "SSE stream ended inside a UTF-8 character".to_string(),
+                ),
+            );
+        }
+        self.decode(self.pending.len());
+        let block = std::mem::take(&mut self.buffer);
+        let block = block.trim_matches('\n');
+        Ok((!block.is_empty()).then(|| parse_sse_event(block)))
+    }
+
+    fn decode(&mut self, len: usize) {
+        let text = std::str::from_utf8(&self.pending[..len]).expect("validated UTF-8 prefix");
+        self.buffer
+            .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        self.pending.drain(..len);
     }
 }
 
@@ -872,6 +1158,10 @@ fn streamed_text_char_count(value: &Value) -> u64 {
     streamed_texts(value)
         .map(|text| text.chars().count() as u64)
         .sum()
+}
+
+fn streamed_text_byte_count(value: &Value) -> u64 {
+    streamed_texts(value).map(|text| text.len() as u64).sum()
 }
 
 fn streamed_text_word_count(value: &Value) -> u64 {
@@ -1657,5 +1947,962 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             metered.next().await.is_none(),
             "a clamped usage-only reprice must complete cleanly"
         );
+    }
+
+    /// A delegated (operator-signed) stream meter over a funded test channel.
+    async fn delegated_test_meter(
+        dimensions: Vec<MeterDimension>,
+        label: &str,
+    ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
+        delegated_test_meter_on(dimensions, label, Arc::new(MemoryChannelStore::new())).await
+    }
+
+    async fn delegated_test_meter_on(
+        dimensions: Vec<MeterDimension>,
+        label: &str,
+        store: Arc<dyn ChannelStore>,
+    ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
+        let channel = delegated_channel(label, &store).await;
+        let meter = delegated_meter(&channel.session, &channel.channel_id, dimensions).await;
+        (channel.session, channel.channel_id, meter)
+    }
+
+    struct DelegatedChannel {
+        config: SessionConfig,
+        operator: Arc<dyn TransactionSigner>,
+        session: Arc<SessionMpp>,
+        channel_id: String,
+    }
+
+    /// A funded operator-signed channel in `store`, served by one replica.
+    async fn delegated_channel(label: &str, store: &Arc<dyn ChannelStore>) -> DelegatedChannel {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let mut operator_keypair = [0_u8; 64];
+        operator_keypair[..32].copy_from_slice(signing_key.as_bytes());
+        operator_keypair[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+        let operator: Arc<dyn TransactionSigner> =
+            Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
+        let config = SessionConfig {
+            operator: operator.pubkey().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            suggested_deposit: Some(1_000_000),
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            network: "localnet".to_string(),
+            min_voucher_delta: 1,
+            voucher_signer: VoucherSigner::Operator,
+            ..SessionConfig::default()
+        };
+        let session = delegated_replica(&config, &operator, label, store);
+        let challenge = session.challenge(None).unwrap();
+        let channel_id = solana_pubkey::Pubkey::new_unique().to_string();
+        store
+            .put_channel(
+                &channel_id,
+                test_channel_state(
+                    &channel_id,
+                    1_000_000,
+                    operator.pubkey().to_string(),
+                    "operator",
+                    &challenge.id,
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        DelegatedChannel {
+            config,
+            operator,
+            session,
+            channel_id,
+        }
+    }
+
+    /// One gateway replica over `store`.
+    fn delegated_replica(
+        config: &SessionConfig,
+        operator: &Arc<dyn TransactionSigner>,
+        label: &str,
+        store: &Arc<dyn ChannelStore>,
+    ) -> Arc<SessionMpp> {
+        Arc::new(
+            SessionMpp::new_with_channel_store(config.clone(), label, Arc::clone(store))
+                .with_blockhash_cache(stream_test_blockhash_cache())
+                .with_payment_channel_signer(Arc::clone(operator)),
+        )
+    }
+
+    /// A stream admitted on `session` at the channel's current watermark.
+    async fn delegated_meter(
+        session: &Arc<SessionMpp>,
+        channel_id: &str,
+        dimensions: Vec<MeterDimension>,
+    ) -> DelegatedSessionStreamMeter {
+        let reservation = session
+            .reserve_delegated_capacity(channel_id, 100_000)
+            .await
+            .unwrap()
+            .expect("session capacity should be available");
+        let forward = SessionForward::delegated(
+            session.clone(),
+            channel_id.to_string(),
+            0,
+            crate::server::metering::UptoSettlementPlan {
+                metering: metering(dimensions),
+                variant_hint: None,
+                request_properties: RequestProperties::default(),
+                ceiling_usd: 0.1,
+                inferred_usage: None,
+            },
+            (100_000, 1_000_000),
+            solana_pubkey::Pubkey::new_unique().to_string(),
+            reservation,
+        );
+        DelegatedSessionStreamMeter::from_forward(forward).unwrap()
+    }
+
+    fn token_dimension(direction: MeterDirection, path: &str) -> MeterDimension {
+        MeterDimension {
+            direction,
+            unit: BillingUnit::Tokens,
+            scale: 1,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.000001,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: Some(pay_types::metering::UsageMeter {
+                source: pay_types::metering::UsageMeterSource::ResponseJson,
+                path: Some(path.to_string()),
+                header: None,
+            }),
+        }
+    }
+
+    async fn drain_delegated_bytes(
+        chunks: Vec<Bytes>,
+        meter: DelegatedSessionStreamMeter,
+    ) -> Result<Vec<u8>, BoxError> {
+        drain_delegated(
+            chunks.into_iter().map(|chunk| chunk.to_vec()).collect(),
+            meter,
+        )
+        .await
+    }
+
+    async fn drain_delegated(
+        chunks: Vec<Vec<u8>>,
+        meter: DelegatedSessionStreamMeter,
+    ) -> Result<Vec<u8>, BoxError> {
+        let upstream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
+        );
+        let metered = meter_delegated_response_stream(upstream, meter, true);
+        futures_util::pin_mut!(metered);
+        let mut served = Vec::new();
+        while let Some(chunk) = metered.next().await {
+            served.extend_from_slice(&chunk?);
+        }
+        Ok(served)
+    }
+
+    #[tokio::test]
+    async fn delegated_sse_meters_events_with_utf8_split_across_chunks() {
+        let event = b"data: {\"choices\":[{\"delta\":{\"content\":\"\xC3\xA9\"}}],\"usage\":{\"completion_tokens\":5}}\n\n";
+        let split = event.iter().position(|byte| *byte == 0xC3).unwrap() + 1;
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "sse-utf8-split",
+        )
+        .await;
+
+        let served = drain_delegated(
+            vec![event[..split].to_vec(), event[split..].to_vec()],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(served, event);
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    #[tokio::test]
+    async fn delegated_sse_meters_unsplit_utf8_event() {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"é\"}}],\"usage\":{\"completion_tokens\":5}}\n\n";
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "sse-utf8-whole",
+        )
+        .await;
+
+        drain_delegated(vec![event.as_bytes().to_vec()], meter)
+            .await
+            .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    #[test]
+    fn sse_decoder_handles_every_utf8_and_crlf_split_point() {
+        let stream = "data: {\"t\":\"a€😀\"}\r\n\r\ndata: {\"t\":\"z\"}\r\n\r\n".as_bytes();
+        for split in 0..=stream.len() {
+            let mut decoder = SseUsageDecoder::default();
+            let mut events = decoder.push_chunk(&stream[..split]).unwrap();
+            events.extend(decoder.push_chunk(&stream[split..]).unwrap());
+            assert!(decoder.finish().unwrap().is_none(), "split {split}");
+            let data: Vec<_> = events.into_iter().filter_map(|event| event.data).collect();
+            assert_eq!(
+                data,
+                vec!["{\"t\":\"a€😀\"}", "{\"t\":\"z\"}"],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_decoder_rejects_malformed_utf8() {
+        let mut decoder = SseUsageDecoder::default();
+        assert!(decoder.push_chunk(b"data: \xFF\n\n").is_err());
+    }
+
+    #[test]
+    fn sse_decoder_rejects_stream_ending_inside_a_character() {
+        let mut decoder = SseUsageDecoder::default();
+        assert!(
+            decoder
+                .push_chunk(b"data: {\"t\":\"\xE2\x82")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decoder.finish().is_err());
+    }
+
+    #[test]
+    fn sse_decoder_flushes_final_event_without_blank_line() {
+        let mut decoder = SseUsageDecoder::default();
+        assert!(
+            decoder
+                .push_chunk(b"data: {\"usage\":{\"completion_tokens\":7}}\n")
+                .unwrap()
+                .is_empty()
+        );
+        let event = decoder.finish().unwrap().expect("final event");
+        assert_eq!(
+            event.data.as_deref(),
+            Some("{\"usage\":{\"completion_tokens\":7}}")
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_sse_meters_final_event_without_blank_line() {
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "sse-final-event",
+        )
+        .await;
+
+        drain_delegated(
+            vec![b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":7}}".to_vec()],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(7));
+    }
+
+    fn sse_text_event(text: &str) -> Vec<u8> {
+        let chunk = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+        format!("data: {chunk}\n\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn delegated_token_stream_without_provider_usage_settles_text_upper_bound() {
+        let payload = "!?".repeat(256);
+        assert_eq!(count_words(&payload), 1);
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "missing-usage-upper-bound",
+        )
+        .await;
+
+        drain_delegated(
+            vec![sse_text_event(&payload), b"data: [DONE]\n\n".to_vec()],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.committed_watermark(&channel_id),
+            Some(payload.len() as u64),
+            "a word count must never be the final token settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_token_stream_settles_provider_usage_when_reported() {
+        let payload = "!?".repeat(256);
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "provider-usage-authoritative",
+        )
+        .await;
+
+        drain_delegated(
+            vec![
+                sse_text_event(&payload),
+                b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":300}}\n\n".to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            meter,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(300));
+    }
+
+    async fn interrupted_meter(
+        label: &str,
+    ) -> (Arc<SessionMpp>, String, DelegatedSessionStreamMeter) {
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![
+                token_dimension(MeterDirection::Input, "/usage/prompt_tokens"),
+                token_dimension(MeterDirection::Output, "/usage/completion_tokens"),
+            ],
+            label,
+        )
+        .await;
+        (session, channel_id, meter.with_request_body_bytes(40))
+    }
+
+    async fn settled_watermark(
+        session: &SessionMpp,
+        channel_id: &str,
+        expected: u64,
+    ) -> Option<u64> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let watermark = session.committed_watermark(channel_id);
+            if watermark == Some(expected) || Instant::now() > deadline {
+                return watermark;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_still_settles_the_missing_usage_bounds() {
+        let payload = "!?".repeat(64);
+        let (session, channel_id, meter) = interrupted_meter("upstream-error-bounds").await;
+        let upstream = futures_util::stream::iter(vec![
+            Ok(Bytes::from(sse_text_event(&payload))),
+            Err(std::io::Error::other("upstream reset")),
+        ]);
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        assert!(metered.next().await.unwrap().is_ok(), "text is released");
+        assert!(metered.next().await.unwrap().is_err());
+        drop(metered);
+
+        // Input from the request body bound, output from the text bytes.
+        let expected = 40 + payload.len() as u64;
+        assert_eq!(
+            settled_watermark(&session, &channel_id, expected).await,
+            Some(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_disconnect_still_settles_the_missing_usage_bounds() {
+        let payload = "!?".repeat(64);
+        let (session, channel_id, meter) = interrupted_meter("disconnect-bounds").await;
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+            sse_text_event(&payload),
+        ))])
+        .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        assert!(metered.next().await.unwrap().is_ok(), "text is released");
+        // The buyer disconnects before the stream completes.
+        drop(metered);
+
+        let expected = 40 + payload.len() as u64;
+        assert_eq!(
+            settled_watermark(&session, &channel_id, expected).await,
+            Some(expected)
+        );
+    }
+
+    /// A store that stalls once the watermark reaches `stall_at`: its next
+    /// read never answers (cancelling an attempt in the lifecycle touch after
+    /// its voucher saved), or with `slow_write`, the write that saved it is
+    /// slow to return (cancelling the attempt inside the commit itself).
+    struct StallingStore {
+        inner: MemoryChannelStore,
+        stall_at: u64,
+        slow_write: bool,
+        stalled: std::sync::atomic::AtomicBool,
+    }
+
+    impl StallingStore {
+        fn new(stall_at: u64, slow_write: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryChannelStore::new(),
+                stall_at,
+                slow_write,
+                stalled: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        async fn after_write(&self, channel_id: &str) {
+            if !self.slow_write {
+                return;
+            }
+            let saved = self
+                .inner
+                .get_channel(channel_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|state| state.cumulative >= self.stall_at);
+            if saved && !self.stalled.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        }
+
+        fn stalled(&self) -> bool {
+            self.stalled.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    type StoreFuture<'a, T> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<T, pay_kit::mpp::store::StoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    impl ChannelStore for StallingStore {
+        fn list_channels(&self) -> StoreFuture<'_, Vec<pay_kit::mpp::store::ChannelState>> {
+            self.inner.list_channels()
+        }
+
+        fn get_channel(
+            &self,
+            channel_id: &str,
+        ) -> StoreFuture<'_, Option<pay_kit::mpp::store::ChannelState>> {
+            let channel_id = channel_id.to_string();
+            Box::pin(async move {
+                let state = self.inner.get_channel(&channel_id).await?;
+                if !self.slow_write
+                    && state
+                        .as_ref()
+                        .is_some_and(|state| state.cumulative >= self.stall_at)
+                    && !self.stalled.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::future::pending::<()>().await;
+                }
+                Ok(state)
+            })
+        }
+
+        fn put_channel(
+            &self,
+            channel_id: &str,
+            state: pay_kit::mpp::store::ChannelState,
+        ) -> StoreFuture<'_, ()> {
+            self.inner.put_channel(channel_id, state)
+        }
+
+        fn delete_channel(&self, channel_id: &str) -> StoreFuture<'_, ()> {
+            self.inner.delete_channel(channel_id)
+        }
+
+        fn update_channel(
+            &self,
+            channel_id: &str,
+            updater: Box<
+                dyn FnOnce(
+                        Option<pay_kit::mpp::store::ChannelState>,
+                    ) -> Result<
+                        pay_kit::mpp::store::ChannelState,
+                        pay_kit::mpp::store::StoreError,
+                    > + Send,
+            >,
+        ) -> StoreFuture<'_, pay_kit::mpp::store::ChannelState> {
+            let channel_id = channel_id.to_string();
+            Box::pin(async move {
+                let state = self.inner.update_channel(&channel_id, updater).await?;
+                self.after_write(&channel_id).await;
+                Ok(state)
+            })
+        }
+
+        fn read_channel(
+            &self,
+            channel_id: &str,
+            reader: Box<
+                dyn FnOnce(
+                        Option<&pay_kit::mpp::store::ChannelState>,
+                    ) -> Result<(), pay_kit::mpp::store::StoreError>
+                    + Send,
+            >,
+        ) -> StoreFuture<'_, ()> {
+            self.inner.read_channel(channel_id, reader)
+        }
+
+        fn mutate_channel(
+            &self,
+            channel_id: &str,
+            seed: Option<pay_kit::mpp::store::ChannelState>,
+            mutator: Box<
+                dyn FnOnce(
+                        &mut pay_kit::mpp::store::ChannelState,
+                    ) -> Result<(), pay_kit::mpp::store::StoreError>
+                    + Send,
+            >,
+        ) -> StoreFuture<'_, ()> {
+            let channel_id = channel_id.to_string();
+            Box::pin(async move {
+                self.inner
+                    .mutate_channel(&channel_id, seed, mutator)
+                    .await?;
+                self.after_write(&channel_id).await;
+                Ok(())
+            })
+        }
+
+        fn touch_channel_lifecycle(
+            &self,
+            channel_id: &str,
+            lifecycle: pay_kit::mpp::store::ChannelLifecycle,
+        ) -> StoreFuture<'_, pay_kit::mpp::store::ChannelState> {
+            self.inner.touch_channel_lifecycle(channel_id, lifecycle)
+        }
+
+        fn advance_cumulative(
+            &self,
+            channel_id: &str,
+            expected: u64,
+            new: u64,
+        ) -> StoreFuture<'_, bool> {
+            self.inner.advance_cumulative(channel_id, expected, new)
+        }
+
+        fn update_deposit(&self, channel_id: &str, new_deposit: u64) -> StoreFuture<'_, ()> {
+            self.inner.update_deposit(channel_id, new_deposit)
+        }
+
+        fn mark_sealed(&self, channel_id: &str) -> StoreFuture<'_, ()> {
+            self.inner.mark_sealed(channel_id)
+        }
+
+        fn mark_finalized(&self, channel_id: &str) -> StoreFuture<'_, ()> {
+            self.inner.mark_finalized(channel_id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_settlement_is_never_charged_twice() {
+        let store = StallingStore::new(5, false);
+        let (session, channel_id, meter) = delegated_test_meter_on(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "cancelled-settlement",
+            store.clone(),
+        )
+        .await;
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(usage_event(5))])
+            .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        // The voucher for 5 is saved, then the lifecycle touch never returns.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), metered.next())
+                .await
+                .is_err()
+        );
+        assert!(store.stalled());
+        // The buyer disconnects mid-settlement; the finalizer retries.
+        drop(metered);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let state = store.inner.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 5, "the usage is charged exactly once");
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    fn usage_event(completion_tokens: u64) -> Bytes {
+        Bytes::from(format!(
+            "data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":{completion_tokens}}}}}\n\n"
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_charge_cancelled_inside_its_commit_is_never_charged_twice() {
+        let store = StallingStore::new(5, true);
+        let (session, channel_id, meter) = delegated_test_meter_on(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "cancelled-commit",
+            store.clone(),
+        )
+        .await;
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(usage_event(5))])
+            .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        // The voucher for 5 is saved; the write reporting it is still out.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), metered.next())
+                .await
+                .is_err()
+        );
+        assert!(store.stalled());
+        drop(metered);
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let state = store.inner.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 5, "the usage is charged exactly once");
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    #[tokio::test]
+    async fn streams_on_two_replicas_each_pay_their_own_usage() {
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let dimensions = || {
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )]
+        };
+        let channel = delegated_channel("two-replicas", &store).await;
+        let channel_id = channel.channel_id.clone();
+        let first_meter = delegated_meter(&channel.session, &channel_id, dimensions()).await;
+        // A second gateway over the same store admits a stream on the same
+        // channel at the same watermark.
+        let second = delegated_replica(&channel.config, &channel.operator, "two-replicas", &store);
+        let second_meter = delegated_meter(&second, &channel_id, dimensions()).await;
+
+        drain_delegated_bytes(vec![usage_event(5)], first_meter)
+            .await
+            .unwrap();
+        drain_delegated_bytes(vec![usage_event(5), usage_event(7)], second_meter)
+            .await
+            .unwrap();
+
+        let state = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 12, "each stream pays its own usage");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_settlement_reports_its_earnings_once() {
+        let store = StallingStore::new(5, false);
+        let (session, _, meter) = delegated_test_meter_on(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "cancelled-earnings",
+            store,
+        )
+        .await;
+        let reported = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&reported);
+        let meter = meter.with_observer(Some(MeteredSettlement::with_callback(move |usd| {
+            *sink.lock().unwrap() = Some(usd);
+        })));
+        let upstream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(usage_event(5))])
+            .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_delegated_response_stream(upstream, meter, true));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), metered.next())
+                .await
+                .is_err()
+        );
+        drop(metered);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reported.lock().unwrap().is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expected = 5.0 / 10f64.powi(i32::from(session.decimals()));
+        let reported = reported.lock().unwrap().expect("earnings reported");
+        assert!(
+            (reported - expected).abs() < 1e-12,
+            "{reported} != {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_stream_settles_provider_usage_once() {
+        let (session, channel_id, meter) = interrupted_meter("completed-provider-usage").await;
+        drain_delegated(
+            vec![
+                sse_text_event("hello world"),
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n"
+                    .to_vec(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            meter,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+    }
+
+    #[test]
+    fn missing_output_usage_upper_bound_counts_utf8_bytes_only_at_finish() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Tokens,
+            1,
+            1,
+        )]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+        accumulator
+            .observe_chunk(&sse_text_event("héllo wörld"), true)
+            .unwrap();
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens),
+            Some(2)
+        );
+
+        assert!(accumulator.finish_stream(true).unwrap());
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens),
+            Some("héllo wörld".len() as u64)
+        );
+    }
+
+    fn input_output_token_dimensions() -> Vec<MeterDimension> {
+        vec![
+            token_dimension(MeterDirection::Input, "/usage/prompt_tokens"),
+            token_dimension(MeterDirection::Output, "/usage/completion_tokens"),
+        ]
+    }
+
+    const OUTPUT_ONLY_USAGE: &[u8] =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"one two three four five\"}}],\"usage\":{\"completion_tokens\":5}}\n\n";
+
+    #[tokio::test]
+    async fn missing_prompt_usage_settles_the_request_body_bound() {
+        let (session, channel_id, meter) =
+            delegated_test_meter(input_output_token_dimensions(), "missing-prompt-usage").await;
+
+        drain_delegated(
+            vec![OUTPUT_ONLY_USAGE.to_vec()],
+            meter.with_request_body_bytes(600),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.committed_watermark(&channel_id),
+            Some(605),
+            "a missing prompt observation must not be rated as zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn reported_prompt_usage_is_authoritative() {
+        let (session, channel_id, meter) =
+            delegated_test_meter(input_output_token_dimensions(), "reported-prompt-usage").await;
+
+        drain_delegated(
+            vec![
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5}}\n\n"
+                    .to_vec(),
+            ],
+            meter.with_request_body_bytes(600),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.committed_watermark(&channel_id), Some(105));
+    }
+
+    #[tokio::test]
+    async fn missing_prompt_usage_without_a_body_bound_fails_the_stream() {
+        let (_session, _channel_id, meter) =
+            delegated_test_meter(input_output_token_dimensions(), "unbounded-prompt").await;
+
+        let error = drain_delegated(vec![OUTPUT_ONLY_USAGE.to_vec()], meter)
+            .await
+            .expect_err("unrated input must not complete cleanly");
+
+        assert!(
+            error.to_string().contains("missing required observation"),
+            "{error}"
+        );
+    }
+
+    async fn client_voucher_stream(
+        min_voucher_delta: u64,
+        label: &str,
+    ) -> (
+        Arc<SessionMpp>,
+        Arc<MemoryChannelStore>,
+        String,
+        SessionHandle,
+        SessionStreamMeter,
+    ) {
+        let store_impl = Arc::new(MemoryChannelStore::new());
+        let store: Arc<dyn ChannelStore> = store_impl.clone();
+        let session = Arc::new(
+            SessionMpp::new_with_channel_store(
+                SessionConfig {
+                    operator: solana_pubkey::Pubkey::new_unique().to_string(),
+                    recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                    suggested_deposit: Some(1_000),
+                    currency: solana_pubkey::Pubkey::new_unique().to_string(),
+                    network: "localnet".to_string(),
+                    min_voucher_delta,
+                    ..SessionConfig::default()
+                },
+                label,
+                store,
+            )
+            .with_blockhash_cache(stream_test_blockhash_cache()),
+        );
+        let challenge = session.challenge(None).unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let signer = stream_test_signer();
+        let authorized_signer = signer.pubkey().to_string();
+        let handle = SessionHandle::new(channel, signer, challenge.clone());
+        let channel_id = channel.to_string();
+        store_impl
+            .put_channel(
+                &channel_id,
+                test_channel_state(
+                    &channel_id,
+                    1_000,
+                    &authorized_signer,
+                    "client",
+                    &challenge.id,
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        let context = SessionStreamContext::new(session.clone(), channel_id.clone(), 0);
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Bytes,
+            1,
+            1,
+        )]);
+        let meter = SessionStreamMeter::new(spec, SessionUsageHints::default(), context).unwrap();
+        (session, store_impl, channel_id, handle, meter)
+    }
+
+    #[tokio::test]
+    async fn below_threshold_usage_is_not_released_before_its_commit() {
+        let (session, store, channel_id, _handle, meter) =
+            client_voucher_stream(10, "stream-drop-secret").await;
+        let upstream =
+            futures_util::stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"paid"))])
+                .chain(futures_util::stream::pending());
+        let mut metered = Box::pin(meter_response_stream(upstream, meter, false));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err(),
+            "below-threshold usage must stay withheld until committed"
+        );
+        // The client disconnects: nothing billable was released unpaid.
+        drop(metered);
+
+        let state = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 0);
+        assert_eq!(
+            session.finalize_params(&channel_id).await.unwrap().settled,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn below_threshold_tail_is_released_after_final_commit() {
+        let (session, _store, channel_id, handle, meter) =
+            client_voucher_stream(10, "stream-tail-secret").await;
+        let upstream = futures_util::stream::iter([
+            Ok::<_, reqwest::Error>(Bytes::from_static(b"pa")),
+            Ok::<_, reqwest::Error>(Bytes::from_static(b"id")),
+        ]);
+        let metered = meter_response_stream(upstream, meter, false);
+        futures_util::pin_mut!(metered);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err()
+        );
+        // Vouchers below min_voucher_delta are rejected, so the client covers
+        // the tail with one delta-sized commit.
+        let voucher = handle.voucher_header(10).await.unwrap();
+        session.process(&voucher).await.unwrap();
+
+        let mut served = Vec::new();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(1), metered.next())
+            .await
+            .unwrap()
+        {
+            served.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(served, b"paid");
+        assert_eq!(session.committed_watermark(&channel_id), Some(10));
+    }
+
+    #[tokio::test]
+    async fn committed_ahead_usage_streams_without_holding() {
+        let (session, _store, _channel_id, handle, meter) =
+            client_voucher_stream(10, "stream-ahead-secret").await;
+        let voucher = handle.voucher_header(100).await.unwrap();
+        session.process(&voucher).await.unwrap();
+        let upstream =
+            futures_util::stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"paid"))])
+                .chain(futures_util::stream::pending());
+        let metered = meter_response_stream(upstream, meter, false);
+        futures_util::pin_mut!(metered);
+
+        let released = tokio::time::timeout(Duration::from_secs(1), metered.next())
+            .await
+            .expect("prepaid usage must not be held")
+            .unwrap()
+            .unwrap();
+        assert_eq!(released, Bytes::from_static(b"paid"));
     }
 }

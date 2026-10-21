@@ -10,8 +10,9 @@
 //! 1. Server returns 402 with session challenge (intent="session")
 //! 2. Client builds a challenge-bound open transaction and sends the `open`
 //!    action; the server verifies, broadcasts, and confirms it
-//! 3. Client-signed channels send voucher_header(cost) per request;
-//!    operator-signed channels send use_header() and the operator meters
+//! 3. Client-signed channels send voucher_header(cost) per request and
+//!    record_voucher() once the server accepts it; operator-signed channels
+//!    send use_header() and the operator meters
 //! 4. When done: close_header() triggers on-chain settlement
 //! ```
 
@@ -38,8 +39,9 @@ pub use pay_kit::mpp::client::session::ActiveSession as RawSession;
 /// each call.
 ///
 /// `SessionHandle` is `Clone` and `Send + Sync` — safe to share across async
-/// tasks (e.g., a middleware that reuses the same channel for all in-flight
-/// requests to the same server).
+/// tasks. Client vouchers advance the watermark only through
+/// [`Self::record_voucher`], so concurrent requests sign the same voucher and
+/// the server accepts it once; a rejected request never raises what settles.
 #[derive(Clone)]
 pub struct SessionHandle {
     inner: Arc<Mutex<ActiveSession>>,
@@ -106,17 +108,36 @@ impl SessionHandle {
         self
     }
 
-    /// Build an `Authorization` header carrying a voucher for `amount` base units.
-    ///
-    /// Increments the cumulative watermark by `amount`. Call this before every
-    /// metered API request on a client-signed channel.
+    /// Build an `Authorization` header carrying a voucher for `amount` base
+    /// units above the recorded watermark, without advancing it. Call
+    /// [`Self::record_voucher`] with the header once the server accepts the
+    /// request; until then every call re-signs the same voucher.
     pub async fn voucher_header(&self, amount: u64) -> Result<String> {
-        let mut session = self.inner.lock().await;
+        let session = self.inner.lock().await;
         let action = session
-            .voucher_action(amount)
+            .prepare_voucher_action(amount)
             .await
             .map_err(|e| Error::Mpp(format!("Failed to sign voucher: {e}")))?;
         build_header(&self.challenge, &action)
+    }
+
+    /// Advance the watermark to the voucher in `header` (from
+    /// [`Self::voucher_header`]) after the server accepted it.
+    pub async fn record_voucher(&self, header: &str) -> Result<()> {
+        let credential = pay_kit::mpp::parse_authorization(header)
+            .map_err(|e| Error::Mpp(format!("Invalid voucher header: {e}")))?;
+        let Ok(SessionAction::Voucher(payload)) =
+            serde_json::from_value::<SessionAction>(credential.payload)
+        else {
+            return Err(Error::Mpp("header does not carry a session voucher".into()));
+        };
+        let mut session = self.inner.lock().await;
+        if payload.voucher.data.channel_id != session.channel_id_str() {
+            return Err(Error::Mpp("voucher belongs to another channel".into()));
+        }
+        session
+            .record_voucher(&payload.voucher)
+            .map_err(|e| Error::Mpp(format!("Failed to record voucher: {e}")))
     }
 
     /// Build an `Authorization` header for a metered request on an
@@ -506,20 +527,7 @@ pub fn open_operator_signed_session_authorizations(
         )));
     }
 
-    let minimum = request
-        .minimum_deposit
-        .as_deref()
-        .map(parse_session_deposit)
-        .transpose()?
-        .unwrap_or(0);
-    let deposit = request
-        .suggested_deposit
-        .as_deref()
-        .map(parse_session_deposit)
-        .transpose()?
-        .unwrap_or(1_000_000)
-        .max(minimum)
-        .max(1);
+    let deposit = operator_session_deposit(&request)?;
     let sandbox = network_override == Some("localnet");
     let (handle, open_authorization) = open_payment_channel_session_header_with_override(
         challenge,
@@ -538,6 +546,24 @@ pub fn open_operator_signed_session_authorizations(
         .map_err(|error| Error::Mpp(format!("Failed to build runtime: {error}")))?;
     let use_authorization = runtime.block_on(handle.use_header())?;
     Ok((open_authorization, use_authorization))
+}
+
+/// Base-unit deposit an operator-signed session open locks for `request`.
+pub fn operator_session_deposit(request: &SessionRequest) -> Result<u64> {
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(0);
+    Ok(request
+        .suggested_deposit
+        .as_deref()
+        .map(parse_session_deposit)
+        .transpose()?
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1))
 }
 
 fn parse_session_deposit(value: &str) -> Result<u64> {
@@ -860,7 +886,11 @@ mod tests {
             _ => panic!("expected open action"),
         }
 
-        let voucher = parse_action(&handle.voucher_header(125).await.unwrap());
+        let header = handle.voucher_header(125).await.unwrap();
+        // Signing alone never advances what settles.
+        assert_eq!(handle.cumulative().await, 0);
+        handle.record_voucher(&header).await.unwrap();
+        let voucher = parse_action(&header);
         match voucher {
             SessionAction::Voucher(payload) => {
                 assert_eq!(payload.voucher.data.channel_id, channel_id_str);
@@ -899,7 +929,8 @@ mod tests {
         let (voucher_key, signer) = test_keypair();
         let handle =
             SessionHandle::new(channel_id, signer, challenge).with_voucher_key(voucher_key);
-        handle.voucher_header(100).await.unwrap();
+        let header = handle.voucher_header(100).await.unwrap();
+        handle.record_voucher(&header).await.unwrap();
 
         let close = parse_action(&handle.close_header(None).await.unwrap());
         let SessionAction::Close(payload) = close else {
@@ -933,6 +964,41 @@ mod tests {
         };
         assert!(payload.voucher.is_none());
         assert_eq!(payload.authentication, Some(proof));
+    }
+
+    #[tokio::test]
+    async fn concurrent_vouchers_sign_one_increment_until_recorded() {
+        let (voucher_key, signer) = test_keypair();
+        let handle = SessionHandle::new(Pubkey::new_unique(), signer, test_challenge("session"))
+            .with_voucher_key(voucher_key);
+        let cumulative = |header: &str| match parse_action(header) {
+            SessionAction::Voucher(payload) => payload.voucher.data.cumulative_amount,
+            _ => panic!("expected voucher action"),
+        };
+        let (first, second) = tokio::join!(handle.voucher_header(10), handle.voucher_header(10));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        // Both in-flight requests carry the same voucher: the server accepts
+        // it once, so the rejected one cannot raise the settled watermark.
+        assert_eq!(cumulative(&first), "10");
+        assert_eq!(cumulative(&second), "10");
+        assert_eq!(handle.cumulative().await, 0);
+
+        handle.record_voucher(&first).await.unwrap();
+        assert_eq!(handle.cumulative().await, 10);
+        // The duplicate cannot be recorded twice; the next request advances.
+        assert!(handle.record_voucher(&second).await.is_err());
+        assert_eq!(cumulative(&handle.voucher_header(10).await.unwrap()), "20");
+    }
+
+    #[tokio::test]
+    async fn record_voucher_rejects_foreign_headers() {
+        let challenge = test_challenge("session");
+        let handle = SessionHandle::new(Pubkey::new_unique(), test_signer(), challenge.clone());
+        let other = SessionHandle::new(Pubkey::new_unique(), test_signer(), challenge);
+        let foreign = other.voucher_header(10).await.unwrap();
+        assert!(handle.record_voucher(&foreign).await.is_err());
+        assert!(handle.record_voucher("Payment garbage").await.is_err());
+        assert_eq!(handle.cumulative().await, 0);
     }
 
     #[test]

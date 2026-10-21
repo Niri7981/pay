@@ -61,6 +61,12 @@ pub struct Config {
     /// independently of `/v1/send`'s hot wallet.
     #[serde(default)]
     pub push: PushConfig,
+
+    /// Shared MPP replay store (`redis://` / `rediss://`, or the explicit
+    /// single-process `memory://`). Required while send, subscriptions or
+    /// channels is enabled. Falls back to `PAY_MPP_REDIS_URL`.
+    #[serde(default)]
+    pub mpp_store_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -102,6 +108,39 @@ pub struct SendConfig {
 
     #[serde(default)]
     pub fee_refund_split: FeeRefundSplitConfig,
+
+    /// Base64 of the confidential mint's 64-byte auditor ElGamal keypair
+    /// (`pubkey || secret`). Lets confidential settlement decrypt the
+    /// transfer's auditor ciphertext and enforce the challenged amount.
+    #[serde(default)]
+    pub confidential_auditor: Option<String>,
+
+    /// Settle confidential sends whose amount cannot be decrypted. Their
+    /// responses are marked `amountVerified: false`. Mutually exclusive with
+    /// `confidential_auditor`.
+    #[serde(default)]
+    pub accept_unverified_confidential_amount: bool,
+}
+
+impl SendConfig {
+    /// The decoded auditor keypair, when configured.
+    pub fn confidential_auditor_bytes(&self) -> Result<Option<[u8; 64]>, String> {
+        use base64::Engine;
+        let Some(encoded) = self
+            .confidential_auditor
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| "send.confidential_auditor must be base64".to_string())?;
+        <[u8; 64]>::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| "send.confidential_auditor must decode to 64 bytes".to_string())
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -134,6 +173,8 @@ impl Default for SendConfig {
             sol_price_asset: default_sol_price_asset(),
             fee_payer: FeePayerConfig::default(),
             fee_refund_split: FeeRefundSplitConfig::default(),
+            confidential_auditor: None,
+            accept_unverified_confidential_amount: false,
         }
     }
 }
@@ -561,6 +602,18 @@ fn validate_campaign_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_confidential_amount_policy(send: &SendConfig) -> Result<(), String> {
+    let auditor = send.confidential_auditor_bytes()?;
+    if auditor.is_some() && send.accept_unverified_confidential_amount {
+        return Err(
+            "send.confidential_auditor and send.accept_unverified_confidential_amount are \
+             mutually exclusive"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_redemption_config(redemption: &RedemptionConfig) -> Result<(), String> {
     if redemption.network != Network::Mainnet {
         return Err(
@@ -729,6 +782,7 @@ impl Config {
         cfg.apply_send_env();
         cfg.apply_rpc_url_env();
         cfg.apply_redemption_env()?;
+        cfg.apply_mpp_store_env();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -825,6 +879,26 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    fn apply_mpp_store_env(&mut self) {
+        if self
+            .mpp_store_url
+            .as_deref()
+            .is_none_or(|url| url.trim().is_empty())
+            && let Ok(url) = std::env::var("PAY_MPP_REDIS_URL")
+            && !url.trim().is_empty()
+        {
+            self.mpp_store_url = Some(url.trim().to_string());
+        }
+    }
+
+    /// The replay store URL, when configured.
+    pub fn mpp_store_url(&self) -> Option<&str> {
+        self.mpp_store_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
     }
 
     fn apply_send_env(&mut self) {
@@ -975,6 +1049,7 @@ impl Config {
             if self.send.sol_price_asset.trim().is_empty() {
                 return Err(ConfigError::Invalid("send.sol_price_asset is empty".into()));
             }
+            validate_confidential_amount_policy(&self.send).map_err(ConfigError::Invalid)?;
         }
         if self.redemption.enabled {
             validate_redemption_config(&self.redemption).map_err(ConfigError::Invalid)?;
@@ -1007,6 +1082,13 @@ impl Config {
                     "send.fee_payer.pubkey is required when redemption.enabled is true".into(),
                 ));
             }
+        }
+        if (self.send.enabled || self.subscriptions.enabled || self.channels.enabled)
+            && self.mpp_store_url().is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "mpp_store_url is required when send, subscriptions or channels is enabled".into(),
+            ));
         }
         if self.subscriptions.enabled {
             if self
@@ -1226,6 +1308,79 @@ mod tests {
         let error = parse_redemption_secret(r#"{"version":2,"campaigns":[]}"#)
             .expect_err("unknown version must fail");
         assert!(error.contains("unsupported redemption campaign document version 2"));
+    }
+
+    fn enabled_send_config() -> super::Config {
+        serde_json::from_value(serde_json::json!({
+            "networks": { "mainnet": { "rpc_url": "http://rpc" } },
+            "stablecoins": [{ "symbol": "USDC", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "token_program": "spl_token", "decimals": 6 }],
+            "mpp_store_url": "redis://127.0.0.1/",
+            "send": {
+                "enabled": true,
+                "mpp_challenge_binding_secret": "secret",
+                "fee_payer": { "key_name": "key", "pubkey": "pubkey" }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn send_requires_a_shared_store_and_one_amount_policy() {
+        use base64::Engine;
+        enabled_send_config()
+            .validate()
+            .expect("baseline validates");
+
+        let mut config = enabled_send_config();
+        config.mpp_store_url = Some(" ".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("mpp_store_url is required"), "{error}");
+        for endpoint in ["subscriptions", "channels"] {
+            let mut value = serde_json::json!({
+                "networks": { "mainnet": { "rpc_url": "http://rpc" } },
+                "stablecoins": [{ "symbol": "USDC", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "token_program": "spl_token", "decimals": 6 }],
+            });
+            value[endpoint] = serde_json::json!({ "enabled": true });
+            let mut config: super::Config = serde_json::from_value(value).unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("mpp_store_url is required"),
+                "{endpoint}: {error}"
+            );
+            config.mpp_store_url = Some("redis://127.0.0.1/".into());
+            let error = config
+                .validate()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(!error.contains("mpp_store_url"), "{endpoint}: {error}");
+        }
+
+        let auditor = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
+        let mut config = enabled_send_config();
+        config.send.confidential_auditor = Some(auditor.clone());
+        config.validate().expect("auditor alone validates");
+        assert_eq!(
+            config.send.confidential_auditor_bytes(),
+            Ok(Some([1u8; 64]))
+        );
+
+        config.send.accept_unverified_confidential_amount = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("mutually exclusive"), "{error}");
+
+        let mut config = enabled_send_config();
+        config.send.accept_unverified_confidential_amount = true;
+        config.validate().expect("explicit opt-in alone validates");
+
+        for bad in [
+            "not base64!",
+            &base64::engine::general_purpose::STANDARD.encode([1u8; 63]),
+        ] {
+            let mut config = enabled_send_config();
+            config.send.confidential_auditor = Some(bad.to_string());
+            assert!(config.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -105,6 +105,7 @@ struct Context {
     permissions: Option<Arc<McpPermissions>>,
     timeout: Duration,
     config_error: bool,
+    controller: Option<Arc<dyn pay_mcp::controlled::ControlledExecution>>,
     outbound_policy: pay_core::client::fetch::OutboundPolicy,
 }
 impl Context {
@@ -130,6 +131,7 @@ impl Context {
             permissions: None,
             timeout: Duration::from_secs(2),
             config_error: false,
+            controller: None,
             outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         }
     }
@@ -158,7 +160,12 @@ impl PayContext for Context {
             ));
         }
         Ok(self.authority.as_ref().map(|a| {
-            AuthorityBinding::new("trusted-agent-42", a.clone()).with_timeout(self.timeout)
+            let binding =
+                AuthorityBinding::new("trusted-agent-42", a.clone()).with_timeout(self.timeout);
+            match &self.controller {
+                Some(controller) => binding.with_controlled_execution(controller.clone()),
+                None => binding,
+            }
         }))
     }
 }
@@ -643,18 +650,230 @@ async fn failed_context_and_forged_caller_are_not_authorization_fallbacks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn canonical_yaml_rejection_remains_fail_closed_without_a_fallback() {
+async fn canonical_yaml_reaches_authority_after_sdk_network_normalization() {
     let m = Merchant::new("exact").await;
-    let a = Authority::new(Decision::Allow);
+    let a = Authority::new(Decision::Deny);
     let mut c = Context::new(Some(a.clone()));
     c.permissions = Some(Arc::new(
         McpPermissions::from_config(&serde_yml::from_str("max_payment: '$1.00'").unwrap()).unwrap(),
     ));
     let c = Arc::new(c);
     let result = call(c.clone(), args(&m.url, Some("existing-yaml-rejection"))).await;
-    assert!(text(&result).contains("invalid Solana network"));
-    assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+    assert!(text(&result).contains("DENIED"));
+    assert_eq!(a.calls.load(Ordering::SeqCst), 1);
     assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
     assert_eq!(c.approval.load(Ordering::SeqCst), 0);
     assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+}
+
+struct Controller {
+    mode: &'static str,
+    plans: AtomicUsize,
+    executions: AtomicUsize,
+    facts: Mutex<Vec<pay_mcp::controlled::ControlledRequest>>,
+}
+impl Controller {
+    fn new(mode: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            plans: AtomicUsize::new(0),
+            executions: AtomicUsize::new(0),
+            facts: Mutex::new(Vec::new()),
+        })
+    }
+    fn response(&self) -> pay_mcp::controlled::ControlledResponse {
+        pay_mcp::controlled::ControlledResponse {
+            status: if self.mode == "invalid-response" {
+                0
+            } else {
+                200
+            },
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: if self.mode == "large-response" {
+                vec![0; 65_537]
+            } else {
+                b"{\"fixture\":\"controller-delivery\"}".to_vec()
+            },
+        }
+    }
+}
+impl pay_mcp::controlled::ControlledExecution for Controller {
+    fn plan(
+        &self,
+        request: &pay_mcp::controlled::ControlledRequest,
+    ) -> pay_core::Result<pay_mcp::controlled::ExecutionPlan> {
+        self.plans.fetch_add(1, Ordering::SeqCst);
+        self.facts.lock().unwrap().push(request.clone());
+        if self.mode == "plan-error" {
+            return Err(pay_core::Error::PaymentRejected(
+                "CONTROLLER_UNAVAILABLE".into(),
+            ));
+        }
+        if self.mode == "replay" || self.mode == "invalid-response" || self.mode == "large-response"
+        {
+            return Ok(pay_mcp::controlled::ExecutionPlan::Replay {
+                response: self.response(),
+            });
+        }
+        Ok(pay_mcp::controlled::ExecutionPlan::Build {
+            payer: "Vote111111111111111111111111111111111111111".into(),
+            rpc_url: "http://127.0.0.1:0".into(),
+            lifetime: Some(pay_mcp::controlled::ControlledLifetime {
+                recent_blockhash: if self.mode == "changed-blockhash" {
+                    "SysvarRent111111111111111111111111111111111"
+                } else {
+                    "11111111111111111111111111111111"
+                }
+                .into(),
+                last_valid_block_height: 1,
+            }),
+        })
+    }
+    fn execute(
+        &self,
+        request: &pay_mcp::controlled::ControlledRequest,
+        unsigned: pay_mcp::controlled::UnsignedPayment,
+    ) -> pay_core::Result<pay_mcp::controlled::ControlledResponse> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(request.spend.caller_id, "trusted-agent-42");
+        let tx = pay_kit::core::tx::decode(&unsigned.transaction).unwrap();
+        assert!(
+            tx.signatures
+                .iter()
+                .all(|signature| signature.as_ref().iter().all(|byte| *byte == 0))
+        );
+        assert_eq!(
+            tx.message.recent_blockhash().to_string(),
+            "11111111111111111111111111111111"
+        );
+        assert_eq!(
+            request.payment_required["accepts"][0],
+            request.spend.accepted
+        );
+        if self.mode == "execute-error" {
+            return Err(pay_core::Error::PaymentRejected(
+                "CONTROLLER_LOST_REPLY".into(),
+            ));
+        }
+        Ok(self.response())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn controlled_builder_and_replay_never_load_pay_accounts_or_send_paid_http() {
+    for mode in ["build", "replay"] {
+        let merchant = Merchant::new("exact").await;
+        let authority = Authority::new(Decision::Allow);
+        let controller = Controller::new(mode);
+        let mut context = Context::new(Some(authority.clone()));
+        context.controller = Some(controller.clone());
+        let context = Arc::new(context);
+        let result = call(context.clone(), args(&merchant.url, Some("controlled"))).await;
+        assert_eq!(result.is_error, Some(false), "{}", text(&result));
+        assert!(text(&result).contains("controller-delivery"));
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.plans.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            controller.executions.load(Ordering::SeqCst),
+            usize::from(mode == "build")
+        );
+        assert_eq!(merchant.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
+        assert_eq!(context.store.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(context.approval.load(Ordering::SeqCst), 0);
+        let facts = controller.facts.lock().unwrap();
+        assert_eq!(
+            facts[0].spend.request.body.as_ref().unwrap(),
+            br#"{"query":"fixture"}"#
+        );
+        assert_eq!(facts[0].payment_required["resource"]["url"], merchant.url);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn controlled_errors_and_lost_reply_are_terminal_without_wallet_fallback() {
+    for mode in [
+        "plan-error",
+        "execute-error",
+        "changed-blockhash",
+        "invalid-response",
+        "large-response",
+    ] {
+        let merchant = Merchant::new("exact").await;
+        let controller = Controller::new(mode);
+        let mut context = Context::new(Some(Authority::new(Decision::Allow)));
+        context.controller = Some(controller.clone());
+        let context = Arc::new(context);
+        let result = call(context.clone(), args(&merchant.url, Some("terminal"))).await;
+        assert_eq!(result.is_error, Some(true), "{mode}: {}", text(&result));
+        assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
+        assert_eq!(context.store.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(context.approval.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authority_denial_and_yaml_limits_still_precede_controlled_execution() {
+    for deny in [true, false] {
+        let merchant = Merchant::new("exact-with-cluster").await;
+        let controller = Controller::new("replay");
+        let mut context = Context::new(Some(Authority::new(if deny {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        })));
+        context.controller = Some(controller.clone());
+        if !deny {
+            context.permissions = Some(Arc::new(
+                McpPermissions::from_config(&serde_yml::from_str("max_payment: '$0.001'").unwrap())
+                    .unwrap(),
+            ));
+        }
+        let result = call(Arc::new(context), args(&merchant.url, Some("gated"))).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(controller.plans.load(Ordering::SeqCst), 0);
+        assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
+    }
+}
+
+// This literal is intentionally the exact pre-custody public shape used by
+// external authority providers (including the separate remote-provider PR).
+#[test]
+fn spending_authority_request_remains_source_compatible() {
+    let _ = SpendRequest {
+        operation_id: "operation".into(),
+        attempt_id: "attempt".into(),
+        caller_id: "caller".into(),
+        request: pay_mcp::authority::ImmutableRequest {
+            method: "GET".into(),
+            url: "https://example.com".into(),
+            headers: vec![],
+            body: None,
+        },
+        amount_atomic: "1".into(),
+        asset: "asset".into(),
+        network: "network".into(),
+        execution_network: "mainnet".into(),
+        recipient: "recipient".into(),
+        accepted: json!({}),
+    };
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn controlled_probe_preserves_redirect_protocol_and_free_response_behavior() {
+    for mode in ["redirect", "v1", "mpp", "free"] {
+        let merchant = Merchant::new(mode).await;
+        let authority = Authority::new(Decision::Allow);
+        let controller = Controller::new("replay");
+        let mut context = Context::new(Some(authority.clone()));
+        context.controller = Some(controller.clone());
+        let context = Arc::new(context);
+        let result = call(context.clone(), args(&merchant.url, Some("probe-policy"))).await;
+        assert_eq!(result.is_error, Some(mode != "free"));
+        assert_eq!(controller.plans.load(Ordering::SeqCst), 0);
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
+        assert_eq!(context.store.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(context.approval.load(Ordering::SeqCst), 0);
+    }
 }

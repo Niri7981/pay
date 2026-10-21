@@ -272,7 +272,7 @@ fn charge_build_options(
         max_tx_version,
         expected_network: Some(network.to_string()),
         // Split ATA rent would be spent outside the approved amount.
-        allow_payer_funded_ata_creation: false,
+        payer_funded_ata_creation: pay_kit::mpp::client::PayerFundedAtaCreation::Decline,
         ..Default::default()
     }
 }
@@ -760,7 +760,10 @@ mod tests {
     fn charge_options_pin_the_selected_network() {
         let options = charge_build_options("devnet", None);
         assert_eq!(options.expected_network.as_deref(), Some("devnet"));
-        assert!(!options.allow_payer_funded_ata_creation);
+        assert_eq!(
+            options.payer_funded_ata_creation,
+            pay_kit::mpp::client::PayerFundedAtaCreation::Decline
+        );
     }
 
     #[test]
@@ -816,10 +819,7 @@ mod tests {
             None,
         )
         .expect_err("payer-funded split ATA rent must be refused");
-        assert!(
-            err.to_string().contains("allow_payer_funded_ata_creation"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("this client declines"), "{err}");
         // Control: with a server fee payer funding the rent, the guard
         // does not apply (any remaining failure is unrelated, e.g. RPC).
         let result = build_credential_with_override(
@@ -831,10 +831,7 @@ mod tests {
             None,
         );
         if let Err(err) = result {
-            assert!(
-                !err.to_string().contains("allow_payer_funded_ata_creation"),
-                "{err}"
-            );
+            assert!(!err.to_string().contains("this client declines"), "{err}");
         }
     }
 

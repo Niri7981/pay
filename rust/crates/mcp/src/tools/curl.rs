@@ -1421,14 +1421,21 @@ fn do_paid_fetch(
                 account_override = selected;
             }
             let built_payment = scope.with_approval(peer.as_ref(), |auth| {
-                pay_core::client::x402::build_payment_for_attempt(
+                pay_core::client::x402::build_payment_for_attempt_with_rpc(
                     &challenge,
                     store,
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
                     auth,
-                    Some(&attempt),
+                    pay_core::client::x402::ExactPaymentExecution {
+                        attempt: Some(&attempt),
+                        rpc: scope.rpc_url_override.as_ref().map(|url| {
+                            pay_kit::x402::solana_rpc_client::rpc_client::RpcClient::new(
+                                url.clone(),
+                            )
+                        }),
+                    },
                 )
             })?;
 
@@ -2797,8 +2804,9 @@ mod external_authority_cache_tests {
             outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         };
         let cache = SessionCache::default();
+        let payer = session_payer(scope.accounts.as_ref(), None, None);
         cache.store(
-            session_cache_key("", "GET", &url).unwrap(),
+            session_cache_key(&payer, "GET", &url).unwrap(),
             "must-not-be-attached".into(),
         );
         let attempt = cache

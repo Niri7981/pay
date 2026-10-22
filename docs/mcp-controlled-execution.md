@@ -12,8 +12,9 @@ external authority allow, Pay calls the controller on curl's blocking worker:
 1. `plan(&ControlledRequest)` returns `Build` or `Replay`.
 2. For `Build`, Pay calls pay-kit's existing exact unsigned builder with the host's
    public payer key and the selected requirement. A supplied lifetime must agree
-   with any challenge blockhash. Missing blockhash or mint decimals can cause SDK
-   RPC reads through the host-configured URL; supply both to avoid those reads.
+   with any challenge blockhash. The SDK checks a supplied blockhash against the
+   host-configured RPC and rejects it if not live on that cluster. Missing
+   blockhashes or mint decimals are fetched through that RPC as well.
 3. `execute(request, unsigned)` transfers only unsigned bytes to the controller.
    The controller independently validates the message, signs, persists original
    evidence, starts the final paid HTTP and reconciles its original payment.

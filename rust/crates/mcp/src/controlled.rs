@@ -39,7 +39,8 @@ pub struct ControlledLifetime {
 #[derive(Serialize, Deserialize)]
 pub enum ExecutionPlan {
     /// Trusted host configuration, never accepted as curl tool arguments. Missing
-    /// blockhash/decimals may cause the SDK to read this RPC endpoint.
+    /// decimals are resolved through this RPC; blockhashes are always fetched or
+    /// checked for validity on this endpoint.
     Build {
         payer: String,
         rpc_url: String,

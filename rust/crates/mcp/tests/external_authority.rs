@@ -99,6 +99,7 @@ impl ApprovalPolicy for Approval {
     }
 }
 struct Context {
+    rpc: Arc<Controller>,
     authority: Option<Arc<Authority>>,
     store: Arc<Store>,
     approval: Arc<AtomicUsize>,
@@ -122,6 +123,7 @@ impl Context {
             .or_default()
             .insert("fixture".into(), ephemeral.account);
         Self {
+            rpc: Controller::new("build"),
             authority,
             store: Arc::new(Store {
                 inner: MemoryAccountsStore::with_file(file),
@@ -142,7 +144,7 @@ impl PayContext for Context {
             accounts: self.store.clone(),
             network_override: None,
             account_override: Some("fixture".into()),
-            rpc_url_override: None,
+            rpc_url_override: Some(self.rpc.rpc_url.clone()),
             approval: Arc::new(Approval(self.approval.clone())),
             payment_permissions: self.permissions.clone(),
             body_files: false,
@@ -650,7 +652,7 @@ async fn failed_context_and_forged_caller_are_not_authorization_fallbacks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn canonical_yaml_reaches_authority_after_sdk_network_normalization() {
+async fn canonical_yaml_reaches_authority_after_network_normalization() {
     let m = Merchant::new("exact").await;
     let a = Authority::new(Decision::Deny);
     let mut c = Context::new(Some(a.clone()));
@@ -658,7 +660,11 @@ async fn canonical_yaml_reaches_authority_after_sdk_network_normalization() {
         McpPermissions::from_config(&serde_yml::from_str("max_payment: '$1.00'").unwrap()).unwrap(),
     ));
     let c = Arc::new(c);
-    let result = call(c.clone(), args(&m.url, Some("existing-yaml-rejection"))).await;
+    let result = call(
+        c.clone(),
+        args(&m.url, Some("canonical-yaml-authority-denial")),
+    )
+    .await;
     assert!(text(&result).contains("DENIED"));
     assert_eq!(a.calls.load(Ordering::SeqCst), 1);
     assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
@@ -668,14 +674,79 @@ async fn canonical_yaml_reaches_authority_after_sdk_network_normalization() {
 
 struct Controller {
     mode: &'static str,
+    rpc_url: String,
+    rpc_calls: Arc<AtomicUsize>,
+    rpc_task: tokio::task::JoinHandle<()>,
     plans: AtomicUsize,
     executions: AtomicUsize,
     facts: Mutex<Vec<pay_mcp::controlled::ControlledRequest>>,
 }
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.rpc_task.abort();
+    }
+}
 impl Controller {
     fn new(mode: &'static str) -> Arc<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let rpc_calls = Arc::new(AtomicUsize::new(0));
+        let calls = rpc_calls.clone();
+        let rpc_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let end = loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(i) = raw.windows(4).position(|x| x == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = std::str::from_utf8(&raw[..end]).unwrap();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while raw.len() - end < length {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                let request: Value = serde_json::from_slice(&raw[end..end + length]).unwrap();
+                // This fixture permits only the unsigned builder's read operation.
+                assert_eq!(request["method"], "isBlockhashValid");
+                assert_eq!(request["params"][0], "11111111111111111111111111111111");
+                calls.fetch_add(1, Ordering::SeqCst);
+                let mut response = json!({"jsonrpc":"2.0", "id":request["id"]});
+                if mode == "rpc-error" {
+                    response["error"] = json!({"code":-32600,"message":"fixture RPC failure"});
+                } else {
+                    response["result"] =
+                        json!({"context":{"slot":1},"value":mode != "invalid-blockhash"});
+                }
+                let body = response.to_string();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
         Arc::new(Self {
             mode,
+            rpc_url,
+            rpc_calls,
+            rpc_task,
             plans: AtomicUsize::new(0),
             executions: AtomicUsize::new(0),
             facts: Mutex::new(Vec::new()),
@@ -717,7 +788,7 @@ impl pay_mcp::controlled::ControlledExecution for Controller {
         }
         Ok(pay_mcp::controlled::ExecutionPlan::Build {
             payer: "Vote111111111111111111111111111111111111111".into(),
-            rpc_url: "http://127.0.0.1:0".into(),
+            rpc_url: self.rpc_url.clone(),
             lifetime: Some(pay_mcp::controlled::ControlledLifetime {
                 recent_blockhash: if self.mode == "changed-blockhash" {
                     "SysvarRent111111111111111111111111111111111"
@@ -777,6 +848,10 @@ async fn controlled_builder_and_replay_never_load_pay_accounts_or_send_paid_http
             controller.executions.load(Ordering::SeqCst),
             usize::from(mode == "build")
         );
+        assert_eq!(
+            controller.rpc_calls.load(Ordering::SeqCst),
+            usize::from(mode == "build")
+        );
         assert_eq!(merchant.probes.load(Ordering::SeqCst), 1);
         assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
         assert_eq!(context.store.reads.load(Ordering::SeqCst), 0);
@@ -796,6 +871,8 @@ async fn controlled_errors_and_lost_reply_are_terminal_without_wallet_fallback()
         "plan-error",
         "execute-error",
         "changed-blockhash",
+        "invalid-blockhash",
+        "rpc-error",
         "invalid-response",
         "large-response",
     ] {
@@ -806,6 +883,13 @@ async fn controlled_errors_and_lost_reply_are_terminal_without_wallet_fallback()
         let context = Arc::new(context);
         let result = call(context.clone(), args(&merchant.url, Some("terminal"))).await;
         assert_eq!(result.is_error, Some(true), "{mode}: {}", text(&result));
+        if matches!(mode, "invalid-blockhash" | "rpc-error") {
+            assert!(text(&result).contains("UNSIGNED_PREPARE_FAILED"));
+            assert_eq!(controller.rpc_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(controller.executions.load(Ordering::SeqCst), 0);
+        } else if mode == "execute-error" {
+            assert_eq!(controller.executions.load(Ordering::SeqCst), 1);
+        }
         assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
         assert_eq!(context.store.reads.load(Ordering::SeqCst), 0);
         assert_eq!(context.approval.load(Ordering::SeqCst), 0);

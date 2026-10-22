@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use pay_core::accounts::{Account, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK};
-use pay_core::keystore::{AuthGate, AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
+use pay_core::keystore::{AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
 use pay_core::remote::{CredentialSource, Credentials, MemoryCredentials};
 use pay_mcp::context::{CallScope, PayContext};
-use pay_mcp::policy::{MemoryLedger, PolicyApproval, PolicyGate, SpendLedger, SpendPolicy};
+use pay_mcp::policy::{
+    MemoryLedger, PolicyApproval, PolicyGate, Reserved, SpendLedger, SpendPolicy,
+};
 use rmcp::service::{RequestContext, RoleServer};
 
 use crate::mcp::Tenant;
@@ -74,6 +76,12 @@ pub struct TenantRecord {
 }
 
 impl TenantRecord {
+    /// The spend-ledger key: the provider wallet, not the subject, so every
+    /// connection linked to one wallet shares one allowance.
+    pub fn ledger_key(&self) -> String {
+        format!("wallet:{}:{}", self.provider, self.wallet_id)
+    }
+
     /// The `accounts.yml` entry this tenant would have on a laptop: a remote
     /// account gated by policy (`auth_required` on, so the override applies).
     fn account(&self) -> Account {
@@ -102,11 +110,32 @@ struct LinkTicket {
     claimed: bool,
 }
 
+/// What a wallet has already paid out, from a record that outlives this
+/// process, so a restart cannot hand out a second daily allowance.
+#[async_trait::async_trait]
+pub trait SpendHistory: Send + Sync {
+    /// USD minor units `wallet` paid out in stablecoins during the current
+    /// UTC day. An error means unknown, and binding fails closed.
+    async fn spent_today(&self, wallet: &str) -> Result<u64, String>;
+}
+
+/// A history with a fixed answer, for tests.
+pub struct FixedHistory(pub u64);
+
+#[async_trait::async_trait]
+impl SpendHistory for FixedHistory {
+    async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+        Ok(self.0)
+    }
+}
+
 /// Every bound tenant, by subject, plus the link tickets outstanding.
 pub struct TenantRegistry {
     tenants: Mutex<HashMap<String, Arc<TenantRecord>>>,
     links: Mutex<HashMap<String, LinkTicket>>,
     provisioning: Mutex<HashSet<String>>,
+    /// Ledger keys whose spend before this process started is recorded.
+    seeded: Mutex<HashSet<String>>,
     ledger: Arc<dyn SpendLedger>,
     cookie_key: [u8; 32],
 }
@@ -115,7 +144,7 @@ pub struct TenantRegistry {
 /// provider actually returns a signature.
 pub struct SpendReservation {
     subject: String,
-    amount: u64,
+    reserved: Option<Reserved>,
     ledger: Arc<dyn SpendLedger>,
     committed: bool,
 }
@@ -128,8 +157,11 @@ impl SpendReservation {
 
 impl Drop for SpendReservation {
     fn drop(&mut self) {
-        if !self.committed {
-            self.ledger.release(&self.subject, self.amount);
+        if !self.committed
+            && let Some(reserved) = self.reserved
+        {
+            self.ledger
+                .release(&self.subject, reserved.day, reserved.amount);
         }
     }
 }
@@ -153,6 +185,7 @@ impl TenantRegistry {
             tenants: Mutex::default(),
             links: Mutex::default(),
             provisioning: Mutex::default(),
+            seeded: Mutex::default(),
             ledger,
             cookie_key,
         }
@@ -169,19 +202,38 @@ impl TenantRegistry {
         let whole = amount_minor / USD_MINOR_UNITS_PER_DOLLAR;
         let fraction = amount_minor % USD_MINOR_UNITS_PER_DOLLAR;
         let amount = format!("${whole}.{fraction:04}");
-        PolicyGate::new(&tenant.subject, tenant.policy, self.ledger.clone())
-            .authenticate(&AuthIntent::authorize_payment_details(
+        let key = tenant.ledger_key();
+        let reserved = PolicyGate::new(&key, tenant.policy, self.ledger.clone())
+            .reserve(&AuthIntent::authorize_payment_details(
                 &amount,
                 "hosted CLI transaction",
                 "connect.pay.sh",
             ))
             .map_err(|error| error.to_string())?;
         Ok(SpendReservation {
-            subject: tenant.subject.clone(),
-            amount: amount_minor,
+            subject: key,
+            reserved,
             ledger: self.ledger.clone(),
             committed: false,
         })
+    }
+
+    /// Record what `tenant`'s wallet already spent today before this process
+    /// saw it, once per wallet. The in-process ledger covers the rest.
+    pub async fn seed_spend(
+        &self,
+        tenant: &TenantRecord,
+        history: &dyn SpendHistory,
+    ) -> Result<(), String> {
+        let key = tenant.ledger_key();
+        if self.seeded.lock().unwrap().contains(&key) {
+            return Ok(());
+        }
+        let spent = history.spent_today(&tenant.pubkey).await?;
+        if self.seeded.lock().unwrap().insert(key.clone()) {
+            let _ = self.ledger.check_and_record(&key, spent, None);
+        }
+        Ok(())
     }
 
     fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
@@ -327,6 +379,20 @@ impl TenantRegistry {
 
     pub fn get(&self, subject: &str) -> Option<Arc<TenantRecord>> {
         self.tenants.lock().unwrap().get(subject).cloned()
+    }
+
+    /// Unbind every subject on one provider wallet; returns those subjects.
+    pub fn remove_wallet(&self, provider: &str, wallet_id: &str) -> Vec<String> {
+        let mut tenants = self.tenants.lock().unwrap();
+        let subjects: Vec<String> = tenants
+            .values()
+            .filter(|t| t.provider == provider && t.wallet_id == wallet_id)
+            .map(|t| t.subject.clone())
+            .collect();
+        for subject in &subjects {
+            tenants.remove(subject);
+        }
+        subjects
     }
 
     pub fn remove(&self, subject: &str) -> Option<Arc<TenantRecord>> {
@@ -533,6 +599,16 @@ impl CloudContext {
     }
 }
 
+impl CloudContext {
+    fn approval(&self, record: &TenantRecord) -> PolicyApproval {
+        PolicyApproval {
+            subject: record.ledger_key(),
+            policy: record.policy,
+            ledger: self.registry.ledger.clone(),
+        }
+    }
+}
+
 /// The tenant the bearer middleware attached to this request.
 fn tenant_of(call: &RequestContext<RoleServer>) -> Option<Tenant> {
     call.extensions
@@ -558,12 +634,10 @@ impl PayContext for CloudContext {
             network_override: Some(MAINNET_NETWORK.to_string()),
             account_override: Some(record.account_name.clone()),
             rpc_url_override: None,
-            approval: Arc::new(PolicyApproval {
-                subject: record.subject.clone(),
-                policy: record.policy,
-                ledger: self.registry.ledger.clone(),
-            }),
-            payment_permissions: None,
+            approval: Arc::new(self.approval(&record)),
+            // Fail closed on challenge-selected terms: mainnet stablecoins
+            // only, before any payment is built or signed.
+            payment_permissions: Some(Arc::new(pay_mcp::McpPermissions::hosted())),
             // The server has no access to the caller's files.
             body_files: false,
             // Arbitrary public APIs remain available, but tenant-controlled
@@ -760,15 +834,155 @@ mod tests {
 
         {
             let _failed = registry.reserve_cli_transaction(&tenant, 10_000).unwrap();
-            assert_eq!(ledger.spent_today("sub_1"), 10_000);
+            assert_eq!(ledger.spent_today(&tenant.ledger_key()), 10_000);
         }
-        assert_eq!(ledger.spent_today("sub_1"), 0);
+        assert_eq!(ledger.spent_today(&tenant.ledger_key()), 0);
 
         registry
             .reserve_cli_transaction(&tenant, 10_000)
             .unwrap()
             .commit();
-        assert_eq!(ledger.spent_today("sub_1"), 10_000);
+        assert_eq!(ledger.spent_today(&tenant.ledger_key()), 10_000);
+    }
+
+    #[test]
+    fn a_prior_day_failed_reservation_does_not_erase_new_day_spend() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let day = Arc::new(AtomicU64::new(100));
+        let clock_day = day.clone();
+        let ledger = Arc::new(MemoryLedger::with_clock(Arc::new(move || {
+            clock_day.load(Ordering::SeqCst)
+        })));
+        let registry = TenantRegistry::with_ledger(ledger.clone());
+        let mut tenant = record("sub_1");
+        tenant.policy = SpendPolicy {
+            per_call_ceiling: Some(100_000),
+            daily_cap: Some(100_000),
+        };
+
+        let failed = registry.reserve_cli_transaction(&tenant, 60_000).unwrap();
+        day.store(101, Ordering::SeqCst);
+        registry
+            .reserve_cli_transaction(&tenant, 60_000)
+            .unwrap()
+            .commit();
+        drop(failed);
+        assert_eq!(ledger.spent_today(&tenant.ledger_key()), 60_000);
+        assert!(
+            registry.reserve_cli_transaction(&tenant, 100_000).is_err(),
+            "the committed day-101 spend still counts against the cap"
+        );
+        registry
+            .reserve_cli_transaction(&tenant, 40_000)
+            .unwrap()
+            .commit();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_registry_counts_what_the_wallet_already_spent() {
+        // Before the restart: the full $5 daily cap is spent.
+        let before = TenantRegistry::new();
+        let tenant = record("sub_1");
+        for _ in 0..5 {
+            before
+                .reserve_cli_transaction(&tenant, 10_000)
+                .unwrap()
+                .commit();
+        }
+        assert!(before.reserve_cli_transaction(&tenant, 1).is_err());
+
+        // After it: the chain says $5 left the wallet today.
+        let after = TenantRegistry::new();
+        after
+            .seed_spend(&tenant, &FixedHistory(50_000))
+            .await
+            .unwrap();
+        assert!(after.reserve_cli_transaction(&tenant, 1).is_err());
+        // Seeding happens once; a later login does not double count.
+        let partial = TenantRegistry::new();
+        partial
+            .seed_spend(&tenant, &FixedHistory(30_000))
+            .await
+            .unwrap();
+        partial
+            .seed_spend(&tenant, &FixedHistory(30_000))
+            .await
+            .unwrap();
+        partial
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
+        partial
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
+        assert!(partial.reserve_cli_transaction(&tenant, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_history_seeds_nothing_and_retries() {
+        struct Down;
+        #[async_trait::async_trait]
+        impl SpendHistory for Down {
+            async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+                Err("rpc down".into())
+            }
+        }
+        let registry = TenantRegistry::new();
+        let tenant = record("sub_1");
+        assert!(registry.seed_spend(&tenant, &Down).await.is_err());
+        registry
+            .seed_spend(&tenant, &FixedHistory(50_000))
+            .await
+            .unwrap();
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+    }
+
+    #[test]
+    fn linked_subjects_share_one_wallet_allowance() {
+        let registry = TenantRegistry::new();
+        let stable = record("sub_owner");
+        // What `link_complete` binds: the stable record under a guest subject.
+        let mut guest_one = stable.clone();
+        guest_one.subject = "guest_one".to_string();
+        let mut guest_two = stable.clone();
+        guest_two.subject = "guest_two".to_string();
+
+        // $1 per call, $5 per day, across every alias of the wallet.
+        for tenant in [&stable, &guest_one, &guest_two, &guest_one, &stable] {
+            registry
+                .reserve_cli_transaction(tenant, 10_000)
+                .unwrap()
+                .commit();
+        }
+        for tenant in [&stable, &guest_one, &guest_two] {
+            assert!(registry.reserve_cli_transaction(tenant, 1).is_err());
+        }
+
+        // A different wallet has its own allowance.
+        let mut other = record("guest_three");
+        other.wallet_id = "acc_2".to_string();
+        registry
+            .reserve_cli_transaction(&other, 10_000)
+            .unwrap()
+            .commit();
+    }
+
+    #[test]
+    fn hosted_mcp_approval_shares_the_cli_wallet_allowance() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let registry = Arc::new(TenantRegistry::with_ledger(ledger.clone()));
+        let context = CloudContext::new(registry.clone());
+        let stable = record("sub_owner");
+        let mut guest = stable.clone();
+        guest.subject = "guest_one".to_string();
+        let approval = context.approval(&guest);
+        assert_eq!(approval.subject, stable.ledger_key());
+        registry
+            .reserve_cli_transaction(&stable, 10_000)
+            .unwrap()
+            .commit();
+        assert_eq!(ledger.spent_today(&approval.subject), 10_000);
     }
 
     // ── Through /mcp ───────────────────────────────────────────────────

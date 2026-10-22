@@ -49,6 +49,9 @@ const TX = {
     /** SPL TransferChecked (disc=12), 1 USDC. Accounts: [sender, senderATA, recipientATA, splToken, tokenProg] */
     SPL_TRANSFER_CHECKED:
         'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIF253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuNicctxGUdrncy4pSly24NYezTDOv+u5FxoObmmc7sj0Oin7ibcocRFXdbqWkgitQB9+5rV3DjkEl8IvjO3CCBTBpuIV/6rgYT7aH9jRhjANdrEOdwa6ztVmKDwAAAAAAEG3fbh12Whk9nL4UbO63msHLSF7V9bN5E6jPWFfv8AqQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQEAQMCAAoMQEIPAAAAAAAG',
+    /** SPL Transfer (disc=3), 1 token. Accounts: [sender, senderATA, recipientATA, tokenProg] */
+    SPL_TRANSFER:
+        'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAEE253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuNicctxGUdrncy4pSly24NYezTDOv+u5FxoObmmc7sj0Oin7ibcocRFXdbqWkgitQB9+5rV3DjkEl8IvjO3CCBTBt324ddloZPZy+FGzut5rBy0he1fWzeROoz1hX7/AKkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEDAwECAAkDQEIPAAAAAAA=',
     /** SPL TransferChecked but with system program (wrong). */
     SPL_WRONG_PROGRAM:
         'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAIF253ynD68LT6pZYKXCxW2ZdXbKibEiRnYD8UPXLZkNuNicctxGUdrncy4pSly24NYezTDOv+u5FxoObmmc7sj0Oin7ibcocRFXdbqWkgitQB9+5rV3DjkEl8IvjO3CCBTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGm4hX/quBhPtof2NGGMA12sQ53BrrO1WYoPAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQMEAQQCAAoMQEIPAAAAAAAG',
@@ -333,6 +336,73 @@ describe('validateTransfer', () => {
                     splToken: ADDRESSES.sender, // wrong mint
                 }),
             ).rejects.toThrow('invalid transfer');
+        });
+    });
+
+    describe.each([
+        { instruction: 'Transfer', base64Tx: TX.SPL_TRANSFER },
+        { instruction: 'TransferChecked', base64Tx: TX.SPL_TRANSFER_CHECKED },
+    ])('SPL $instruction recipient balances', ({ base64Tx }) => {
+        it('accepts a recipient token account created by the transaction', async () => {
+            const response = makeSPLResponse({ base64Tx });
+            // RPC records token balances, but this account did not exist before
+            // the transaction. Its amount and decimals are in the post entry.
+            response.meta.preTokenBalances = [];
+            const rpc = createMockRpc(response);
+            await expect(
+                validateTransfer(rpc, SIGNATURE, {
+                    recipient: ADDRESSES.recipient,
+                    amount: 1,
+                    splToken: ADDRESSES.splToken,
+                }),
+            ).resolves.toBe(response);
+        });
+
+        it('rejects an underpaid newly created recipient account', async () => {
+            const response = makeSPLResponse({ base64Tx, postAmount: '999999' });
+            response.meta.preTokenBalances = [];
+            await expect(
+                validateTransfer(createMockRpc(response), SIGNATURE, {
+                    recipient: ADDRESSES.recipient,
+                    amount: 1,
+                    splToken: ADDRESSES.splToken,
+                }),
+            ).rejects.toThrow('amount not transferred');
+        });
+
+        it('keeps the existing recipient balance when calculating the increase', async () => {
+            const response = makeSPLResponse({ base64Tx, preAmount: '1000000', postAmount: '1500000' });
+            await expect(
+                validateTransfer(createMockRpc(response), SIGNATURE, {
+                    recipient: ADDRESSES.recipient,
+                    amount: 1,
+                    splToken: ADDRESSES.splToken,
+                }),
+            ).rejects.toThrow('amount not transferred');
+        });
+
+        it.each(['preTokenBalances', 'postTokenBalances'])('rejects missing %s metadata', async field => {
+            const response = makeSPLResponse({ base64Tx });
+            Reflect.deleteProperty(response.meta, field);
+            await expect(
+                validateTransfer(createMockRpc(response), SIGNATURE, {
+                    recipient: ADDRESSES.recipient,
+                    amount: 1,
+                    splToken: ADDRESSES.splToken,
+                }),
+            ).rejects.toThrow('missing balance data');
+        });
+
+        it('rejects a missing recipient post-balance entry', async () => {
+            const response = makeSPLResponse({ base64Tx });
+            response.meta.postTokenBalances = [];
+            await expect(
+                validateTransfer(createMockRpc(response), SIGNATURE, {
+                    recipient: ADDRESSES.recipient,
+                    amount: 1,
+                    splToken: ADDRESSES.splToken,
+                }),
+            ).rejects.toThrow('missing balance data');
         });
     });
 

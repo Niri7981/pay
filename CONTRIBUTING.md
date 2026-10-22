@@ -45,7 +45,19 @@ just ts test               # Run tests
 just ts test-watch         # Run tests in watch mode
 ```
 
+## Correctness by construction
+
+Payment code fails open in subtle ways: a check at one call site gets skipped by a sibling path, a second replica, a later refactor, or another SDK. Fix the class, not the instance:
+
+- **Make invalid states unrepresentable.** Validate once at the boundary into a newtype with a private constructor (parse, don't validate). Prefer enums to bool/`Option` flags. No `Default` for security-relevant config.
+- **Make required steps unskippable.** If B must follow check A, have A return a value (guard, token, proof) that B takes as an argument: a lock guard to write a journal, a reservation token to commit, a "not landed" proof to replace a transaction.
+- **Put atomicity in the contract.** Check-and-reserve belongs inside one storage operation, not in callers. Every implementation of a storage trait runs the same shared test suite.
+- **Cover every exit path.** Metering, settlement and cleanup that must happen run from a guard/`Drop` or a spawned task that a cancelled request cannot drop.
+- **Enforce, don't document.** Prefer a compile error, then a test that fails in default CI, then a comment.
+- **Pin behaviour across crates.** When pay relies on a pay-kit invariant, add a test on the pay side too, so a pay-kit bump that weakens it fails here.
+
 ## Before Submitting
 
 - Run `just ci` (full lint, typecheck, test, build for both Rust and TypeScript)
 - Use [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `chore:`, etc.)
+- Behavioural fixes ship with a regression test that fails before the change, plus a positive control.

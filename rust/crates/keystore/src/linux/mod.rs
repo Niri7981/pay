@@ -14,21 +14,16 @@ const POLKIT_ACTION_DELETE: &str = "sh.pay.delete-keypair";
 const POLKIT_ACTION_SESSION: &str = "sh.pay.open-session";
 const POLKIT_ACTION_GATEWAY_FEE_PAYER: &str = "sh.pay.use-gateway-fee-payer";
 const POLKIT_ACTION_USE: &str = "sh.pay.use-keypair";
-const LEGACY_POLKIT_ACTION: &str = "sh.pay.unlock-keypair";
 
 pub struct Polkit;
 
 impl AuthGate for Polkit {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
+        // Only the typed action carries the operation and payment bucket the
+        // user is approving; a missing one fails closed with install guidance
+        // instead of falling back to a generic prompt.
         let action = polkit_action_for_intent(intent);
-        run(async move {
-            match polkit_authenticate(action).await {
-                Err(e) if action != LEGACY_POLKIT_ACTION && is_missing_action(&e) => {
-                    polkit_authenticate(LEGACY_POLKIT_ACTION).await
-                }
-                result => result,
-            }
-        })
+        run(polkit_authenticate(action))
     }
 
     fn is_available(&self) -> bool {
@@ -128,7 +123,7 @@ fn polkit_action_for_intent(intent: &AuthIntent) -> &'static str {
         AuthIntent::DeleteAccount(_) => POLKIT_ACTION_DELETE,
         AuthIntent::OpenSession(_) => POLKIT_ACTION_SESSION,
         AuthIntent::UseGatewayFeePayer(_) => POLKIT_ACTION_GATEWAY_FEE_PAYER,
-        AuthIntent::UseAccount(_) => POLKIT_ACTION_USE,
+        AuthIntent::UseAccount(_) | AuthIntent::SignIn(_) => POLKIT_ACTION_USE,
     }
 }
 
@@ -160,10 +155,6 @@ fn missing_action_error(action: &str) -> Error {
          \x20 sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy \\\n\
          \x20      /usr/share/polkit-1/actions/"
     ))
-}
-
-fn is_missing_action(error: &Error) -> bool {
-    matches!(error, Error::Backend(msg) if msg.contains("is not installed"))
 }
 
 fn process_start_time() -> Result<u64> {
@@ -656,6 +647,43 @@ mod tests {
             )),
             POLKIT_ACTION_SESSION
         );
+    }
+
+    #[test]
+    fn every_typed_action_is_declared_by_the_embedded_policy() {
+        const POLICY: &str = include_str!("../../../../config/polkit/sh.pay.unlock-keypair.policy");
+        let mut intents = vec![
+            AuthIntent::default_payment(),
+            AuthIntent::create_account("a"),
+            AuthIntent::from_reason("import the \"a\" payment account"),
+            AuthIntent::from_reason("export the \"a\" payment account"),
+            AuthIntent::from_reason("delete the \"a\" payment account"),
+            AuthIntent::from_reason("authorize opening a pay session"),
+            AuthIntent::from_reason("use your pay account as the gateway fee payer"),
+            AuthIntent::use_account("read"),
+            AuthIntent::sign_in("sign in to merchant.example"),
+        ];
+        for amount in [
+            "$0.0001", "$0.001", "$0.005", "$0.01", "$0.05", "$0.10", "$0.50", "$1", "$2", "$5",
+            "$10", "$15", "$20", "$25", "$50", "$51",
+        ] {
+            intents.push(AuthIntent::authorize_payment(amount, "api"));
+        }
+        for intent in &intents {
+            let action = polkit_action_for_intent(intent);
+            assert_ne!(action, "sh.pay.unlock-keypair", "{intent:?}");
+            assert!(
+                POLICY.contains(&format!("<action id=\"{action}\">")),
+                "{action} missing from the embedded policy"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_typed_action_names_it_and_how_to_install() {
+        let error = missing_action_error(POLKIT_ACTION_PAYMENT).to_string();
+        assert!(error.contains("sh.pay.authorize-payment"), "{error}");
+        assert!(error.contains("pay setup"), "{error}");
     }
 
     #[test]

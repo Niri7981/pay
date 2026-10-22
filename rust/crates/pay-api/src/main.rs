@@ -3,6 +3,7 @@ mod endpoints;
 mod observability;
 mod signer;
 mod state;
+mod store;
 mod telemetry;
 
 use std::sync::Arc;

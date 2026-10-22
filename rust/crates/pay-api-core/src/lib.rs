@@ -6,6 +6,8 @@ pub mod receipt;
 pub mod rpc;
 pub mod stablecoin;
 pub mod subscription_state;
+#[cfg(test)]
+mod test_rpc;
 pub mod token_metadata;
 pub mod transfer_batch;
 

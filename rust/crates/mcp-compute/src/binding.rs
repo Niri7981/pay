@@ -22,6 +22,7 @@ pub struct DataBindingClient {
 #[derive(Serialize)]
 struct BindingRequest<'a> {
     payer: &'a str,
+    channel_id: &'a str,
     binding_name: &'a str,
     driver: &'a str,
     store_id: &'a str,
@@ -118,6 +119,7 @@ impl DataBindingClient {
             }
             let request = BindingRequest {
                 payer: &tenant.payer,
+                channel_id: &tenant.channel_id,
                 binding_name: &binding.name,
                 driver: &binding.service.driver,
                 store_id: &binding.service.id,

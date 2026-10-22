@@ -208,6 +208,10 @@ fn build_state(
                 network: "localnet".to_string(),
                 rpc_url: Some(rpc_url.to_string()),
                 challenge_binding_secret: Some("bench-rehearsal-secret-not-for-prod!".to_string()),
+                realm: Some(pay_core::server::payment::recipient_derived_charge_realm(
+                    recipient,
+                )),
+                store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
                 ..Default::default()
             })
             .map_err(|e| anyhow::anyhow!("mpp config: {e}"))?;
@@ -647,8 +651,9 @@ mod tests {
         let (challenge, _) = SessionHandle::parse_challenge(&header).unwrap();
         let request: pay_kit::mpp::SessionRequest = challenge.request.decode().unwrap();
         assert_eq!(request.currency, local_usdc_currency().unwrap());
+        let price: u64 = request.amount.parse().unwrap();
         let handle = seeded_session::handle_for_challenge(&cfg.run.name, 0, challenge).unwrap();
-        let voucher = handle.voucher_header(1).await.unwrap();
+        let voucher = handle.voucher_header(price).await.unwrap();
         let response = client
             .post(format!("{}/v1/charge", proxy.url))
             .header("host", HOST_HEADER)

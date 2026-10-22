@@ -7,6 +7,16 @@ pub struct Tenant {
     pub key: String,
     /// Payment channel funding resources created by this control-plane call.
     pub channel_id: String,
+    /// Store incarnation pinned by a runtime capability, if any.
+    pub binding: Option<StoreBinding>,
+}
+
+/// Runtime capabilities authorize one store incarnation, not a reusable name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreBinding {
+    pub generation: String,
+    /// Lease key of the channel that funded the bound store.
+    pub channel_lease: String,
 }
 
 fn default_driver() -> String {

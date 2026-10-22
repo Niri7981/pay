@@ -2,7 +2,7 @@ use crate::server::accounting::{AccountingKey, AccountingStore};
 use http::HeaderMap;
 use pay_types::metering::{
     AccountingMode, ApiSpec, BillingUnit, CompareOp, Endpoint, MeterCondition, MeterDimension,
-    MeterDirection, MeterVariant, Metering, MissingUsagePolicy, PriceTier, UsageMeter,
+    MeterDirection, MeterVariant, Metering, MissingUsagePolicy, PriceTier, SplitRule, UsageMeter,
     UsageMeterSource,
 };
 use serde::{Deserialize, Serialize};
@@ -96,15 +96,17 @@ pub fn find_endpoint<'a>(api: &'a ApiSpec, method: &str, path: &str) -> Option<&
 
 /// Find an endpoint by path only (ignoring HTTP method).
 /// Used for browser payment links where the browser sends GET to a POST endpoint.
+/// Literal paths win over `{param}` / `{*rest}` patterns, as in [`find_endpoint`].
 pub fn find_endpoint_by_path<'a>(api: &'a ApiSpec, path: &str) -> Option<&'a Endpoint> {
     api.endpoints
         .iter()
-        .find(|e| e.path == path || path_matches(&e.path, path))
+        .find(|e| e.path == path)
+        .or_else(|| api.endpoints.iter().find(|e| path_matches(&e.path, path)))
 }
 
 /// Match a path pattern like "v1beta/models/{modelsId}:generateContent"
 /// against a concrete path like "v1beta/models/gemini-2.0-flash:generateContent".
-fn path_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern_parts: Vec<&str> = pattern.split('/').collect();
     let path_parts: Vec<&str> = path.split('/').collect();
 
@@ -200,6 +202,86 @@ pub fn resolve_price(
     None
 }
 
+/// Resolve the price a fixed per-call scheme (MPP charge, x402 exact, x402
+/// batch) charges. Those schemes authorize before the request body is read,
+/// so only a path-derived hint can select a variant; otherwise the body may
+/// select any variant and the most expensive candidate is charged.
+///
+/// Errors when a dimension is aggregate-settled (tokens, quota units, or a
+/// response meter): its quantity is unknown before authorization.
+pub fn resolve_fixed_price(
+    metering: &Metering,
+    props: &RequestProperties,
+    variant_hint: Option<&str>,
+) -> Result<Option<ResolvedPrice>, String> {
+    if let Some(dim) = metering
+        .dimensions
+        .iter()
+        .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter()))
+        .find(|dim| dim.is_aggregate_settled())
+    {
+        return Err(format!(
+            "{:?} {:?} usage is metered from the response and cannot be charged per call",
+            dim.direction, dim.unit
+        ));
+    }
+    let dimensions = fixed_charge_dimensions(metering, props, variant_hint);
+    if dimensions.is_empty() {
+        return Ok(resolve_price(metering, props, variant_hint, None));
+    }
+    Ok(Some(resolve_dimensions_as(
+        dimensions,
+        props,
+        None,
+        Unmeasured::Costliest,
+    )))
+}
+
+fn fixed_charge_dimensions<'a>(
+    metering: &'a Metering,
+    props: &RequestProperties,
+    variant_hint: Option<&str>,
+) -> &'a [MeterDimension] {
+    if metering.variants.is_empty() {
+        return &metering.dimensions;
+    }
+    if variant_hint.is_some() {
+        if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
+            return &variant.dimensions;
+        }
+        if !metering.dimensions.is_empty() {
+            return &metering.dimensions;
+        }
+    }
+    metering
+        .variants
+        .iter()
+        .map(|variant| variant.dimensions.as_slice())
+        .chain(Some(metering.dimensions.as_slice()).filter(|dims| !dims.is_empty()))
+        .max_by(|a, b| {
+            let usd = |dims| {
+                per_call_usd(&resolve_dimensions_as(
+                    dims,
+                    props,
+                    None,
+                    Unmeasured::Costliest,
+                ))
+            };
+            usd(a).total_cmp(&usd(b))
+        })
+        .unwrap_or(&metering.dimensions)
+}
+
+/// Per-call USD amount charged for a resolved fixed price: every dimension
+/// contributes its unit price.
+pub fn per_call_usd(price: &ResolvedPrice) -> f64 {
+    price
+        .dimensions
+        .iter()
+        .map(|d| d.price_usd / d.scale.max(1) as f64)
+        .sum()
+}
+
 pub fn effective_dimensions<'a>(
     metering: &'a Metering,
     variant_hint: Option<&str>,
@@ -219,17 +301,18 @@ pub fn effective_dimensions<'a>(
     &metering.dimensions
 }
 
-pub fn upto_max_usd(metering: &Metering, resolved_price: Option<&ResolvedPrice>) -> f64 {
-    metering
-        .upto
-        .as_ref()
-        .and_then(|upto| upto.max_usd)
-        .or_else(|| {
-            resolved_price
-                .and_then(|p| p.dimensions.first())
-                .map(|d| d.price_usd / d.scale.max(1) as f64)
-        })
-        .unwrap_or(0.01)
+/// The authorized `x402-upto` ceiling: `upto.max_usd`, or the legacy
+/// single-dimension unit price. `None` when several dimensions are priced
+/// without an explicit ceiling, since no one unit price bounds their sum.
+pub fn upto_max_usd(metering: &Metering, resolved_price: Option<&ResolvedPrice>) -> Option<f64> {
+    if let Some(max_usd) = metering.upto.as_ref().and_then(|upto| upto.max_usd) {
+        return Some(max_usd);
+    }
+    match resolved_price.map(|p| p.dimensions.as_slice()) {
+        Some([d]) => Some(d.price_usd / d.scale.max(1) as f64),
+        Some([]) | None => Some(0.01),
+        Some(_) => None,
+    }
 }
 
 pub fn upto_min_usd(metering: &Metering) -> Option<f64> {
@@ -355,8 +438,17 @@ pub fn upto_actual_amount_from_response(
     let units_per_usd = max_amount as f64 / plan.ceiling_usd;
     Ok(UptoActualAmount {
         usd,
-        base_units: ((usd * units_per_usd).round() as u64).min(max_amount),
+        base_units: usd_to_base_units(usd, units_per_usd, max_amount),
     })
+}
+
+/// Convert measured USD to base units, rounding to nearest like the session
+/// meter, except that positive usage never rounds down to zero.
+fn usd_to_base_units(usd: f64, units_per_usd: f64, max_amount: u64) -> u64 {
+    if usd <= 0.0 || !usd.is_finite() {
+        return 0;
+    }
+    ((usd * units_per_usd).round().max(1.0) as u64).min(max_amount)
 }
 
 fn clamp_actual_usd(metering: &Metering, actual_usd: f64, ceiling_usd: f64) -> f64 {
@@ -432,14 +524,15 @@ fn extract_and_price_usage(
             extract_dimension_quantity(dim, preset, &priced_props, headers, json, inferred_usage)
         };
         // Stream usage is cumulative, not additive. Providers may report input
-        // and output in different events; use the last observation of each.
+        // and output in different events; a later lower record never lowers
+        // the served quantity, so use the highest observation of each.
         let quantity = json
             .iter()
-            .rev()
-            .find_map(|json| extract(Some(json)).ok())
+            .filter_map(|json| extract(Some(json)).ok())
+            .max_by(f64::total_cmp)
             .map(Ok)
             .unwrap_or_else(|| extract(None))?;
-        total += quantity as f64 / dim.scale.max(1) as f64 * price;
+        total += quantity / dim.scale.max(1) as f64 * price;
     }
     Ok(total)
 }
@@ -570,6 +663,20 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     value.saturating_add(divisor.saturating_sub(1)) / divisor.max(1)
 }
 
+/// Units billed in whole counts; a fractional quantity for these is invalid
+/// rather than rounded (a `0.49` request must not price as zero).
+fn is_count_unit(unit: BillingUnit) -> bool {
+    !matches!(
+        unit,
+        BillingUnit::Minutes
+            | BillingUnit::Hours
+            | BillingUnit::Seconds
+            | BillingUnit::Gibibytes
+            | BillingUnit::Tebibytes
+            | BillingUnit::Vcpu
+    )
+}
+
 fn extract_dimension_quantity(
     dim: &MeterDimension,
     preset: Option<&str>,
@@ -577,12 +684,30 @@ fn extract_dimension_quantity(
     headers: &HeaderMap,
     json: Option<&serde_json::Value>,
     inferred_usage: Option<&crate::InferenceUsage>,
-) -> Result<u64, UptoUsageError> {
+) -> Result<f64, UptoUsageError> {
+    let quantity = extract_raw_quantity(dim, preset, props, headers, json, inferred_usage)?;
+    if is_count_unit(dim.unit) && quantity.fract() != 0.0 {
+        return Err(UptoUsageError::InvalidUsage(format!(
+            "fractional usage {quantity} for {:?} {:?}",
+            dim.direction, dim.unit
+        )));
+    }
+    Ok(quantity)
+}
+
+fn extract_raw_quantity(
+    dim: &MeterDimension,
+    preset: Option<&str>,
+    props: &RequestProperties,
+    headers: &HeaderMap,
+    json: Option<&serde_json::Value>,
+    inferred_usage: Option<&crate::InferenceUsage>,
+) -> Result<f64, UptoUsageError> {
     // Observer token counts take precedence for token dimensions.
     if let Some(usage) = inferred_usage
         && let Some(quantity) = inferred_quantity_for_dim(usage, dim, props)
     {
-        return Ok(quantity);
+        return Ok(quantity as f64);
     }
     // A response-header meter is already explicit and does not require
     // buffering a JSON body. Endpoint presets only disambiguate inherited
@@ -621,15 +746,20 @@ fn extract_dimension_quantity(
                 dim.direction
             ))
         })?;
-        return Ok(ceil_div_u64(tokens, per_unit));
+        return Ok(ceil_div_u64(tokens, per_unit) as f64);
     }
 
     if dim.unit == BillingUnit::Tokens {
         let json =
             json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
-        return provider_token_quantity(json, dim.direction).ok_or_else(|| {
-            UptoUsageError::MissingUsage(format!("no token usage for {:?} tokens", dim.direction))
-        });
+        return provider_token_quantity(json, dim.direction)
+            .map(|tokens| tokens as f64)
+            .ok_or_else(|| {
+                UptoUsageError::MissingUsage(format!(
+                    "no token usage for {:?} tokens",
+                    dim.direction
+                ))
+            });
     }
 
     if let Some(path) = preset_json_path(preset, dim) {
@@ -639,7 +769,7 @@ fn extract_dimension_quantity(
     }
 
     if matches!(dim.direction, MeterDirection::Usage) && matches!(dim.unit, BillingUnit::Requests) {
-        return Ok(1);
+        return Ok(1.0);
     }
 
     Err(UptoUsageError::MissingUsage(format!(
@@ -663,7 +793,7 @@ fn extract_from_meter(
     meter: &UsageMeter,
     headers: &HeaderMap,
     json: Option<&serde_json::Value>,
-) -> Result<u64, UptoUsageError> {
+) -> Result<f64, UptoUsageError> {
     match meter.source {
         UsageMeterSource::ResponseJson => {
             let json = json
@@ -719,17 +849,17 @@ fn preset_json_path(preset: Option<&str>, dim: &MeterDimension) -> Option<&'stat
     None
 }
 
-fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<u64, UptoUsageError> {
+fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<f64, UptoUsageError> {
     let value = json
         .pointer(path)
         .ok_or_else(|| UptoUsageError::MissingUsage(format!("json path `{path}`")))?;
     match value {
         serde_json::Value::Number(n) => {
             if let Some(v) = n.as_u64() {
-                Ok(v)
+                Ok(v as f64)
             } else if let Some(v) = n.as_f64() {
                 if v.is_finite() && v >= 0.0 {
-                    Ok(v.round() as u64)
+                    Ok(v)
                 } else {
                     Err(UptoUsageError::InvalidUsage(format!(
                         "json path `{path}` is negative or non-finite"
@@ -748,16 +878,16 @@ fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<u64
     }
 }
 
-fn parse_usage_quantity(value: &str) -> Result<u64, UptoUsageError> {
+fn parse_usage_quantity(value: &str) -> Result<f64, UptoUsageError> {
     let trimmed = value.trim();
     if let Ok(v) = trimmed.parse::<u64>() {
-        return Ok(v);
+        return Ok(v as f64);
     }
     let v = trimmed
         .parse::<f64>()
         .map_err(|e| UptoUsageError::InvalidUsage(e.to_string()))?;
     if v.is_finite() && v >= 0.0 {
-        Ok(v.round() as u64)
+        Ok(v)
     } else {
         Err(UptoUsageError::InvalidUsage(
             "usage value is negative or non-finite".to_string(),
@@ -765,22 +895,40 @@ fn parse_usage_quantity(value: &str) -> Result<u64, UptoUsageError> {
     }
 }
 
-/// Resolve the effective split rules for a metering config.
-/// Per-tier splits override the metering-level splits.
-pub fn resolve_split_rules(metering: &Metering) -> &[pay_types::metering::SplitRule] {
-    // Check first tier for per-tier splits
-    let tier_splits = metering
-        .dimensions
-        .first()
-        .and_then(|d| d.tiers.first())
-        .map(|t| t.splits.as_slice())
-        .unwrap_or(&[]);
+/// Split rules for the tier a fixed per-call charge is priced at: the
+/// selected tier's override, else the metering-level splits. Uses the same
+/// variant and tier selection as [`resolve_fixed_price`].
+pub fn resolve_split_rules<'a>(
+    metering: &'a Metering,
+    props: &RequestProperties,
+    variant_hint: Option<&str>,
+) -> &'a [SplitRule] {
+    fixed_charge_dimensions(metering, props, variant_hint)
+        .iter()
+        .filter_map(|dimension| select_tier(dimension, props, Unmeasured::Costliest))
+        .map(|tier| tier.splits.as_slice())
+        .find(|splits| !splits.is_empty())
+        .unwrap_or(&metering.splits)
+}
 
-    if !tier_splits.is_empty() {
-        return tier_splits;
+/// Every split rule a metering config can apply, across tiers and variants.
+pub fn all_split_rules(metering: &Metering) -> impl Iterator<Item = &SplitRule> {
+    fn tier_splits(dimensions: &[MeterDimension]) -> impl Iterator<Item = &SplitRule> {
+        dimensions
+            .iter()
+            .flat_map(|dimension| dimension.tiers.iter())
+            .flat_map(|tier| tier.splits.iter())
     }
-
-    &metering.splits
+    metering
+        .splits
+        .iter()
+        .chain(tier_splits(&metering.dimensions))
+        .chain(
+            metering
+                .variants
+                .iter()
+                .flat_map(|variant| tier_splits(&variant.dimensions)),
+        )
 }
 
 /// After a request is forwarded, record the usage and return the actual price charged.
@@ -814,15 +962,21 @@ pub(crate) fn resolve_variant<'a>(
     variants: &'a [MeterVariant],
     hint: Option<&str>,
 ) -> Option<&'a MeterVariant> {
+    // The most specific (longest) contained value wins, so an exact value
+    // beats its prefixes and `gpt-4o` is never priced as `gpt-4`. Ties keep
+    // config order.
     let mut default = None;
+    let mut best: Option<&MeterVariant> = None;
     for variant in variants {
         if variant.value.eq_ignore_ascii_case("default") {
             default.get_or_insert(variant);
-        } else if hint.is_some_and(|hint| hint.contains(&variant.value)) {
-            return Some(variant);
+        } else if hint.is_some_and(|hint| hint.contains(&variant.value))
+            && best.is_none_or(|best| variant.value.len() > best.value.len())
+        {
+            best = Some(variant);
         }
     }
-    default
+    best.or(default)
 }
 
 fn resolve_dimensions(
@@ -830,10 +984,31 @@ fn resolve_dimensions(
     props: &RequestProperties,
     ctx: Option<&MeteringContext>,
 ) -> ResolvedPrice {
+    resolve_dimensions_as(dimensions, props, ctx, Unmeasured::Provisional)
+}
+
+/// How a tier condition on a request property that was not measured resolves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unmeasured {
+    /// Request-time estimate later corrected by response metering; only an
+    /// unknown `body_size`, which nothing measures later, is priced
+    /// conservatively.
+    Provisional,
+    /// Fixed per-call authorization: never repriced, so any unmeasured
+    /// condition prices the costliest tier.
+    Costliest,
+}
+
+fn resolve_dimensions_as(
+    dimensions: &[MeterDimension],
+    props: &RequestProperties,
+    ctx: Option<&MeteringContext>,
+    unmeasured: Unmeasured,
+) -> ResolvedPrice {
     let resolved = dimensions
         .iter()
         .map(|dim| {
-            let price = resolve_tier(&dim.tiers, props, ctx, dim);
+            let price = resolve_tier(&dim.tiers, props, ctx, unmeasured);
             ResolvedDimension {
                 direction: format!("{:?}", dim.direction).to_lowercase(),
                 unit: format!("{:?}", dim.unit).to_lowercase(),
@@ -852,7 +1027,7 @@ fn resolve_tier(
     tiers: &[PriceTier],
     props: &RequestProperties,
     ctx: Option<&MeteringContext>,
-    _dim: &MeterDimension,
+    unmeasured: Unmeasured,
 ) -> f64 {
     // If we have accounting context and tiers have up_to, resolve by cumulative usage
     let has_volume_tiers = tiers.iter().any(|t| t.up_to.is_some());
@@ -876,7 +1051,7 @@ fn resolve_tier(
         return first_non_free_price(tiers);
     }
 
-    select_price_tier_from_tiers(tiers, props)
+    select_price_tier_from_tiers(tiers, props, unmeasured)
         .map(|tier| tier.price_usd)
         .unwrap_or(0.0)
 }
@@ -885,6 +1060,14 @@ pub(crate) fn select_price_tier<'a>(
     dimension: &'a MeterDimension,
     props: &RequestProperties,
 ) -> Option<&'a PriceTier> {
+    select_tier(dimension, props, Unmeasured::Provisional)
+}
+
+fn select_tier<'a>(
+    dimension: &'a MeterDimension,
+    props: &RequestProperties,
+    unmeasured: Unmeasured,
+) -> Option<&'a PriceTier> {
     if dimension.tiers.iter().any(|tier| tier.up_to.is_some()) {
         return dimension
             .tiers
@@ -892,13 +1075,29 @@ pub(crate) fn select_price_tier<'a>(
             .find(|tier| tier.price_usd > 0.0)
             .or_else(|| dimension.tiers.first());
     }
-    select_price_tier_from_tiers(&dimension.tiers, props)
+    select_price_tier_from_tiers(&dimension.tiers, props, unmeasured)
 }
 
 fn select_price_tier_from_tiers<'a>(
     tiers: &'a [PriceTier],
     props: &RequestProperties,
+    unmeasured: Unmeasured,
 ) -> Option<&'a PriceTier> {
+    // A condition on a property that was not measured (e.g. a chunked body
+    // without Content-Length) must not silently select a cheaper tier.
+    let conservative = |condition: &MeterCondition| {
+        condition_property(condition, props).is_none()
+            && (unmeasured == Unmeasured::Costliest
+                || matches!(condition, MeterCondition::BodySize { .. }))
+    };
+    if tiers
+        .iter()
+        .any(|tier| tier.condition.as_ref().is_some_and(conservative))
+    {
+        return tiers
+            .iter()
+            .max_by(|a, b| a.price_usd.total_cmp(&b.price_usd));
+    }
     tiers
         .iter()
         .find(|tier| {
@@ -933,21 +1132,31 @@ fn first_non_free_price(tiers: &[PriceTier]) -> f64 {
         .unwrap_or(0.0)
 }
 
-pub(crate) fn evaluate_condition(condition: &MeterCondition, props: &RequestProperties) -> bool {
-    let (actual, op, threshold) = match condition {
-        MeterCondition::InputTokens { op, value } => (props.input_tokens, op, *value),
-        MeterCondition::InputCharacters { op, value } => (props.input_characters, op, *value),
-        MeterCondition::ContextLength { op, value } => (props.context_length, op, *value),
-        MeterCondition::BodySize { op, value } => (props.body_size, op, *value),
-        MeterCondition::DurationSeconds { op, value } => (props.duration_seconds, op, *value),
-        MeterCondition::BatchSize { op, value } => (props.batch_size, op, *value),
-        MeterCondition::ImagePixels { op, value } => (props.image_pixels, op, *value),
-    };
+fn condition_property(condition: &MeterCondition, props: &RequestProperties) -> Option<u64> {
+    match condition {
+        MeterCondition::InputTokens { .. } => props.input_tokens,
+        MeterCondition::InputCharacters { .. } => props.input_characters,
+        MeterCondition::ContextLength { .. } => props.context_length,
+        MeterCondition::BodySize { .. } => props.body_size,
+        MeterCondition::DurationSeconds { .. } => props.duration_seconds,
+        MeterCondition::BatchSize { .. } => props.batch_size,
+        MeterCondition::ImagePixels { .. } => props.image_pixels,
+    }
+}
 
-    let actual = match actual {
-        Some(v) => v,
-        // If we don't have the property, assume the condition doesn't apply (pass)
-        None => return true,
+/// Whether `condition` holds. An unmeasured property passes (provisional).
+pub(crate) fn evaluate_condition(condition: &MeterCondition, props: &RequestProperties) -> bool {
+    let (op, threshold) = match condition {
+        MeterCondition::InputTokens { op, value }
+        | MeterCondition::InputCharacters { op, value }
+        | MeterCondition::ContextLength { op, value }
+        | MeterCondition::BodySize { op, value }
+        | MeterCondition::DurationSeconds { op, value }
+        | MeterCondition::BatchSize { op, value }
+        | MeterCondition::ImagePixels { op, value } => (op, *value),
+    };
+    let Some(actual) = condition_property(condition, props) else {
+        return true;
     };
 
     match op {
@@ -1754,7 +1963,7 @@ mod tests {
         );
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
 
-        assert_eq!(upto_max_usd(&metering, price.as_ref()), 0.10);
+        assert_eq!(upto_max_usd(&metering, price.as_ref()), Some(0.10));
     }
 
     #[test]
@@ -1771,7 +1980,7 @@ mod tests {
         );
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
 
-        assert_eq!(upto_max_usd(&metering, price.as_ref()), 0.00002);
+        assert_eq!(upto_max_usd(&metering, price.as_ref()), Some(0.00002));
     }
 
     #[test]
@@ -2240,6 +2449,130 @@ mod tests {
         .unwrap();
         assert_eq!(high_actual.usd, 0.10);
         assert_eq!(high_actual.base_units, 100_000);
+    }
+
+    fn per_million_token_plan() -> UptoSettlementPlan {
+        let metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    0.10,
+                    Some(response_json("/usage/prompt_tokens")),
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    0.30,
+                    Some(response_json("/usage/completion_tokens")),
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.02),
+                ..Default::default()
+            }),
+        );
+        settlement_plan(metering, 0.02)
+    }
+
+    fn per_million_amount(body: &[u8]) -> u64 {
+        upto_actual_amount_from_response(
+            &per_million_token_plan(),
+            20_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap()
+        .base_units
+    }
+
+    #[test]
+    fn positive_sub_base_unit_usage_charges_at_least_one_base_unit() {
+        // 1 + 1 tokens = $0.0000004, i.e. 0.4 base units at six decimals.
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":1,"completion_tokens":1}}"#),
+            1
+        );
+        // 1.5 base units rounds half up.
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":3,"completion_tokens":4}}"#),
+            2
+        );
+    }
+
+    #[test]
+    fn exact_and_zero_usage_convert_without_rounding_up() {
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":1000,"completion_tokens":1000}}"#),
+            400
+        );
+        assert_eq!(
+            per_million_amount(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0}}"#),
+            0
+        );
+    }
+
+    #[test]
+    fn usd_to_base_units_never_exceeds_the_authorized_amount() {
+        assert_eq!(usd_to_base_units(1.0, 1_000_000.0, 20_000), 20_000);
+        assert_eq!(usd_to_base_units(f64::NAN, 1_000_000.0, 20_000), 0);
+        assert_eq!(usd_to_base_units(-1.0, 1_000_000.0, 20_000), 0);
+    }
+
+    fn sse_output_amount(body: &[u8]) -> u64 {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000_000,
+                1.0,
+                Some(response_json("/usage/completion_tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(1.0),
+                missing_usage: MissingUsagePolicy::Error,
+                ..Default::default()
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "text/event-stream".parse().unwrap(),
+        );
+        upto_actual_amount_from_response(
+            &settlement_plan(metering, 1.0),
+            1_000_000,
+            &headers,
+            Some(body),
+        )
+        .unwrap()
+        .base_units
+    }
+
+    #[test]
+    fn decreasing_cumulative_sse_usage_never_lowers_settlement() {
+        assert_eq!(
+            sse_output_amount(
+                b"data: {\"usage\":{\"completion_tokens\":1000}}\n\ndata: {\"usage\":{\"completion_tokens\":1}}\n\n"
+            ),
+            1_000
+        );
+    }
+
+    #[test]
+    fn increasing_cumulative_sse_usage_settles_the_final_total() {
+        assert_eq!(
+            sse_output_amount(
+                b"data: {\"usage\":{\"completion_tokens\":1}}\n\ndata: {\"usage\":{\"completion_tokens\":1000}}\n\n"
+            ),
+            1_000
+        );
+        assert_eq!(
+            sse_output_amount(b"data: {\"usage\":{\"completion_tokens\":1000}}\n\n"),
+            1_000
+        );
     }
 
     #[test]
@@ -2839,5 +3172,346 @@ mod tests {
 
         let expected = 12.0 / 1_000_000.0 * 0.10 + 214.0 / 1_000_000.0 * 0.30;
         assert!((actual.usd - expected).abs() < 1e-12, "usd={}", actual.usd);
+    }
+
+    fn yaml_metering(yaml: &str) -> Metering {
+        serde_yml::from_str(yaml).expect("metering parses")
+    }
+
+    fn request_variant(value: &str, price_usd: f64) -> String {
+        format!(
+            "  - param: model\n    value: {value}\n    dimensions:\n      - direction: usage\n        unit: requests\n        scale: 1\n        tiers: [{{price_usd: {price_usd}}}]\n"
+        )
+    }
+
+    #[test]
+    fn fixed_price_without_path_hint_charges_most_expensive_variant() {
+        let metering = yaml_metering(&format!(
+            "variants:\n{}{}{}",
+            request_variant("cheap", 0.01),
+            request_variant("premium", 0.10),
+            request_variant("default", 0.05),
+        ));
+        let props = RequestProperties::default();
+
+        let unhinted = resolve_fixed_price(&metering, &props, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(per_call_usd(&unhinted), 0.10);
+        // Request-time pricing (upto/session) still uses the default variant.
+        let legacy = resolve_price(&metering, &props, None, None).unwrap();
+        assert_eq!(per_call_usd(&legacy), 0.05);
+
+        let cheap = resolve_fixed_price(&metering, &props, Some("cheap"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(per_call_usd(&cheap), 0.01);
+        let other = resolve_fixed_price(&metering, &props, Some("unlisted"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(per_call_usd(&other), 0.05);
+    }
+
+    #[test]
+    fn fixed_price_includes_top_level_dimensions_as_candidates() {
+        let metering = yaml_metering(&format!(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{{price_usd: 0.25}}]\nvariants:\n{}",
+            request_variant("cheap", 0.01),
+        ));
+        let props = RequestProperties::default();
+
+        assert_eq!(
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, None)
+                    .unwrap()
+                    .unwrap()
+            ),
+            0.25
+        );
+        // A path hint that matches nothing uses the top-level backstop.
+        assert_eq!(
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, Some("x"))
+                    .unwrap()
+                    .unwrap()
+            ),
+            0.25
+        );
+        assert_eq!(
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, Some("cheap"))
+                    .unwrap()
+                    .unwrap()
+            ),
+            0.01
+        );
+    }
+
+    #[test]
+    fn fixed_price_unmatched_hint_without_fallback_charges_most_expensive_variant() {
+        let metering = yaml_metering(&format!(
+            "variants:\n{}{}",
+            request_variant("cheap", 0.01),
+            request_variant("premium", 0.10),
+        ));
+        let price = resolve_fixed_price(&metering, &RequestProperties::default(), Some("unlisted"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(per_call_usd(&price), 0.10);
+    }
+
+    #[test]
+    fn variant_selection_prefers_the_most_specific_value() {
+        for variants in [
+            vec![("gpt-4", 0.01), ("gpt-4o", 1.00)],
+            vec![("gpt-4o", 1.00), ("gpt-4", 0.01)],
+        ] {
+            let yaml = variants
+                .iter()
+                .map(|(value, price)| request_variant(value, *price))
+                .collect::<String>();
+            let metering = yaml_metering(&format!("variants:\n{yaml}"));
+            let price = |hint: &str| {
+                per_call_usd(
+                    &resolve_price(&metering, &RequestProperties::default(), Some(hint), None)
+                        .unwrap(),
+                )
+            };
+            assert_eq!(price("gpt-4o"), 1.00);
+            assert_eq!(price("gpt-4"), 0.01);
+            // Family matching still applies to dated or tagged aliases.
+            assert_eq!(price("gpt-4o-2024-08-06"), 1.00);
+            assert_eq!(price("gpt-4-turbo"), 0.01);
+            assert_eq!(price("v1/models/gpt-4o:generateContent"), 1.00);
+        }
+    }
+
+    #[test]
+    fn unmeasured_condition_property_prices_the_costliest_tier() {
+        let metering = yaml_metering(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers:\n      - price_usd: 0.01\n        condition: {field: body_size, op: \"<=\", value: 1048576}\n      - price_usd: 0.10\n        condition: {field: body_size, op: \">\", value: 1048576}\n",
+        );
+        let price = |body_size| {
+            let props = RequestProperties {
+                body_size,
+                ..Default::default()
+            };
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, None)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(price(None), 0.10);
+        assert_eq!(price(Some(1_048_577)), 0.10);
+        assert_eq!(price(Some(1_048_576)), 0.01);
+        assert_eq!(price(Some(0)), 0.01);
+    }
+
+    #[test]
+    fn fixed_price_does_not_assume_unmeasured_conditions_pass() {
+        let metering = yaml_metering(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers:\n      - price_usd: 0.01\n        condition: {field: context_length, op: \"<=\", value: 1000}\n      - price_usd: 0.05\n        condition: {field: context_length, op: \">\", value: 1000}\n",
+        );
+        let props = RequestProperties::default();
+        assert_eq!(
+            per_call_usd(
+                &resolve_fixed_price(&metering, &props, None)
+                    .unwrap()
+                    .unwrap()
+            ),
+            0.05
+        );
+        // Response-repriced paths keep their provisional estimate.
+        assert_eq!(
+            per_call_usd(&resolve_price(&metering, &props, None, None).unwrap()),
+            0.01
+        );
+    }
+
+    #[test]
+    fn upto_max_usd_requires_explicit_ceiling_for_multiple_dimensions() {
+        let dims = || {
+            vec![
+                usage_dim(MeterDirection::Usage, BillingUnit::Requests, 1, 0.01, None),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Bytes,
+                    1,
+                    1.00,
+                    Some(UsageMeter {
+                        source: UsageMeterSource::ResponseHeader,
+                        path: None,
+                        header: Some("x-usage-bytes".into()),
+                    }),
+                ),
+            ]
+        };
+        let implicit = upto_metering(dims(), None);
+        let price = resolve_price(&implicit, &RequestProperties::default(), None, None);
+        assert_eq!(upto_max_usd(&implicit, price.as_ref()), None);
+
+        let explicit = upto_metering(
+            dims(),
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(2.0),
+                ..Default::default()
+            }),
+        );
+        let price = resolve_price(&explicit, &RequestProperties::default(), None, None);
+        assert_eq!(upto_max_usd(&explicit, price.as_ref()), Some(2.0));
+    }
+
+    #[test]
+    fn fixed_price_sums_every_dimension() {
+        let metering = yaml_metering(
+            "dimensions:\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{price_usd: 0.001}]\n  - direction: usage\n    unit: requests\n    scale: 1\n    tiers: [{price_usd: 0.5}]\n",
+        );
+        let price = resolve_fixed_price(&metering, &RequestProperties::default(), None)
+            .unwrap()
+            .unwrap();
+        assert!((per_call_usd(&price) - 0.501).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fixed_price_rejects_aggregate_settled_dimensions() {
+        for dims in [
+            "  - direction: input\n    unit: tokens\n    scale: 1000000\n    tiers: [{price_usd: 1.0}]\n",
+            "  - direction: input\n    unit: quota_units\n    scale: 1\n    tiers: [{price_usd: 1.0}]\n",
+            "  - direction: output\n    unit: bytes\n    scale: 1\n    meter: {source: response_header, header: x-bytes}\n    tiers: [{price_usd: 1.0}]\n",
+        ] {
+            let top = yaml_metering(&format!("dimensions:\n{dims}"));
+            assert!(resolve_fixed_price(&top, &RequestProperties::default(), None).is_err());
+            let nested = dims
+                .replace("\n  ", "\n        ")
+                .replacen("  -", "        -", 1);
+            let variant = yaml_metering(&format!(
+                "variants:\n{}  - param: model\n    value: big\n    dimensions:\n{nested}",
+                request_variant("small", 0.01)
+            ));
+            assert!(
+                resolve_fixed_price(&variant, &RequestProperties::default(), Some("small"))
+                    .is_err()
+            );
+        }
+        let flat = yaml_metering(&format!("variants:\n{}", request_variant("small", 0.01)));
+        assert!(resolve_fixed_price(&flat, &RequestProperties::default(), None).is_ok());
+    }
+
+    fn fractional_plan(
+        unit: BillingUnit,
+        meter: UsageMeter,
+        policy: MissingUsagePolicy,
+    ) -> UptoSettlementPlan {
+        settlement_plan(
+            upto_metering(
+                vec![usage_dim(MeterDirection::Usage, unit, 1, 1.0, Some(meter))],
+                Some(pay_types::metering::UptoMetering {
+                    max_usd: Some(1.0),
+                    missing_usage: policy,
+                    ..Default::default()
+                }),
+            ),
+            1.0,
+        )
+    }
+
+    #[test]
+    fn fractional_count_usage_is_invalid_not_rounded_to_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-usage-units", HeaderValue::from_static("0.49"));
+        for (meter, headers, body) in [
+            (
+                response_json("/usage/units"),
+                HeaderMap::new(),
+                Some(br#"{"usage":{"units":0.49}}"#.as_slice()),
+            ),
+            (
+                response_json("/usage/units"),
+                HeaderMap::new(),
+                Some(br#"{"usage":{"units":"0.49"}}"#.as_slice()),
+            ),
+            (response_header("x-usage-units"), headers, None),
+        ] {
+            let error = upto_actual_amount_from_response(
+                &fractional_plan(
+                    BillingUnit::Requests,
+                    meter.clone(),
+                    MissingUsagePolicy::Error,
+                ),
+                1_000_000,
+                &headers,
+                body,
+            );
+            assert_eq!(error, Err(UptoUsageError::MissingUsagePolicyError));
+            // Other policies apply instead of a silent zero.
+            let ceiling = upto_actual_amount_from_response(
+                &fractional_plan(BillingUnit::Requests, meter, MissingUsagePolicy::Ceiling),
+                1_000_000,
+                &headers,
+                body,
+            )
+            .unwrap();
+            assert_eq!(ceiling.base_units, 1_000_000);
+        }
+    }
+
+    #[test]
+    fn fractional_continuous_usage_is_priced_exactly() {
+        let actual = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Seconds,
+                response_json("/usage/seconds"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"seconds":0.49}}"#),
+        )
+        .unwrap();
+        assert!((actual.usd - 0.49).abs() < 1e-12);
+        assert_eq!(actual.base_units, 490_000);
+
+        // Whole counts still settle normally.
+        let whole = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Requests,
+                response_json("/usage/units"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"units":2.0}}"#),
+        )
+        .unwrap();
+        assert_eq!(whole.usd, 1.0);
+    }
+
+    #[test]
+    fn positive_usage_settles_at_least_one_base_unit() {
+        let actual = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Seconds,
+                response_json("/usage/seconds"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"seconds":0.0000001}}"#),
+        )
+        .unwrap();
+        assert_eq!(actual.base_units, 1);
+        let zero = upto_actual_amount_from_response(
+            &fractional_plan(
+                BillingUnit::Seconds,
+                response_json("/usage/seconds"),
+                MissingUsagePolicy::Error,
+            ),
+            1_000_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"seconds":0}}"#),
+        )
+        .unwrap();
+        assert_eq!(zero.base_units, 0);
     }
 }

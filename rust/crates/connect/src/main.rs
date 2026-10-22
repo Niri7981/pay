@@ -110,6 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rpc = %operator.rpc_url,
                 "sell_inference enabled: endpoints under /endpoints/<id>/v1"
             );
+            info!(
+                "sell_inference: x402 batch-settlement not offered without a durable channel store"
+            );
             state.with_sell(operator)
         }
         None => {

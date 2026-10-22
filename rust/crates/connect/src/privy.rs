@@ -19,10 +19,14 @@
 //! `PRIVY_SIGNER_ID` (that key's quorum id), optionally `PRIVY_POLICY_ID`,
 //! `PRIVY_API_BASE_URL`, and one of `PRIVY_VERIFICATION_KEY` (a single PEM,
 //! `\n` escapes accepted) or `PRIVY_JWKS_URL` (default: the app's JWKS at
-//! auth.privy.io, fetched once at startup; it can hold several keys during
-//! a rotation).
+//! auth.privy.io; it can hold several keys during a rotation). The JWKS is
+//! refetched every few minutes and replaced wholesale, so a key Privy
+//! retires stops verifying; keys that cannot be refreshed for an hour stop
+//! verifying too.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -41,6 +45,17 @@ pub const API_BASE_ENV: &str = "PRIVY_API_BASE_URL";
 const DEFAULT_API_BASE: &str = "https://api.privy.io/v1";
 /// `iss` of every Privy access token.
 const ISSUER: &str = "privy.io";
+/// How old a fetched JWKS may get before a sign-in refetches it.
+const JWKS_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Least time between refetches, so unknown `kid`s cannot hammer Privy.
+const JWKS_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Beyond this age without a successful refetch the keys are not trusted.
+const JWKS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+/// How long a revoked session is remembered: past the lifetime of any
+/// access token issued for it.
+const REVOKED_SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// Most revoked sessions remembered at once.
+const MAX_REVOKED_SESSIONS: usize = 4096;
 
 #[derive(Clone)]
 pub struct Config {
@@ -115,6 +130,7 @@ pub fn default_jwks_url(app_id: &str) -> String {
 pub struct Identity {
     /// `did:privy:…`, stable for the user in this app.
     pub user_id: String,
+    /// The Privy session (`sid`) the token belongs to; always present.
     pub session_id: Option<String>,
 }
 
@@ -130,7 +146,8 @@ struct Claims {
 pub struct Wallet {
     pub id: String,
     pub address: String,
-    /// Whether pay's key quorum is a signer, so tool calls can sign.
+    /// Whether pay's key quorum is a signer, under the configured policy
+    /// when there is one, so tool calls can sign.
     pub pay_can_sign: bool,
 }
 
@@ -146,6 +163,13 @@ pub enum PrivyError {
 
 /// The app's ES256 public keys, by `kid` when the JWKS names one.
 struct Keys(Vec<(Option<String>, jsonwebtoken::DecodingKey)>);
+
+/// The verification keys in force and when they were last confirmed.
+struct KeySet {
+    keys: Keys,
+    /// When the JWKS was fetched; `None` for a configured PEM.
+    fetched_at: Option<Instant>,
+}
 
 #[derive(Deserialize)]
 struct Jwks {
@@ -197,6 +221,10 @@ impl Keys {
     }
 
     /// The keys to try for a token: the one its `kid` names, else all.
+    fn knows(&self, kid: Option<&str>) -> bool {
+        kid.is_some_and(|kid| self.0.iter().any(|(k, _)| k.as_deref() == Some(kid)))
+    }
+
     fn candidates(&self, kid: Option<&str>) -> Vec<&jsonwebtoken::DecodingKey> {
         let named: Vec<_> = self
             .0
@@ -216,8 +244,15 @@ impl Keys {
 pub struct Privy {
     cfg: Config,
     http: reqwest::Client,
-    keys: Keys,
+    keys: RwLock<Arc<KeySet>>,
+    /// Serializes JWKS refetches and remembers the last attempt.
+    refresh: tokio::sync::Mutex<Option<Instant>>,
+    refresh_after: Duration,
+    retry_after: Duration,
+    max_age: Duration,
     validation: jsonwebtoken::Validation,
+    /// Sessions signed out here, by `sid`, with when.
+    revoked: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 impl Privy {
@@ -227,13 +262,14 @@ impl Privy {
             .verification_key
             .clone()
             .ok_or(ConfigError::Missing(VERIFICATION_KEY_ENV))?;
-        Self::with_keys(cfg, Keys::from_pem(&pem)?)
+        Self::with_keys(cfg, Keys::from_pem(&pem)?, None)
     }
 
-    /// A client verifying with the keys in a JWKS document.
+    /// A client verifying with the keys in a JWKS document fetched now, and
+    /// refetching it from `cfg.jwks_url` as it ages.
     pub fn with_jwks(cfg: Config, jwks: &str) -> Result<Self, ConfigError> {
         let keys = Keys::from_jwks(&cfg.jwks_url, jwks)?;
-        Self::with_keys(cfg, keys)
+        Self::with_keys(cfg, keys, Some(Instant::now()))
     }
 
     /// The client for this configuration: the PEM when there is one,
@@ -242,24 +278,15 @@ impl Privy {
         if cfg.verification_key.is_some() {
             return Self::new(cfg);
         }
-        let url = cfg.jwks_url.clone();
-        let body = reqwest::get(&url)
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| ConfigError::Jwks {
-                url: url.clone(),
-                why: e.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|e| ConfigError::Jwks {
-                url: url.clone(),
-                why: e.to_string(),
-            })?;
+        let body = fetch_jwks(&reqwest::Client::new(), &cfg.jwks_url).await?;
         Self::with_jwks(cfg, &body)
     }
 
-    fn with_keys(cfg: Config, keys: Keys) -> Result<Self, ConfigError> {
+    fn with_keys(
+        cfg: Config,
+        keys: Keys,
+        fetched_at: Option<Instant>,
+    ) -> Result<Self, ConfigError> {
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
         validation.set_issuer(&[ISSUER]);
         validation.set_audience(&[cfg.app_id.as_str()]);
@@ -272,13 +299,63 @@ impl Privy {
         Ok(Self {
             cfg,
             http,
-            keys,
+            keys: RwLock::new(Arc::new(KeySet { keys, fetched_at })),
+            refresh: tokio::sync::Mutex::new(None),
+            refresh_after: JWKS_REFRESH_AFTER,
+            retry_after: JWKS_RETRY_AFTER,
+            max_age: JWKS_MAX_AGE,
             validation,
+            revoked: Default::default(),
         })
     }
 
     pub fn key_count(&self) -> usize {
-        self.keys.0.len()
+        self.key_set().keys.0.len()
+    }
+
+    fn key_set(&self) -> Arc<KeySet> {
+        self.keys.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Verify a token against keys refreshed from the JWKS when they have
+    /// aged or do not name the token's `kid`.
+    pub async fn authenticate(&self, access_token: &str) -> Result<Identity, String> {
+        let kid = jsonwebtoken::decode_header(access_token.trim())
+            .map_err(|e| e.to_string())?
+            .kid;
+        let set = self.key_set();
+        if let Some(fetched_at) = set.fetched_at
+            && (fetched_at.elapsed() >= self.refresh_after || !set.keys.knows(kid.as_deref()))
+        {
+            self.refresh_jwks().await;
+        }
+        self.verify(access_token)
+    }
+
+    async fn refresh_jwks(&self) {
+        let mut last_attempt = self.refresh.lock().await;
+        if last_attempt.is_some_and(|at| at.elapsed() < self.retry_after) {
+            return;
+        }
+        let set = self.key_set();
+        *last_attempt = Some(Instant::now());
+        let keys = match fetch_jwks(&self.http, &self.cfg.jwks_url).await {
+            Ok(body) => Keys::from_jwks(&self.cfg.jwks_url, &body),
+            Err(error) => Err(error),
+        };
+        match keys {
+            Ok(keys) => {
+                *self.keys.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(KeySet {
+                    keys,
+                    fetched_at: Some(Instant::now()),
+                });
+            }
+            Err(error) => tracing::error!(
+                %error,
+                age_secs = set.fetched_at.map(|at| at.elapsed().as_secs()),
+                "Privy JWKS refresh failed; keeping the last set until it expires"
+            ),
+        }
     }
 
     pub fn app_id(&self) -> &str {
@@ -300,9 +377,16 @@ impl Privy {
         let kid = jsonwebtoken::decode_header(token)
             .map_err(|e| e.to_string())?
             .kid;
+        let set = self.key_set();
+        if set
+            .fetched_at
+            .is_some_and(|at| at.elapsed() >= self.max_age)
+        {
+            return Err("the Privy verification keys could not be refreshed".to_string());
+        }
         let mut last = String::from("no verification key");
         let mut data = None;
-        for key in self.keys.candidates(kid.as_deref()) {
+        for key in set.keys.candidates(kid.as_deref()) {
             match jsonwebtoken::decode::<Claims>(token, key, &self.validation) {
                 Ok(d) => {
                     data = Some(d);
@@ -315,10 +399,43 @@ impl Privy {
         if !data.claims.sub.starts_with("did:privy:") {
             return Err("the token subject is not a Privy user".to_string());
         }
+        let session = data
+            .claims
+            .sid
+            .filter(|sid| !sid.trim().is_empty())
+            .ok_or_else(|| "the token carries no Privy session".to_string())?;
+        if self.is_revoked(&session) {
+            return Err("the Privy session was signed out".to_string());
+        }
         Ok(Identity {
             user_id: data.claims.sub,
-            session_id: data.claims.sid,
+            session_id: Some(session),
         })
+    }
+
+    /// Refuse further sign-ins with `session` for as long as its access
+    /// tokens can live.
+    pub fn revoke_session(&self, session: &str) {
+        let now = Instant::now();
+        let mut revoked = self.revoked.lock().unwrap_or_else(|p| p.into_inner());
+        revoked.retain(|_, at| now.saturating_duration_since(*at) <= REVOKED_SESSION_TTL);
+        if revoked.len() >= MAX_REVOKED_SESSIONS
+            && let Some(oldest) = revoked
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(sid, _)| sid.clone())
+        {
+            revoked.remove(&oldest);
+        }
+        revoked.insert(session.to_string(), now);
+    }
+
+    fn is_revoked(&self, session: &str) -> bool {
+        self.revoked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session)
+            .is_some_and(|at| at.elapsed() <= REVOKED_SESSION_TTL)
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -363,9 +480,15 @@ impl Privy {
     pub async fn solana_wallet(&self, user_id: &str) -> Result<Option<Wallet>, PrivyError> {
         let path = format!("/users/{}", urlencode(user_id));
         let user: UserResponse = Self::read(self.get(&path).send().await?, "user").await?;
-        let Some(id) = embedded_solana_wallet_id(&user.linked_accounts) else {
+        if user.id.as_deref().is_some_and(|id| id != user_id) {
+            return Err(PrivyError::Protocol(
+                "user: the response is for another user".to_string(),
+            ));
+        }
+        let Some(linked) = embedded_solana_wallet(&user.linked_accounts) else {
             return Ok(None);
         };
+        let id = linked.id.clone().expect("filtered on id");
         let wallet: WalletResponse = Self::read(
             self.get(&format!("/wallets/{}", urlencode(&id)))
                 .send()
@@ -373,6 +496,20 @@ impl Privy {
             "wallet",
         )
         .await?;
+        if wallet.id != id
+            || wallet
+                .chain_type
+                .as_deref()
+                .is_some_and(|chain| chain != "solana")
+            || linked
+                .address
+                .as_deref()
+                .is_some_and(|address| address != wallet.address)
+        {
+            return Err(PrivyError::Protocol(
+                "wallet: the response does not match the user's linked wallet".to_string(),
+            ));
+        }
         Ok(Some(self.wallet_from(wallet)))
     }
 
@@ -402,11 +539,24 @@ impl Privy {
     }
 
     fn wallet_from(&self, wallet: WalletResponse) -> Wallet {
-        let pay_can_sign = wallet
+        let signer = wallet
             .additional_signers
             .iter()
-            .any(|s| s.id() == self.cfg.signer_id)
-            || wallet.owner_id.as_deref() == Some(self.cfg.signer_id.as_str());
+            .find(|s| s.id() == self.cfg.signer_id);
+        let is_owner = wallet.owner_id.as_deref() == Some(self.cfg.signer_id.as_str());
+        // With a policy configured, it must govern the wallet, and pay's
+        // signer must not carry overrides that replace it.
+        let policy_bound = match &self.cfg.policy_id {
+            None => true,
+            Some(policy) => {
+                wallet.policy_ids.iter().any(|p| p == policy)
+                    && signer.is_none_or(|s| {
+                        let overrides = s.override_policy_ids();
+                        overrides.is_empty() || overrides == [policy.as_str()]
+                    })
+            }
+        };
+        let pay_can_sign = (signer.is_some() || is_owner) && policy_bound;
         Wallet {
             id: wallet.id,
             address: wallet.address,
@@ -442,6 +592,162 @@ impl Privy {
     }
 }
 
+async fn fetch_jwks(http: &reqwest::Client, url: &str) -> Result<String, ConfigError> {
+    let bad = |e: reqwest::Error| ConfigError::Jwks {
+        url: url.to_string(),
+        why: e.to_string(),
+    };
+    http.get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(bad)?
+        .text()
+        .await
+        .map_err(bad)
+}
+
+/// A wallet's stablecoin outflow today, read from the chain: the record of
+/// what its hosted signatures actually spent.
+pub struct OnChainSpendHistory {
+    rpc_url: String,
+    http: reqwest::Client,
+}
+
+/// Signature pages read per wallet; a wallet past this many transactions
+/// today is reported as unknown rather than undercounted.
+const HISTORY_PAGES: usize = 4;
+const HISTORY_PAGE: usize = 1_000;
+
+impl OnChainSpendHistory {
+    pub fn new(rpc_url: impl Into<String>) -> Self {
+        Self {
+            rpc_url: rpc_url.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn rpc(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let response: serde_json::Value = self
+            .http
+            .post(&self.rpc_url)
+            .timeout(Duration::from_secs(10))
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("{method}: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("{method}: {e}"))?;
+        if let Some(error) = response.get("error") {
+            return Err(format!("{method}: {error}"));
+        }
+        Ok(response["result"].clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tenants::SpendHistory for OnChainSpendHistory {
+    async fn spent_today(&self, wallet: &str) -> Result<u64, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        let day_start = (now / 86_400 * 86_400) as i64;
+        let mut before: Option<String> = None;
+        let mut raw = 0_u64;
+        for _ in 0..HISTORY_PAGES {
+            let mut config = json!({ "limit": HISTORY_PAGE, "commitment": "confirmed" });
+            if let Some(before) = &before {
+                config["before"] = json!(before);
+            }
+            let page = self
+                .rpc("getSignaturesForAddress", json!([wallet, config]))
+                .await?;
+            let page = page
+                .as_array()
+                .ok_or("getSignaturesForAddress: not a list")?;
+            for entry in page {
+                // An unknown block time counts as today.
+                if entry["blockTime"].as_i64().is_some_and(|t| t < day_start) {
+                    return Ok(raw.div_ceil(100));
+                }
+                let signature = entry["signature"].as_str().ok_or("signature missing")?;
+                before = Some(signature.to_string());
+                if !entry["err"].is_null() {
+                    continue;
+                }
+                let tx = self
+                    .rpc(
+                        "getTransaction",
+                        json!([signature, { "encoding": "json", "commitment": "confirmed",
+                                            "maxSupportedTransactionVersion": 0 }]),
+                    )
+                    .await?;
+                let tx: ConfirmedTransaction = serde_json::from_value(tx)
+                    .map_err(|e| format!("getTransaction {signature}: history unavailable: {e}"))?;
+                raw = raw.saturating_add(tx.stablecoin_outflow(wallet));
+            }
+            if page.len() < HISTORY_PAGE {
+                return Ok(raw.div_ceil(100));
+            }
+        }
+        Err(format!("{wallet} has too many transactions today to count"))
+    }
+}
+
+/// A `getTransaction` result with its status metadata. A null result or null
+/// meta does not deserialize, so missing history can't count as zero spend.
+#[derive(Deserialize)]
+struct ConfirmedTransaction {
+    meta: TransactionMeta,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionMeta {
+    err: Option<serde_json::Value>,
+    pre_token_balances: Vec<serde_json::Value>,
+    post_token_balances: Vec<serde_json::Value>,
+}
+
+impl ConfirmedTransaction {
+    /// Raw six-decimal stablecoin units `owner`'s token accounts lost.
+    fn stablecoin_outflow(&self, owner: &str) -> u64 {
+        if self.meta.err.is_some() {
+            return 0;
+        }
+        let balances = |entries: &[serde_json::Value]| -> BTreeMap<u64, u64> {
+            entries
+                .iter()
+                .filter(|b| b["owner"].as_str() == Some(owner))
+                .filter(|b| {
+                    b["mint"]
+                        .as_str()
+                        .is_some_and(pay_kit::mpp::protocol::solana::is_known_stablecoin_mint)
+                })
+                .filter_map(|b| {
+                    Some((
+                        b["accountIndex"].as_u64()?,
+                        b["uiTokenAmount"]["amount"].as_str()?.parse().ok()?,
+                    ))
+                })
+                .collect()
+        };
+        let pre = balances(&self.meta.pre_token_balances);
+        let post = balances(&self.meta.post_token_balances);
+        pre.iter()
+            .map(|(index, before)| before.saturating_sub(post.get(index).copied().unwrap_or(0)))
+            .fold(0, u64::saturating_add)
+    }
+}
+
 /// The tenant subject for a Privy user.
 pub fn subject_for_user(user_id: &str) -> String {
     crate::tenants::subject_for(PROVIDER_ID, user_id)
@@ -454,6 +760,8 @@ fn urlencode(s: &str) -> String {
 #[derive(Deserialize)]
 struct UserResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     linked_accounts: Vec<LinkedAccount>,
 }
 
@@ -463,6 +771,8 @@ struct LinkedAccount {
     kind: String,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    address: Option<String>,
     #[serde(default)]
     chain_type: Option<String>,
     #[serde(default)]
@@ -474,7 +784,12 @@ struct LinkedAccount {
 }
 
 /// The first embedded Solana wallet on a user, by index.
+#[cfg(test)]
 fn embedded_solana_wallet_id(accounts: &[LinkedAccount]) -> Option<String> {
+    embedded_solana_wallet(accounts).and_then(|a| a.id.clone())
+}
+
+fn embedded_solana_wallet(accounts: &[LinkedAccount]) -> Option<&LinkedAccount> {
     accounts
         .iter()
         .filter(|a| a.kind == "wallet" && a.chain_type.as_deref() == Some("solana"))
@@ -484,7 +799,6 @@ fn embedded_solana_wallet_id(accounts: &[LinkedAccount]) -> Option<String> {
         })
         .filter(|a| a.id.is_some())
         .min_by_key(|a| a.wallet_index.unwrap_or(i64::MAX))
-        .and_then(|a| a.id.clone())
 }
 
 #[derive(Deserialize)]
@@ -492,9 +806,13 @@ struct WalletResponse {
     id: String,
     address: String,
     #[serde(default)]
+    chain_type: Option<String>,
+    #[serde(default)]
     owner_id: Option<String>,
     #[serde(default)]
     additional_signers: Vec<Signer>,
+    #[serde(default)]
+    policy_ids: Vec<String>,
 }
 
 /// Privy has listed signers both as bare ids and as `{ "signer_id": … }`.
@@ -502,14 +820,28 @@ struct WalletResponse {
 #[serde(untagged)]
 enum Signer {
     Id(String),
-    Object { signer_id: String },
+    Object {
+        signer_id: String,
+        #[serde(default)]
+        override_policy_ids: Vec<String>,
+    },
 }
 
 impl Signer {
     fn id(&self) -> &str {
         match self {
             Signer::Id(id) => id,
-            Signer::Object { signer_id } => signer_id,
+            Signer::Object { signer_id, .. } => signer_id,
+        }
+    }
+
+    fn override_policy_ids(&self) -> Vec<&str> {
+        match self {
+            Signer::Id(_) => Vec::new(),
+            Signer::Object {
+                override_policy_ids,
+                ..
+            } => override_policy_ids.iter().map(String::as_str).collect(),
         }
     }
 }
@@ -634,7 +966,8 @@ pub(crate) mod tests {
             let (user, (_, signers)) = wallets.iter().find(|(_, (w, _))| *w == id).unwrap();
             Json(json!({
                 "id": id, "address": ADDRESS, "chain_type": "solana", "owner_id": format!("kq_{user}"),
-                "additional_signers": signers.iter().map(|s| json!({ "signer_id": s })).collect::<Vec<_>>()
+                "additional_signers": signers.iter().map(|s| json!({ "signer_id": s })).collect::<Vec<_>>(),
+                "policy_ids": ["pol_1"]
             }))
         }
         async fn create(
@@ -706,6 +1039,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tokens_need_a_live_privy_session() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let sessionless = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "exp": unix() + 60
+        }));
+        assert!(privy.verify(&sessionless).is_err());
+        let blank = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": " ", "exp": unix() + 60
+        }));
+        assert!(privy.verify(&blank).is_err());
+
+        let token = app.token_for(USER);
+        assert!(privy.verify(&token).is_ok());
+        privy.revoke_session("sess_1");
+        assert!(
+            privy.verify(&token).is_err(),
+            "a signed-out session is refused"
+        );
+        let other = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_2", "exp": unix() + 60
+        }));
+        assert!(
+            privy.verify(&other).is_ok(),
+            "other sessions are unaffected"
+        );
+    }
+
+    #[test]
     fn jwks_keys_verify_by_kid_and_by_trial() {
         let app = FakeApp::new("http://unused");
         let mut cfg = app.cfg.clone();
@@ -722,7 +1084,7 @@ pub(crate) mod tests {
             let key = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
             jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
-                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "exp": unix() + 60 }),
+                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 60 }),
                 &key,
             )
             .unwrap()
@@ -742,6 +1104,133 @@ pub(crate) mod tests {
             default_jwks_url("app_1"),
             "https://auth.privy.io/api/v1/apps/app_1/jwks.json"
         );
+    }
+
+    /// A JWKS endpoint whose document the test can replace or break.
+    async fn mock_jwks(doc: Arc<Mutex<Option<String>>>) -> String {
+        async fn serve(
+            State(doc): State<Arc<Mutex<Option<String>>>>,
+        ) -> Result<String, axum::http::StatusCode> {
+            doc.lock()
+                .unwrap()
+                .clone()
+                .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        }
+        let app = Router::new()
+            .route("/jwks.json", get(serve))
+            .with_state(doc);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/jwks.json")
+    }
+
+    fn jwk(kid: &str, key: &SigningKey) -> serde_json::Value {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let point = key.verifying_key().to_encoded_point(false);
+        json!({ "kty": "EC", "crv": "P-256", "kid": kid, "use": "sig", "alg": "ES256",
+                "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap()) })
+    }
+
+    fn signed_by(key: &SigningKey, kid: &str, user: &str) -> String {
+        let pem = key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap();
+        let encoding = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(kid.to_string());
+        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 600 });
+        jsonwebtoken::encode(&header, &claims, &encoding).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retired_jwks_keys_stop_verifying_after_refresh() {
+        let retired = SigningKey::random(&mut rand::rngs::OsRng);
+        let current = SigningKey::random(&mut rand::rngs::OsRng);
+        let doc = Arc::new(Mutex::new(Some(
+            json!({ "keys": [jwk("kid_retired", &retired), jwk("kid_current", &current)] })
+                .to_string(),
+        )));
+        let mut cfg = FakeApp::new("http://unused").cfg;
+        cfg.verification_key = None;
+        cfg.jwks_url = mock_jwks(doc.clone()).await;
+        let mut privy = Privy::connect(cfg).await.unwrap();
+        let victim = "did:privy:victim";
+        assert!(
+            privy
+                .authenticate(&signed_by(&retired, "kid_retired", victim))
+                .await
+                .is_ok()
+        );
+
+        // Privy retires the key; the next sign-in after the refresh window
+        // fetches the new set and the retired key is gone.
+        *doc.lock().unwrap() = Some(json!({ "keys": [jwk("kid_current", &current)] }).to_string());
+        privy.refresh_after = Duration::ZERO;
+        privy.retry_after = Duration::ZERO;
+        let forged = signed_by(&retired, "kid_retired", victim);
+        assert!(privy.authenticate(&forged).await.is_err());
+        assert_eq!(privy.key_count(), 1);
+        assert_eq!(
+            privy
+                .authenticate(&signed_by(&current, "kid_current", victim))
+                .await
+                .unwrap()
+                .user_id,
+            victim
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_kid_is_fetched_without_waiting_for_the_refresh_window() {
+        let first = SigningKey::random(&mut rand::rngs::OsRng);
+        let rotated = SigningKey::random(&mut rand::rngs::OsRng);
+        let doc = Arc::new(Mutex::new(Some(
+            json!({ "keys": [jwk("kid_1", &first)] }).to_string(),
+        )));
+        let mut cfg = FakeApp::new("http://unused").cfg;
+        cfg.verification_key = None;
+        cfg.jwks_url = mock_jwks(doc.clone()).await;
+        let privy = Privy::connect(cfg).await.unwrap();
+        *doc.lock().unwrap() = Some(json!({ "keys": [jwk("kid_2", &rotated)] }).to_string());
+        assert!(
+            privy
+                .authenticate(&signed_by(&rotated, "kid_2", USER))
+                .await
+                .is_ok()
+        );
+        assert!(
+            privy
+                .authenticate(&signed_by(&first, "kid_1", USER))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_that_cannot_be_refreshed_expire() {
+        let key = SigningKey::random(&mut rand::rngs::OsRng);
+        let doc = Arc::new(Mutex::new(Some(
+            json!({ "keys": [jwk("kid_1", &key)] }).to_string(),
+        )));
+        let mut cfg = FakeApp::new("http://unused").cfg;
+        cfg.verification_key = None;
+        cfg.jwks_url = mock_jwks(doc.clone()).await;
+        let mut privy = Privy::connect(cfg).await.unwrap();
+        let token = signed_by(&key, "kid_1", USER);
+        *doc.lock().unwrap() = None;
+        privy.refresh_after = Duration::ZERO;
+        privy.retry_after = Duration::ZERO;
+        // A failed refresh keeps the last set while it is young enough.
+        assert!(privy.authenticate(&token).await.is_ok());
+        privy.max_age = Duration::ZERO;
+        assert!(privy.authenticate(&token).await.is_err(), "fails closed");
+        // A configured PEM never ages.
+        let app = FakeApp::new("http://unused");
+        let mut pem = Privy::new(app.cfg.clone()).unwrap();
+        pem.max_age = Duration::ZERO;
+        assert!(pem.authenticate(&app.token_for(USER)).await.is_ok());
     }
 
     #[test]
@@ -771,6 +1260,266 @@ pub(crate) mod tests {
             Some("w_sol1")
         );
         assert!(embedded_solana_wallet_id(&[]).is_none());
+    }
+
+    async fn serve_json(user: serde_json::Value, wallet: serde_json::Value) -> String {
+        let app = Router::new()
+            .route("/users/{id}", get(move || async move { Json(user) }))
+            .route("/wallets/{id}", get(move || async move { Json(wallet) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn provider_responses_must_match_the_requested_user_and_wallet() {
+        let linked = |address: &str| {
+            json!({ "id": USER, "linked_accounts": [
+                { "type": "wallet", "id": "w_1", "address": address, "chain_type": "solana",
+                  "connector_type": "embedded", "wallet_index": 0 }
+            ]})
+        };
+        let wallet = |id: &str, chain: &str| {
+            json!({ "id": id, "address": ADDRESS, "chain_type": chain,
+                    "additional_signers": [{ "signer_id": SIGNER }] })
+        };
+        let ok = serve_json(linked(ADDRESS), wallet("w_1", "solana")).await;
+        let privy = Privy::new(FakeApp::new(&ok).cfg).unwrap();
+        assert_eq!(privy.solana_wallet(USER).await.unwrap().unwrap().id, "w_1");
+
+        for (user, wallet) in [
+            (linked(ADDRESS), wallet("w_other", "solana")),
+            (linked(ADDRESS), wallet("w_1", "ethereum")),
+            (
+                linked("SomeOtherAddress1111111111111111111111111111"),
+                wallet("w_1", "solana"),
+            ),
+            (
+                json!({ "id": "did:privy:other", "linked_accounts": linked(ADDRESS)["linked_accounts"] }),
+                wallet("w_1", "solana"),
+            ),
+        ] {
+            let base = serve_json(user, wallet).await;
+            let privy = Privy::new(FakeApp::new(&base).cfg).unwrap();
+            assert!(matches!(
+                privy.solana_wallet(USER).await,
+                Err(PrivyError::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn outflow_counts_only_the_owners_stablecoin_debits() {
+        use pay_kit::mpp::protocol::solana::mints;
+        let usdc = mints::USDC_MAINNET;
+        let balance = |index: u64, owner: &str, mint: &str, amount: u64| {
+            json!({ "accountIndex": index, "owner": owner, "mint": mint,
+                    "uiTokenAmount": { "amount": amount.to_string(), "decimals": 6 } })
+        };
+        let tx = json!({ "meta": { "err": null,
+            "preTokenBalances": [
+                balance(1, ADDRESS, usdc, 5_000_000),
+                balance(2, "someone", usdc, 0),
+                balance(3, ADDRESS, "So11111111111111111111111111111111111111112", 9_000),
+            ],
+            "postTokenBalances": [
+                balance(1, ADDRESS, usdc, 3_750_000),
+                balance(2, "someone", usdc, 1_250_000),
+                balance(3, ADDRESS, "So11111111111111111111111111111111111111112", 0),
+            ],
+        }});
+        let outflow = |tx: &serde_json::Value, owner: &str| {
+            serde_json::from_value::<ConfirmedTransaction>(tx.clone())
+                .unwrap()
+                .stablecoin_outflow(owner)
+        };
+        assert_eq!(outflow(&tx, ADDRESS), 1_250_000);
+        assert_eq!(outflow(&tx, "someone"), 0, "an inflow is not spend");
+        let mut failed = tx.clone();
+        failed["meta"]["err"] = json!({ "InstructionError": [0, "Custom"] });
+        assert_eq!(outflow(&failed, ADDRESS), 0);
+        // A closed account (absent afterwards) spent everything it held.
+        let mut closed = tx;
+        closed["meta"]["postTokenBalances"] = json!([]);
+        assert_eq!(outflow(&closed, ADDRESS), 5_000_000);
+        // Unavailable history is not zero spend.
+        for missing in [json!(null), json!({ "meta": null })] {
+            assert!(serde_json::from_value::<ConfirmedTransaction>(missing).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn on_chain_history_sums_todays_outflows() {
+        use crate::tenants::SpendHistory;
+        use pay_kit::mpp::protocol::solana::mints;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let day_start = now / 86_400 * 86_400;
+        let debit = |amount: u64| {
+            json!({ "meta": { "err": null,
+                "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                       "uiTokenAmount": { "amount": "10000000" } }],
+                "postTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                        "uiTokenAmount": { "amount": (10_000_000 - amount).to_string() } }] } })
+        };
+        let rpc = move |Json(request): Json<serde_json::Value>| async move {
+            let result = match request["method"].as_str().unwrap() {
+                "getSignaturesForAddress" => json!([
+                    { "signature": "today_1", "blockTime": now, "err": null },
+                    { "signature": "today_failed", "blockTime": now, "err": { "x": 1 } },
+                    { "signature": "today_2", "blockTime": day_start, "err": null },
+                    { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
+                ]),
+                "getTransaction" => match request["params"][0].as_str().unwrap() {
+                    "today_1" => debit(1_000_001),
+                    "today_2" => debit(500_000),
+                    other => panic!("{other} must not be read"),
+                },
+                other => panic!("{other}"),
+            };
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+        };
+        let app = Router::new().route("/", post(rpc));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let history = OnChainSpendHistory::new(format!("http://{addr}/"));
+        // 1.500001 USDC rounds up to 15,001 minor units.
+        assert_eq!(history.spent_today(ADDRESS).await.unwrap(), 15_001);
+        assert!(
+            OnChainSpendHistory::new("http://127.0.0.1:1/")
+                .spent_today(ADDRESS)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_transaction_history_leaves_the_wallet_unseeded() {
+        use crate::tenants::{SpendHistory, TenantRegistry};
+        use pay_kit::mpp::protocol::solana::mints;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let spend_rpc = |transaction: serde_json::Value| async move {
+            let rpc = move |Json(request): Json<serde_json::Value>| {
+                let transaction = transaction.clone();
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getSignaturesForAddress" => {
+                            json!([{ "signature": "today", "blockTime": now, "err": null }])
+                        }
+                        "getTransaction" => transaction,
+                        other => panic!("{other}"),
+                    };
+                    Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+                }
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, Router::new().route("/", post(rpc)))
+                    .await
+                    .unwrap();
+            });
+            OnChainSpendHistory::new(format!("http://{addr}/"))
+        };
+        let mut credentials = pay_core::remote::Credentials::new();
+        credentials.insert("secret_key".to_string(), "sk_test_1".to_string());
+        let tenant = TenantRecord {
+            subject: "sub_1".to_string(),
+            account_name: "grok".to_string(),
+            provider: PROVIDER_ID.to_string(),
+            wallet_id: "w_1".to_string(),
+            pubkey: ADDRESS.to_string(),
+            credentials,
+            policy: pay_mcp::policy::SpendPolicy::dollars(1.0, 5.0),
+        };
+        let registry = TenantRegistry::new();
+        for missing in [json!(null), json!({ "meta": null })] {
+            let history = spend_rpc(missing.clone()).await;
+            let error = history.spent_today(ADDRESS).await.unwrap_err();
+            assert!(error.contains("history unavailable"), "{missing}: {error}");
+            assert!(registry.seed_spend(&tenant, &history).await.is_err());
+        }
+        // A failed seed left the wallet unseeded: complete history still lands.
+        let full = spend_rpc(json!({ "meta": { "err": null,
+            "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                                   "uiTokenAmount": { "amount": "5000000" } }],
+            "postTokenBalances": [] } }))
+        .await;
+        assert_eq!(full.spent_today(ADDRESS).await.unwrap(), 50_000);
+        registry.seed_spend(&tenant, &full).await.unwrap();
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn pay_signs_only_under_the_configured_policy() {
+        let user = json!({ "id": USER, "linked_accounts": [
+            { "type": "wallet", "id": "w_1", "address": ADDRESS, "chain_type": "solana",
+              "connector_type": "embedded", "wallet_index": 0 }
+        ]});
+        let wallet = |policies: serde_json::Value, signer: serde_json::Value| {
+            json!({ "id": "w_1", "address": ADDRESS, "chain_type": "solana",
+                    "additional_signers": [signer], "policy_ids": policies })
+        };
+        let plain = json!({ "signer_id": SIGNER });
+        for (policies, signer, can_sign) in [
+            (json!(["pol_1"]), plain.clone(), true),
+            (json!(["pol_other", "pol_1"]), plain.clone(), true),
+            (
+                json!(["pol_1"]),
+                json!({ "signer_id": SIGNER, "override_policy_ids": ["pol_1"] }),
+                true,
+            ),
+            (json!(["pol_1"]), json!(SIGNER), true),
+            (json!([]), plain.clone(), false),
+            (json!(["pol_other"]), plain.clone(), false),
+            (
+                json!(["pol_1"]),
+                json!({ "signer_id": SIGNER, "override_policy_ids": ["pol_broad"] }),
+                false,
+            ),
+            (
+                json!(["pol_1"]),
+                json!({ "signer_id": SIGNER, "override_policy_ids": ["pol_1", "pol_broad"] }),
+                false,
+            ),
+        ] {
+            let base = serve_json(user.clone(), wallet(policies.clone(), signer.clone())).await;
+            let privy = Privy::new(FakeApp::new(&base).cfg).unwrap();
+            assert_eq!(
+                privy
+                    .solana_wallet(USER)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pay_can_sign,
+                can_sign,
+                "{policies} {signer}"
+            );
+        }
+        // Without a configured policy only signer membership matters.
+        let base = serve_json(user, wallet(json!([]), plain)).await;
+        let mut cfg = FakeApp::new(&base).cfg;
+        cfg.policy_id = None;
+        assert!(
+            Privy::new(cfg)
+                .unwrap()
+                .solana_wallet(USER)
+                .await
+                .unwrap()
+                .unwrap()
+                .pay_can_sign
+        );
     }
 
     #[tokio::test]

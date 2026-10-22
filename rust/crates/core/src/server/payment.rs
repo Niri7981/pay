@@ -12,7 +12,7 @@ use http_body::Body as _;
 use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
-use crate::server::completion_stream::{self, DeliveryTask, StreamCompletion};
+use crate::server::completion_stream::{self, DeliveryTask, MeteredSettlement, StreamCompletion};
 use crate::server::metering::{self, RequestProperties};
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::telemetry;
@@ -27,6 +27,11 @@ pub struct TrustedPaymentIdentity {
     pub payer: Option<String>,
     pub channel_id: Option<String>,
     pub original_host: Option<String>,
+    /// Durable deployment policy snapshot the request was admitted under
+    /// ([`ResolvedDeploymentPolicy::binding_identity`]).
+    ///
+    /// [`ResolvedDeploymentPolicy::binding_identity`]: crate::server::deployment_policy::ResolvedDeploymentPolicy::binding_identity
+    pub payment_policy: Option<String>,
 }
 
 /// Axum middleware that gates metered endpoints behind MPP payment.
@@ -55,6 +60,8 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
     // values before payment evaluation; only a successfully verified MPP
     // session may add them back below.
     strip_internal_identity_headers(req.headers_mut());
+    req.extensions_mut()
+        .remove::<crate::server::gate::UpstreamRoute>();
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
@@ -108,6 +115,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         GateDecision::Forward {
+            route,
             session,
             receipt,
             upto,
@@ -126,7 +134,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     Ok(result) => result,
                     Err(mut response) => {
                         if let Some(forward) = upto.take()
-                            && let Some((name, value)) = crate::server::gate::settle_upto(
+                            && let Ok(Some((name, value))) = crate::server::gate::settle_upto(
                                 &state,
                                 *forward.open,
                                 0,
@@ -146,10 +154,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             let mut delegated_session = None;
             let mut verified_payer = None;
             let mut verified_channel = None;
+            let mut payment_policy = None;
             if let Some(sf) = session {
                 let mut sf = *sf;
                 verified_payer = sf.verified_payer.clone();
                 verified_channel = Some(sf.channel_id.clone());
+                payment_policy = sf.payment_policy.clone();
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
@@ -164,6 +174,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                 Ok(result) => result,
                                 Err(response) => return response,
                             };
+                        sf.request_body_bytes = restored.body().size_hint().exact();
                         req = restored;
                         if let Some(plan) = sf.metered_plan_mut() {
                             plan.variant_hint = body_variant;
@@ -178,10 +189,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     ));
                 }
             }
+            req.extensions_mut().insert(route);
             req.extensions_mut().insert(TrustedPaymentIdentity {
                 payer: verified_payer,
                 channel_id: verified_channel,
                 original_host: host,
+                payment_policy,
             });
             let deadline = delegated_session
                 .as_ref()
@@ -206,19 +219,20 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 None => forwarding.await,
             };
             // x402 `upto`: settle the opened channel *after* serving — debit the
-            // metered amount on success, refund on failure.
+            // metered amount on success, refund on failure. A served response
+            // whose charge did not settle is withheld.
             if let Some(uf) = upto {
                 let served_ok = response.status().is_success();
-                if let Some(plan) = uf.settlement {
+                let settled = if let Some(plan) = uf.settlement {
                     if metering::upto_requires_response_body(
                         &plan.metering,
                         plan.variant_hint.as_deref(),
                     ) {
                         let limit = metering::upto_response_body_limit(&plan.metering);
-                        let (mut parts, body) = response.into_parts();
+                        let (parts, body) = response.into_parts();
                         match axum::body::to_bytes(body, limit).await {
                             Ok(bytes) => {
-                                if let Some((n, v)) = crate::server::gate::settle_upto_metered(
+                                let settled = crate::server::gate::settle_upto_metered(
                                     &state,
                                     *uf.open,
                                     plan,
@@ -227,21 +241,25 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                     Some(&bytes),
                                     uf.telemetry,
                                 )
-                                .await
-                                {
-                                    parts.headers.append(n, v);
-                                }
+                                .await;
+                                let mut parts = parts;
                                 parts.headers.remove(header::CONTENT_LENGTH);
                                 response = Response::from_parts(parts, Body::from(bytes));
+                                settled
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
                                     "failed to buffer x402 upto response body; refunding"
                                 );
-                                let mut builder =
-                                    Response::builder().status(StatusCode::BAD_GATEWAY);
-                                if let Some((n, v)) = crate::server::gate::settle_upto(
+                                response = Response::builder()
+                                    .status(StatusCode::BAD_GATEWAY)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(r#"{"error":"response_metering_failed"}"#))
+                                    .unwrap_or_else(|_| {
+                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                    });
+                                crate::server::gate::settle_upto(
                                     &state,
                                     *uf.open,
                                     0,
@@ -249,40 +267,39 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                     uf.telemetry,
                                 )
                                 .await
-                                {
-                                    builder = builder.header(n, v);
-                                }
-                                response = builder
-                                    .header(header::CONTENT_TYPE, "application/json")
-                                    .body(Body::from(r#"{"error":"response_metering_failed"}"#))
-                                    .unwrap_or_else(|_| {
-                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                                    });
                             }
                         }
-                    } else if let Some((n, v)) = crate::server::gate::settle_upto_metered(
+                    } else {
+                        crate::server::gate::settle_upto_metered(
+                            &state,
+                            *uf.open,
+                            plan,
+                            served_ok,
+                            response.headers(),
+                            None,
+                            uf.telemetry,
+                        )
+                        .await
+                    }
+                } else {
+                    crate::server::gate::settle_upto(
                         &state,
                         *uf.open,
-                        plan,
+                        uf.settle_amount,
                         served_ok,
-                        response.headers(),
-                        None,
                         uf.telemetry,
                     )
                     .await
-                    {
+                };
+                match settled {
+                    Ok(Some((n, v))) => {
                         response.headers_mut().append(n, v);
                     }
-                } else if let Some((n, v)) = crate::server::gate::settle_upto(
-                    &state,
-                    *uf.open,
-                    uf.settle_amount,
-                    served_ok,
-                    uf.telemetry,
-                )
-                .await
-                {
-                    response.headers_mut().append(n, v);
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "x402 upto settlement failed; withholding response");
+                        response = payment_commit_failed_response();
+                    }
                 }
             }
             // x402 `batch-settlement`: the voucher commits only now, and only
@@ -355,7 +372,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             }
             response
         }
-        GateDecision::Passthrough => next.run(req).await,
+        GateDecision::Passthrough(route) => {
+            req.extensions_mut().insert(route);
+            next.run(req).await
+        }
+        GateDecision::Local => next.run(req).await,
     }
 }
 
@@ -390,6 +411,16 @@ pub fn inject_verified_payer_headers(
         {
             headers.insert("x-pay-original-host", value);
         }
+    }
+}
+
+/// Forward the deployment policy snapshot a request was admitted under, so the
+/// upstream serves exactly the admitted incarnation and price.
+pub fn inject_payment_policy_header(headers: &mut HeaderMap, policy: Option<&str>) {
+    if let Some(policy) = policy
+        && let Ok(value) = HeaderValue::from_str(policy)
+    {
+        headers.insert("x-pay-payment-policy", value);
     }
 }
 
@@ -458,11 +489,29 @@ async fn prepare_metered_request_body(
                 .body(Body::from(r#"{"error":"request_body_too_large"}"#))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         })?;
+    if has_padded_model(&bytes) {
+        // Pricing, the upstream, and seller accounting must all see one model
+        // identity; reject rather than normalize it for pricing only.
+        return Err(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"invalid_model","message":"model must not have leading or trailing whitespace"}"#,
+            ))
+            .unwrap_or_else(|_| StatusCode::BAD_REQUEST.into_response()));
+    }
     let (variant, bytes) = prepare_metered_json_body(&bytes, force_stream_usage);
     if force_stream_usage && let Ok(content_length) = bytes.len().to_string().parse() {
         parts.headers.insert(header::CONTENT_LENGTH, content_length);
     }
     Ok((Request::from_parts(parts, Body::from(bytes)), variant))
+}
+
+fn has_padded_model(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json.get("model")?.as_str().map(|m| m.trim() != m))
+        .unwrap_or(false)
 }
 
 fn prepare_metered_json_body(body: &[u8], force_stream_usage: bool) -> (Option<String>, Vec<u8>) {
@@ -507,7 +556,11 @@ pub(super) async fn settle_axum_delegated_response(
     forward: crate::server::gate::SessionForward,
     response: Response,
 ) -> Response {
-    if !response.status().is_success() && forward.deadline().is_none() {
+    let served = crate::server::gate::session_response_served(
+        response.status(),
+        forward.deadline().is_some(),
+    );
+    if !served && forward.deadline().is_none() {
         // Dropping `forward` releases the capacity lease without charging for
         // a response that was not successfully served.
         return response;
@@ -523,6 +576,9 @@ pub(super) async fn settle_axum_delegated_response(
         return completion_stream::response(response, completion, delivery, false);
     }
 
+    let (mut parts, body) = response.into_parts();
+    let observer = parts.extensions.remove::<MeteredSettlement>();
+    let response = Response::from_parts(parts, body);
     let is_sse = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -541,8 +597,15 @@ pub(super) async fn settle_axum_delegated_response(
     }
     if is_sse && session_stream::DelegatedSessionStreamMeter::supports(&forward) {
         let (mut parts, body) = response.into_parts();
+        let request_body_bytes = forward.request_body_bytes;
         let meter = match session_stream::DelegatedSessionStreamMeter::from_forward(forward) {
-            Ok(meter) => meter,
+            Ok(meter) => {
+                let meter = meter.with_observer(observer);
+                match request_body_bytes {
+                    Some(bytes) => meter.with_request_body_bytes(bytes),
+                    None => meter,
+                }
+            }
             Err(error) => {
                 tracing::error!(%error, "failed to configure delegated session stream metering");
                 return Response::builder()
@@ -580,13 +643,25 @@ pub(super) async fn settle_axum_delegated_response(
         }
     };
 
-    if !parts.status.is_success() {
+    if !served {
         parts.headers.remove(header::CONTENT_LENGTH);
         return Response::from_parts(parts, Body::from(bytes));
     }
+    let watermark = observer.map(|observer| {
+        (
+            observer,
+            forward.handle.clone(),
+            forward.channel_id.clone(),
+            forward.committed_base_units,
+        )
+    });
     match crate::server::gate::settle_delegated_session(forward, &parts.headers, Some(&bytes)).await
     {
         Ok(receipt) => {
+            if let Some((observer, handle, channel, baseline)) = watermark {
+                let committed = handle.committed_watermark(&channel).unwrap_or(baseline);
+                observer.record(committed.saturating_sub(baseline), handle.decimals());
+            }
             if let Some(receipt) = receipt {
                 for (name, value) in receipt.headers {
                     parts.headers.append(name, value);
@@ -613,6 +688,15 @@ pub(super) async fn settle_axum_delegated_response(
 /// USD-pegged settlement tokens (1 whole token == $1). Server startup
 /// enforces that invariant by refusing non-pegged session currencies
 /// (`ensure_session_currencies_usd_pegged` in the CLI server start path).
+/// A served response whose payment did not settle: the body is withheld.
+fn payment_commit_failed_response() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"error":"payment_commit_failed"}"#))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
 pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: u8) -> u64 {
     let per_unit = price
         .dimensions
@@ -627,23 +711,24 @@ pub(crate) fn price_unit_base_amount(price: &metering::ResolvedPrice, decimals: 
 /// by the 402-issuing and verify paths so the advertised and expected amounts
 /// always match.
 pub(crate) fn charge_amount_from_price(price: Option<&metering::ResolvedPrice>) -> String {
-    price
-        .and_then(|p| p.dimensions.first())
-        .map(|d| {
-            let per_unit = d.price_usd / d.scale.max(1) as f64;
-            format!("{}", per_unit)
-        })
-        .unwrap_or_else(|| "0.01".to_string())
+    let Some(price) = price else {
+        return "0.01".to_string();
+    };
+    // Round away float noise from summing dimensions (0.1 + 0.2).
+    let fixed = format!("{:.12}", metering::per_call_usd(price));
+    fixed
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 pub(crate) fn resolve_charge_splits(
     mpp: &pay_kit::mpp::server::Mpp,
-    meter: &pay_types::metering::Metering,
+    split_rules: &[pay_types::metering::SplitRule],
     api: &pay_types::metering::ApiSpec,
     uri: &axum::http::Uri,
     amount: &str,
 ) -> Vec<pay_kit::mpp::protocol::solana::Split> {
-    let split_rules = metering::resolve_split_rules(meter);
     if split_rules.is_empty() {
         return vec![];
     }
@@ -760,6 +845,16 @@ fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+/// The charge realm pay-kit used to derive from the recipient before `realm`
+/// became a required config field: `"App Id - #<8 digits>"` from
+/// `SHA-256(recipient)`. Kept so existing challenge realms don't change.
+pub fn recipient_derived_charge_realm(recipient: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(recipient.as_bytes());
+    let first_four = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    format!("App Id - #{}", first_four % 100_000_000)
+}
+
 /// Whether `candidate` names the same token as `configured` on `network`:
 /// the same string, or a symbol and a mint address that resolve to one mint.
 pub fn same_currency(configured: &str, candidate: &str, network: &str) -> bool {
@@ -837,6 +932,33 @@ mod tests {
     use super::*;
 
     const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    #[test]
+    fn charge_amount_sums_dimensions_without_float_noise() {
+        let dim = |price_usd, scale| metering::ResolvedDimension {
+            direction: "usage".into(),
+            unit: "requests".into(),
+            scale,
+            price_usd,
+        };
+        let price = |dimensions| metering::ResolvedPrice { dimensions };
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(0.1, 1), dim(0.2, 1)]))),
+            "0.3"
+        );
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(0.001, 1), dim(0.5, 1)]))),
+            "0.501"
+        );
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(1.5, 1000)]))),
+            "0.0015"
+        );
+        assert_eq!(
+            charge_amount_from_price(Some(&price(vec![dim(2.0, 1)]))),
+            "2"
+        );
+    }
 
     #[test]
     fn currency_symbols_normalize_but_mint_addresses_remain_case_sensitive() {
@@ -1063,6 +1185,8 @@ apis:
             challenge_binding_secret: Some(
                 "test-challenge-binding-secret-must-be-32-bytes".to_string(),
             ),
+            realm: Some("test-realm".to_string()),
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .expect("test MPP server should initialize")
@@ -1072,7 +1196,9 @@ apis:
         let (api, meter) = configured_charge_splits();
         let mpp = test_mpp();
         let uri: axum::http::Uri = "/v1/test".parse().unwrap();
-        let splits = resolve_charge_splits(&mpp, &meter, &api, &uri, "0.0015");
+        let split_rules =
+            metering::resolve_split_rules(&meter, &RequestProperties::default(), None);
+        let splits = resolve_charge_splits(&mpp, split_rules, &api, &uri, "0.0015");
 
         let challenge = mpp
             .charge_with_options(
@@ -1294,6 +1420,35 @@ apis:
     }
 
     #[tokio::test]
+    async fn metered_body_reports_its_forwarded_size_without_content_length() {
+        // A chunked request carries no Content-Length; the buffered body the
+        // gateway forwards is what bounds unreported input usage.
+        let original = br#"{"model":"premium","stream":true,"messages":[{"role":"user","content":"long prompt"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(futures_util::stream::iter([Ok::<
+                _,
+                std::io::Error,
+            >(
+                bytes::Bytes::from_static(original),
+            )])))
+            .unwrap();
+        assert_eq!(request.body().size_hint().exact(), None);
+        let (request, _) = prepare_metered_request_body(request, true).await.unwrap();
+        let forwarded = request.body().size_hint().exact().unwrap();
+        let body = axum::body::to_bytes(request.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(forwarded, body.len() as u64);
+        assert!(
+            forwarded > original.len() as u64,
+            "stream usage was injected"
+        );
+    }
+
+    #[tokio::test]
     async fn metered_body_preserves_model_and_updates_length_for_stream_usage() {
         let original = br#"{"model":"premium","stream":true,"messages":[]}"#;
         let request = Request::builder()
@@ -1315,6 +1470,36 @@ apis:
         assert_eq!(json["model"], "premium");
         assert_eq!(json["messages"], serde_json::json!([]));
         assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn metered_body_rejects_whitespace_padded_model() {
+        let request = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        for padded in [
+            r#"{"model":" fast ","messages":[]}"#,
+            r#"{"model":"fast\n","messages":[]}"#,
+            r#"{"model":"\tfast","messages":[]}"#,
+        ] {
+            let response = prepare_metered_request_body(request(padded), false)
+                .await
+                .expect_err("padded model must be rejected");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let (_, variant) = prepare_metered_request_body(request(r#"{"model":"fast"}"#), false)
+            .await
+            .unwrap();
+        assert_eq!(variant.as_deref(), Some("fast"));
+        let (_, variant) = prepare_metered_request_body(request(r#"{"messages":[]}"#), false)
+            .await
+            .unwrap();
+        assert_eq!(variant, None);
     }
 
     #[test]

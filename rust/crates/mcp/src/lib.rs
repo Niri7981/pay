@@ -9,7 +9,7 @@ mod server;
 mod tools;
 
 pub use auth::ElicitationAuth;
-pub use context::{ApprovalPolicy, CallScope, LocalContext, PayContext};
+pub use context::{ApprovalHold, ApprovalPolicy, CallScope, LocalContext, PayContext};
 pub use permissions::{McpPermissions, PermissionConfig};
 
 use rmcp::ServiceExt;

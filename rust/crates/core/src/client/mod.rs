@@ -1,3 +1,4 @@
+pub mod attempt;
 pub mod authenticate;
 pub mod balance;
 pub mod batch;

@@ -177,11 +177,43 @@ fn public_redirect_policy() -> reqwest::redirect::Policy {
         if attempt.previous().len() >= 10 {
             return attempt.error("too many redirects");
         }
+        // Caller headers and payment credentials must never reach an origin
+        // the caller did not name.
+        if let Some(initial) = attempt.previous().first()
+            && !is_same_origin_redirect(initial, attempt.url())
+        {
+            let message = format!(
+                "Hosted curl does not follow cross-origin redirects; request {} directly.",
+                attempt.url()
+            );
+            return attempt.error(message);
+        }
         match validate_public_url(attempt.url()) {
             Ok(()) => attempt.follow(),
             Err(error) => attempt.error(error.to_string()),
         }
     })
+}
+
+/// Whether two URLs share scheme, host, and effective port.
+pub fn same_origin(left: &str, right: &str) -> bool {
+    match (reqwest::Url::parse(left), reqwest::Url::parse(right)) {
+        (Ok(left), Ok(right)) => left.origin() == right.origin(),
+        _ => false,
+    }
+}
+
+/// Same origin, or an `http` → `https` upgrade of the same host on default ports.
+fn is_same_origin_redirect(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    if from.origin() == to.origin() {
+        return true;
+    }
+    from.scheme() == "http"
+        && to.scheme() == "https"
+        && from.host_str().is_some()
+        && from.host_str() == to.host_str()
+        && from.port().is_none()
+        && to.port().is_none()
 }
 
 /// One file included in a multipart request body.
@@ -893,6 +925,55 @@ fn fetch_raw_with_method(
 #[cfg(test)]
 mod outbound_policy_tests {
     use super::*;
+
+    #[test]
+    fn hosted_redirects_stay_on_the_requested_origin() {
+        let url = |value: &str| reqwest::Url::parse(value).unwrap();
+        assert!(is_same_origin_redirect(
+            &url("https://api.example/start"),
+            &url("https://api.example/paid?x=1")
+        ));
+        assert!(is_same_origin_redirect(
+            &url("http://api.example/start"),
+            &url("https://api.example/start")
+        ));
+        assert!(is_same_origin_redirect(
+            &url("https://api.example:8443/a"),
+            &url("https://api.example:8443/b")
+        ));
+        // Cross-origin hops would carry custom and payment headers away.
+        assert!(!is_same_origin_redirect(
+            &url("https://api.example/start"),
+            &url("https://attacker.example/paid")
+        ));
+        assert!(!is_same_origin_redirect(
+            &url("https://api.example/start"),
+            &url("https://evil.api.example/paid")
+        ));
+        assert!(!is_same_origin_redirect(
+            &url("https://api.example/start"),
+            &url("https://api.example:8443/paid")
+        ));
+        assert!(!is_same_origin_redirect(
+            &url("https://api.example/start"),
+            &url("http://api.example/start")
+        ));
+        assert!(!is_same_origin_redirect(
+            &url("http://api.example:8080/start"),
+            &url("https://api.example/start")
+        ));
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_host_and_effective_port() {
+        assert!(same_origin(
+            "https://a.example/x",
+            "https://a.example:443/y?z"
+        ));
+        assert!(!same_origin("https://a.example/x", "http://a.example/x"));
+        assert!(!same_origin("https://a.example/x", "https://b.example/x"));
+        assert!(!same_origin("https://a.example/x", "not a url"));
+    }
 
     #[test]
     fn public_policy_rejects_special_use_addresses() {

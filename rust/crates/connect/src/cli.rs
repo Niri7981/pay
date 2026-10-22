@@ -37,6 +37,8 @@ struct Pending {
     callback: String,
     state: String,
     kind: PendingKind,
+    /// The Privy session an approval interrupted by funding began in.
+    session: Option<String>,
     created_at: Instant,
 }
 
@@ -54,11 +56,14 @@ enum PendingKind {
 struct Grant {
     subject: String,
     code_challenge: String,
+    /// The Privy session the link was approved in, if any.
+    session: Option<String>,
     created_at: Instant,
 }
 
 struct Token {
     subject: String,
+    session: Option<String>,
     created_at: Instant,
 }
 
@@ -87,7 +92,12 @@ impl Store {
         (Instant::now().saturating_duration_since(row.created_at) <= REQUEST_TTL).then_some(row)
     }
 
-    fn approve(&self, id: &str, subject: String) -> Option<(Pending, String)> {
+    fn approve(
+        &self,
+        id: &str,
+        subject: String,
+        session: Option<String>,
+    ) -> Option<(Pending, String)> {
         let mut rows = self.pending.lock().unwrap();
         let pending = rows.get(id)?;
         let PendingKind::Link { code_challenge } = &pending.kind else {
@@ -95,6 +105,7 @@ impl Store {
         };
         let code_challenge = code_challenge.clone();
         let pending = rows.remove(id)?;
+        let session = session.or_else(|| pending.session.clone());
         drop(rows);
         if Instant::now().saturating_duration_since(pending.created_at) > REQUEST_TTL {
             return None;
@@ -113,6 +124,7 @@ impl Store {
             Grant {
                 subject,
                 code_challenge,
+                session,
                 created_at: Instant::now(),
             },
         );
@@ -144,17 +156,46 @@ impl Store {
             .is_some_and(|pending| matches!(pending.kind, PendingKind::Link { .. }))
     }
 
-    fn exchange(&self, code: &str, verifier: &str) -> Option<String> {
+    fn exchange(&self, code: &str, verifier: &str) -> Option<(String, Option<String>)> {
         let grant = self.grants.lock().unwrap().remove(&sha256_hex(code))?;
         if Instant::now().saturating_duration_since(grant.created_at) > CODE_TTL
             || pkce_challenge(verifier) != grant.code_challenge
         {
             return None;
         }
-        Some(grant.subject)
+        Some((grant.subject, grant.session))
     }
 
-    fn issue_token(&self, subject: String) -> Result<String, ApiError> {
+    /// End every link code and CLI token issued to `subject`.
+    pub fn revoke_subject(&self, subject: &str) {
+        self.grants
+            .lock()
+            .unwrap()
+            .retain(|_, grant| grant.subject != subject);
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|_, token| token.subject != subject);
+    }
+
+    /// End every link code and CLI token approved in the Privy `session`.
+    pub fn revoke_session(&self, session: &str) {
+        let ours = |s: &Option<String>| s.as_deref() == Some(session);
+        self.grants
+            .lock()
+            .unwrap()
+            .retain(|_, grant| !ours(&grant.session));
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|_, token| !ours(&token.session));
+    }
+
+    pub(crate) fn issue_token(
+        &self,
+        subject: String,
+        session: Option<String>,
+    ) -> Result<String, ApiError> {
         let token = format!("pct_{}", random_token());
         let mut tokens = self.tokens.lock().unwrap();
         let now = Instant::now();
@@ -171,6 +212,7 @@ impl Store {
             sha256_hex(&token),
             Token {
                 subject,
+                session,
                 created_at: now,
             },
         );
@@ -224,6 +266,7 @@ pub async fn start(
         Pending {
             callback: query.callback,
             state: query.state,
+            session: None,
             kind: PendingKind::Link {
                 code_challenge: query.code_challenge,
             },
@@ -276,6 +319,7 @@ pub async fn start_topup(
         Pending {
             callback: query.callback,
             state: query.state,
+            session: None,
             kind: PendingKind::Topup {
                 address: address.clone(),
                 payment_method,
@@ -364,8 +408,11 @@ pub async fn approve(
         .and_then(|value| value.trim().strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let (subject, fresh_login) = match bearer {
-        Some(token) => (approve_with_privy(&state, token).await?.0, true),
+    let (subject, fresh_login, session) = match bearer {
+        Some(token) => {
+            let approval = approve_with_privy(&state, token).await?;
+            (approval.subject, true, approval.session)
+        }
         None => (
             state
                 .tenants()
@@ -379,9 +426,15 @@ pub async fn approve(
                     )
                 })?,
             false,
+            None,
         ),
     };
     if let Some(fund) = funding_next(&state, &id, &subject, fresh_login).await? {
+        if let Some(row) = state.cli().pending.lock().unwrap().get_mut(&id)
+            && session.is_some()
+        {
+            row.session = session.clone();
+        }
         tracing::info!(subject = %subject, address = %fund.address, "empty CLI wallet: funding before approval");
         let mut response = Json(Decision {
             redirect: None,
@@ -398,7 +451,7 @@ pub async fn approve(
     }
     let (pending, code) = state
         .cli()
-        .approve(&id, subject.clone())
+        .approve(&id, subject.clone(), session)
         .ok_or_else(unknown_request)?;
     let mut response = Json(Decision {
         redirect: Some(redirect_url(&pending.callback, &code, &pending.state)),
@@ -533,7 +586,7 @@ pub async fn complete(
     let request: CompleteRequest = serde_json::from_slice(&body).map_err(|error| {
         ApiError::bad_request("invalid_request", format!("invalid JSON body: {error}"))
     })?;
-    let subject = state
+    let (subject, session) = state
         .cli()
         .exchange(&request.code, &request.code_verifier)
         .ok_or_else(ApiError::invalid_grant)?;
@@ -541,7 +594,7 @@ pub async fn complete(
         .tenants()
         .get(&subject)
         .ok_or_else(ApiError::invalid_grant)?;
-    let token = state.cli().issue_token(subject)?;
+    let token = state.cli().issue_token(subject, session)?;
     Ok(Json(CompleteResponse {
         provider: "payconnect",
         status: "ready",
@@ -722,6 +775,7 @@ mod tests {
                 tokens.insert(
                     format!("existing-{index}"),
                     Token {
+                        session: None,
                         subject: format!("subject-{index}"),
                         created_at: now,
                     },
@@ -829,6 +883,7 @@ mod tests {
                 Pending {
                     callback: CALLBACK.to_string(),
                     state: STATE.to_string(),
+                    session: None,
                     kind: PendingKind::Link {
                         code_challenge: pkce_challenge(VERIFIER),
                     },
@@ -976,6 +1031,7 @@ mod tests {
                 tokens.insert(
                     format!("expired-{index}"),
                     Token {
+                        session: None,
                         subject: SUBJECT.to_string(),
                         created_at: expired_at,
                     },
@@ -984,6 +1040,7 @@ mod tests {
             tokens.insert(
                 sha256_hex("pct_expired"),
                 Token {
+                    session: None,
                     subject: SUBJECT.to_string(),
                     created_at: expired_at,
                 },
@@ -991,7 +1048,7 @@ mod tests {
         }
 
         assert_eq!(store.authenticate("pct_expired"), None);
-        let fresh = store.issue_token(SUBJECT.to_string()).unwrap();
+        let fresh = store.issue_token(SUBJECT.to_string(), None).unwrap();
         assert_eq!(store.authenticate(&fresh).as_deref(), Some(SUBJECT));
         assert_eq!(store.tokens.lock().unwrap().len(), 1);
     }
@@ -1006,6 +1063,7 @@ mod tests {
             tokens.insert(
                 oldest.clone(),
                 Token {
+                    session: None,
                     subject: "oldest".to_string(),
                     created_at: now - Duration::from_secs(1),
                 },
@@ -1014,6 +1072,7 @@ mod tests {
                 tokens.insert(
                     format!("live-{index}"),
                     Token {
+                        session: None,
                         subject: index.to_string(),
                         created_at: now,
                     },
@@ -1021,10 +1080,26 @@ mod tests {
             }
         }
 
-        let fresh = store.issue_token(SUBJECT.to_string()).unwrap();
+        let fresh = store.issue_token(SUBJECT.to_string(), None).unwrap();
         let tokens = store.tokens.lock().unwrap();
         assert_eq!(tokens.len(), MAX_ROWS);
         assert!(!tokens.contains_key(&oldest));
         assert!(tokens.contains_key(&sha256_hex(&fresh)));
+    }
+
+    #[test]
+    fn revoking_a_privy_session_ends_its_cli_tokens_only() {
+        let store = Store::default();
+        let ours = store
+            .issue_token(SUBJECT.to_string(), Some("sess_a".to_string()))
+            .unwrap();
+        let other = store
+            .issue_token(SUBJECT.to_string(), Some("sess_b".to_string()))
+            .unwrap();
+        let unbound = store.issue_token(SUBJECT.to_string(), None).unwrap();
+        store.revoke_session("sess_a");
+        assert!(store.authenticate(&ours).is_none());
+        assert_eq!(store.authenticate(&other).as_deref(), Some(SUBJECT));
+        assert_eq!(store.authenticate(&unbound).as_deref(), Some(SUBJECT));
     }
 }

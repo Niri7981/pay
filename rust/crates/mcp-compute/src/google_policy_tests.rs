@@ -170,7 +170,9 @@ async fn serve_fixture(state: Arc<Mutex<FixtureState>>, request: Request) -> Res
         return Json(wallets).into_response();
     }
     if let Some(resource) = path.strip_prefix("/v2/") {
-        if resource == "projects/project/locations/-/functions" {
+        if resource == "projects/project/locations/-/functions"
+            || resource == "projects/project/locations/us-central1/functions"
+        {
             let functions = state
                 .listed_functions
                 .clone()
@@ -1041,4 +1043,239 @@ async fn disabled_policy_storage_is_legacy_compatible_but_explicit_sweeps_fail_c
         driver.reconcile_orphans(true).await,
         Err(ComputeError::Configuration(_))
     ));
+}
+
+#[tokio::test]
+async fn deployment_operations_require_the_funding_channel_lease() {
+    let fixture = Fixture::new(true).await;
+    let mut sibling = fixture.tenant();
+    sibling.channel_id = "sibling".into();
+    let operation = "projects/project/locations/us-central1/operations/deploy";
+    fixture.state.lock().unwrap().functions.insert(
+        operation.into(),
+        json!({
+            "name": operation,
+            "done": false,
+            "metadata": {"target": fixture.identity.resource_name}
+        }),
+    );
+    let invoke = || -> InvokeRequest {
+        serde_json::from_value(json!({
+            "id": fixture.identity.resource_name,
+            "method": "GET",
+            "path": "/summary"
+        }))
+        .unwrap()
+    };
+    let list = || ListRequest {
+        provider: DRIVER_ID.into(),
+        region: None,
+        page_size: 50,
+        page_token: None,
+    };
+
+    assert!(
+        fixture
+            .driver
+            .get(&sibling, fixture.request())
+            .await
+            .is_err()
+    );
+    assert!(fixture.driver.invoke(&sibling, invoke()).await.is_err());
+    assert!(fixture.driver.operation(&sibling, operation).await.is_err());
+    assert!(
+        fixture
+            .driver
+            .list(&sibling, list())
+            .await
+            .unwrap()
+            .deployments
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .driver
+            .delete(&sibling, fixture.request())
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .service
+            .get(&sibling, &fixture.identity.hostname)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .service
+            .set(&sibling, fixture.set_request(1))
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .service
+            .delete(
+                &sibling,
+                DeletePaymentPolicyRequest {
+                    hostname: fixture.identity.hostname.clone(),
+                    expected_version: 1,
+                },
+            )
+            .await
+            .is_err()
+    );
+    // Nothing above reached a mutation or retired the policy.
+    assert!(!fixture.stored().unwrap().retired);
+    assert!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .functions
+            .contains_key(&fixture.identity.resource_name)
+    );
+
+    let owner = fixture.tenant();
+    assert_eq!(
+        fixture
+            .driver
+            .get(&owner, fixture.request())
+            .await
+            .unwrap()
+            .id,
+        fixture.identity.resource_name
+    );
+    assert_eq!(
+        fixture
+            .driver
+            .list(&owner, list())
+            .await
+            .unwrap()
+            .deployments
+            .len(),
+        1
+    );
+    assert!(fixture.driver.operation(&owner, operation).await.is_ok());
+    assert_eq!(
+        fixture
+            .service
+            .get(&owner, &fixture.identity.hostname)
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    fixture
+        .driver
+        .delete(&owner, fixture.request())
+        .await
+        .unwrap();
+    // A deletion operation stays pollable after its target is gone.
+    assert!(fixture.driver.operation(&owner, operation).await.is_ok());
+}
+
+#[tokio::test]
+async fn gateway_invocation_is_bound_to_the_admitted_incarnation_and_policy() {
+    use crate::server::{ORIGINAL_HOST_HEADER, PAYMENT_POLICY_HEADER, PROXY_PROOF_HEADER};
+    use tower::ServiceExt;
+    const PROOF: &str = "proxy-proof-that-is-at-least-32-bytes";
+    let fixture = Fixture::new(true).await;
+    let calls = Arc::new(Mutex::new(0usize));
+    let observed = calls.clone();
+    let origin_app = Router::new().fallback(move || {
+        let observed = observed.clone();
+        async move {
+            *observed.lock().unwrap() += 1;
+            "served"
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let origin_server =
+        tokio::spawn(async move { axum::serve(listener, origin_app).await.unwrap() });
+    fixture
+        .state
+        .lock()
+        .unwrap()
+        .functions
+        .get_mut(&fixture.identity.resource_name)
+        .unwrap()["serviceConfig"]["uri"] = json!(origin);
+    let app = crate::server::router_with_payments(
+        crate::driver::DriverRegistry::new([
+            Arc::new(fixture.driver.clone()) as Arc<dyn ComputeDriver>
+        ])
+        .unwrap(),
+        crate::trigger_driver::TriggerDriverRegistry::default(),
+        "compute.example".into(),
+        Vec::new(),
+        None,
+        b"correct-proof-that-is-at-least-32-bytes".to_vec(),
+        PROOF.as_bytes().to_vec(),
+        Some(fixture.service.clone()),
+    );
+    let admitted = |identity: &DeploymentIdentity, version: u64, price: u64| {
+        json!({
+            "deployment": identity,
+            "version": version,
+            "price_micro_usd": price,
+            "allocations": [],
+        })
+        .to_string()
+    };
+    let call = |policy: Option<String>| {
+        let mut builder = axum::http::Request::get("/summary")
+            .header(PROXY_PROOF_HEADER, PROOF)
+            .header(ORIGINAL_HOST_HEADER, fixture.identity.hostname.as_str());
+        if let Some(policy) = policy {
+            builder = builder.header(PAYMENT_POLICY_HEADER, policy);
+        }
+        app.clone()
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+    };
+    let current = admitted(&fixture.identity, 1, 50_000);
+    assert_eq!(
+        call(Some(current.clone())).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(*calls.lock().unwrap(), 1);
+
+    let mut other_host = fixture.identity.clone();
+    other_host.hostname = format!("gcf-{OWNER}-other.compute.example");
+    for policy in [
+        None,
+        Some("not json".into()),
+        Some(admitted(&fixture.identity, 2, 50_000)),
+        Some(admitted(&fixture.identity, 1, 49_999)),
+        Some(admitted(&other_host, 1, 50_000)),
+    ] {
+        let response = call(policy.clone()).await.unwrap();
+        assert!(response.status().is_client_error(), "{policy:?}");
+    }
+    assert_eq!(*calls.lock().unwrap(), 1);
+
+    // A same-name replacement with a fresh policy cannot serve a request that
+    // was admitted under the retired incarnation.
+    let replacement = identity("weather", "2025-02-01T00:00:00Z");
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let mut function = function(&replacement);
+        function["serviceConfig"]["uri"] = json!(origin);
+        state
+            .functions
+            .insert(replacement.resource_name.clone(), function);
+        seed(&mut state, &policy(&replacement));
+    }
+    let response = call(Some(current)).await.unwrap();
+    assert!(response.status().is_client_error());
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert_eq!(
+        call(Some(admitted(&replacement, 1, 50_000)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    origin_server.abort();
 }

@@ -125,7 +125,11 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
         .method_details
         .clone()
         .ok_or_else(|| Error::Mpp("Subscription challenge is missing methodDetails".into()))?;
-    let method_details = SubscriptionMethodDetails::from_json(&method_details_value)
+    // The activation is built from methodDetails while the prompt shows the
+    // request fields; reject any mismatch (mint, amount, recipient, period)
+    // before either is used.
+    let method_details = request
+        .validated_method_details()
         .map_err(|e| Error::Mpp(format!("Invalid subscription methodDetails: {e}")))?;
 
     // The Solana profile uses on-chain Plan PDAs; the SDK reads `planAddress` from
@@ -165,6 +169,13 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
         .get("decimals")
         .and_then(|v| v.as_u64())
         .unwrap_or(6) as u8;
+    if let Some(known) = pay_types::Stablecoin::decimals_for_mint(&method_details.mint)
+        && known != decimals
+    {
+        return Err(Error::Mpp(format!(
+            "Subscription methodDetails.decimals ({decimals}) does not match the mint's {known}"
+        )));
+    }
 
     // The challenge stores the mint b58 in `currency`. For display we prefer
     // a known stablecoin symbol; otherwise fall back to a short prefix of the
@@ -697,6 +708,7 @@ mod tests {
                 "mint": MINT,
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
+                "recipient": RECIPIENT,
                 "amount": "10000000",
                 "expectedPeriodHours": 720,
                 "decimals": 6,
@@ -780,7 +792,7 @@ mod tests {
         challenge.request = pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap();
 
         let error = decode(&challenge).unwrap_err();
-        assert!(error.to_string().contains("cadence"), "{error}");
+        assert!(error.to_string().contains("billing period"), "{error}");
     }
 
     #[test]
@@ -844,6 +856,7 @@ mod tests {
                 "mint": "Bonk1111111111111111111111111111111111111111",
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
+                "recipient": RECIPIENT,
                 "amount": "1",
                 "expectedPeriodHours": 720,
                 "decimals": 5,
@@ -976,5 +989,41 @@ mod tests {
         let subs = parse_headers(&headers);
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].intent.as_str(), "subscription");
+    }
+
+    fn challenge_with_details(edit: impl FnOnce(&mut serde_json::Value)) -> Challenge {
+        let challenge = subscription_challenge("mainnet");
+        let mut request: serde_json::Value = challenge.request.decode().unwrap();
+        edit(&mut request);
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request).unwrap());
+        crate::client::mpp::parse(&format!(
+            "Payment id=\"sub-1\", realm=\"test\", method=\"solana\", \
+             intent=\"subscription\", request=\"{b64}\""
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_rejects_a_mint_that_differs_from_the_displayed_currency() {
+        const USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+        let challenge = challenge_with_details(|request| {
+            request["methodDetails"]["mint"] = USDT.into();
+        });
+        let err = decode(&challenge).expect_err("USDC shown, USDT signed");
+        assert!(err.to_string().contains("currency"), "{err}");
+    }
+
+    #[test]
+    fn decode_rejects_recipient_and_decimals_mismatches() {
+        let challenge = challenge_with_details(|request| {
+            request["methodDetails"]["recipient"] = PULLER.into();
+        });
+        assert!(decode(&challenge).is_err());
+
+        let challenge = challenge_with_details(|request| {
+            request["methodDetails"]["decimals"] = 2.into();
+        });
+        let err = decode(&challenge).expect_err("USDC has six decimals");
+        assert!(err.to_string().contains("decimals"), "{err}");
     }
 }

@@ -310,7 +310,8 @@ impl BatchSigningPermit {
 
     fn plan_for(&self, chunk_index: u32) -> Result<&PlannedChunk> {
         self.chunks
-            .get(chunk_index as usize)
+            .iter()
+            .find(|chunk| chunk.chunk_index == chunk_index)
             .ok_or_else(|| Error::Config(format!("permit has no chunk index {chunk_index}")))
     }
 
@@ -886,7 +887,7 @@ mod tests {
     }
     use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use crate::client::push::manifest::{ManifestContext, parse_manifest_csv};
-    use crate::client::push::planner::{AtaSnapshot, DestinationAtaStatus, pack_chunks};
+    use crate::client::push::planner::{AtaSnapshot, DestinationAtaStatus, pack_chunks_from};
 
     fn fresh_account_and_store() -> (MemoryAccountsStore, Pubkey) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -922,6 +923,16 @@ mod tests {
         fee_payer_mode: FeePayerMode,
         fee_payer: &Pubkey,
     ) -> (TransferManifest, TransactionPlan) {
+        manifest_and_plan_from(sender, rows, fee_payer_mode, fee_payer, 0)
+    }
+
+    fn manifest_and_plan_from(
+        sender: &Pubkey,
+        rows: usize,
+        fee_payer_mode: FeePayerMode,
+        fee_payer: &Pubkey,
+        first_chunk_index: u32,
+    ) -> (TransferManifest, TransactionPlan) {
         let mut csv = String::from("recipient,amount\n");
         for i in 0..rows {
             let recipient = Pubkey::new_from_array([(i + 10) as u8; 32]);
@@ -955,7 +966,16 @@ mod tests {
                 })
                 .collect(),
         };
-        let plan = pack_chunks(&manifest, &ata, fee_payer_mode, sender, fee_payer, 1).unwrap();
+        let plan = pack_chunks_from(
+            &manifest,
+            &ata,
+            fee_payer_mode,
+            sender,
+            fee_payer,
+            1,
+            first_chunk_index,
+        )
+        .unwrap();
         (manifest, plan)
     }
 
@@ -1066,6 +1086,38 @@ mod tests {
         assert_eq!(signed.row_numbers, plan.row_numbers());
         assert_eq!(permit.signed_transaction_count(), 1);
         assert_eq!(permit.signed_amount_raw(), plan.token_total_raw().unwrap());
+    }
+
+    #[test]
+    fn sign_chunk_addresses_a_resumed_plan_by_its_recorded_index() {
+        let (store, sender) = fresh_account_and_store();
+        let (manifest, plan) =
+            manifest_and_plan_from(&sender, 2, FeePayerMode::SelfFunded, &sender, 7);
+        assert_eq!(plan.chunks[0].chunk_index, 7);
+        let max_total_raw = plan.total_token_raw().unwrap();
+        let mut permit = BatchSigningPermit::authorize(
+            "localnet",
+            &store,
+            Some("default"),
+            manifest.context.network_genesis_hash,
+            &manifest,
+            plan,
+            BatchAuthorizationSummary {
+                account: "default",
+                currency: "USDG",
+                currency_decimals: 6,
+                network: "localnet",
+                recipient_total_raw: max_total_raw,
+                max_total_raw,
+            },
+            chrono::Duration::hours(1),
+            None,
+        )
+        .unwrap();
+        let chunk = permit.chunks[0].clone();
+        let tx = build_unsigned_transaction(&chunk, &permit);
+        assert!(permit.sign_chunk(0, &tx, 1_000).is_err());
+        assert_eq!(permit.sign_chunk(7, &tx, 1_000).unwrap().chunk_index, 7);
     }
 
     #[test]

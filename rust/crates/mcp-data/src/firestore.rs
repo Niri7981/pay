@@ -5,10 +5,9 @@ use async_trait::async_trait;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use crate::driver::{DataDriver, DataError, Result};
+use crate::driver::{DataDriver, DataError, Result, channel_lease_key};
 use crate::types::{
     Condition, CreateDocumentStoreRequest, DataClass, Document, DocumentRequest, DocumentStore,
     DocumentStoreList, DocumentStoreRequest, GatewayRead, GatewayReadRequest,
@@ -248,13 +247,15 @@ impl FirestoreDriver {
             .await
     }
 
-    async fn require_ready_store(&self, tenant: &Tenant, id: &str) -> Result<Value> {
+    async fn require_owned_store(&self, tenant: &Tenant, id: &str) -> Result<Value> {
         let store = self.require_store(tenant, id).await?;
-        if !matches!(firestore_string(&store, "phase"), None | Some("ready")) {
-            return Err(DataError::InvalidRequest(
-                "document store is not ready for operations".into(),
-            ));
-        }
+        require_store_access(tenant, &store)?;
+        Ok(store)
+    }
+
+    async fn require_ready_store(&self, tenant: &Tenant, id: &str) -> Result<Value> {
+        let store = self.require_owned_store(tenant, id).await?;
+        require_ready(&store)?;
         Ok(store)
     }
 
@@ -503,7 +504,7 @@ impl DataDriver for FirestoreDriver {
         tenant: &Tenant,
         request: DocumentStoreRequest,
     ) -> Result<DocumentStore> {
-        normalize_store(self.require_store(tenant, &request.id).await?)
+        normalize_store(self.require_owned_store(tenant, &request.id).await?)
     }
 
     async fn list_document_stores(
@@ -529,6 +530,7 @@ impl DataDriver for FirestoreDriver {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .filter(|store| require_store_access(tenant, store).is_ok())
             .cloned()
             .map(normalize_store)
             .collect::<Result<Vec<_>>>()?;
@@ -546,7 +548,7 @@ impl DataDriver for FirestoreDriver {
         tenant: &Tenant,
         request: DocumentStoreRequest,
     ) -> Result<()> {
-        let store = self.require_store(tenant, &request.id).await?;
+        let store = self.require_owned_store(tenant, &request.id).await?;
         self.delete_store_snapshot(tenant, &store).await
     }
 
@@ -608,8 +610,11 @@ impl DataDriver for FirestoreDriver {
             payer: String::new(),
             key: tenant_key.to_string(),
             channel_id: String::new(),
+            binding: None,
         };
-        let store = self.require_ready_store(&tenant, &request.store_id).await?;
+        // Published reads are public by design; the paid gateway authorizes them.
+        let store = self.require_store(&tenant, &request.store_id).await?;
+        require_ready(&store)?;
         if firestore_bool(&store, "gatewayReads") != Some(true) {
             return Err(DataError::InvalidRequest(
                 "store owner has not published paid gateway reads".into(),
@@ -671,6 +676,7 @@ impl DataDriver for FirestoreDriver {
                     payer: String::new(),
                     key: tenant_key.to_string(),
                     channel_id: channel_id.to_string(),
+                    binding: None,
                 },
                 store,
             )
@@ -775,6 +781,12 @@ fn reclaim_policy_name(policy: &ReclaimPolicy) -> &'static str {
 }
 
 fn validate_name(name: &str) -> Result<()> {
+    // The physical ID namespace stays reserved so references are unambiguous.
+    if name.starts_with(GATEWAY_PREFIX) {
+        return Err(DataError::InvalidRequest(format!(
+            "document store names may not begin with the reserved `{GATEWAY_PREFIX}` prefix"
+        )));
+    }
     if !(3..=42).contains(&name.len())
         || !name.as_bytes()[0].is_ascii_lowercase()
         || !name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
@@ -850,26 +862,41 @@ fn validate_owned_store_id(tenant: &Tenant, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn channel_lease_key(channel_id: &str) -> Result<String> {
-    if channel_id.is_empty() {
-        return Err(DataError::InvalidRequest(
-            "resource creation requires a verified payment channel".into(),
-        ));
-    }
-    let digest = Sha256::digest(channel_id.as_bytes());
-    Ok(digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
 fn require_channel_lease(channel_id: &str, value: &Value) -> Result<()> {
     let expected = channel_lease_key(channel_id)?;
-    if let Some(existing) = firestore_string(value, "payChannel")
-        && existing != expected
-    {
+    if firestore_string(value, "payChannel") != Some(expected.as_str()) {
         return Err(DataError::InvalidRequest(
             "document store is leased to a different payment channel; use a new name".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_ready(store: &Value) -> Result<()> {
+    if !matches!(firestore_string(store, "phase"), None | Some("ready")) {
+        return Err(DataError::InvalidRequest(
+            "document store is not ready for operations".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every payer-scoped request needs the store's funding lease: the verified
+/// channel for control calls, or the incarnation and lease a capability pins.
+fn require_store_access(tenant: &Tenant, store: &Value) -> Result<()> {
+    if firestore_string(store, "tenant") != Some(tenant.key.as_str()) {
+        return Err(DataError::InvalidRequest(
+            "document store belongs to a different payer".into(),
+        ));
+    }
+    let Some(binding) = &tenant.binding else {
+        return require_channel_lease(&tenant.channel_id, store);
+    };
+    if store.get("createTime").and_then(Value::as_str) != Some(binding.generation.as_str())
+        || firestore_string(store, "payChannel") != Some(binding.channel_lease.as_str())
+    {
+        return Err(DataError::InvalidRequest(
+            "data capability was issued for a different store incarnation".into(),
         ));
     }
     Ok(())
@@ -983,7 +1010,9 @@ mod tests {
             "name": store_name, "updateTime": "2026-01-01T00:00:00Z",
             "fields": {
                 "phase": { "stringValue": "deleting" },
-                "reclaimPolicy": { "stringValue": "delete" }
+                "reclaimPolicy": { "stringValue": "delete" },
+                "tenant": { "stringValue": "0123456789abcdef" },
+                "payChannel": { "stringValue": channel_lease_key("channel").unwrap() }
             }
         });
         let deleting = store.clone();
@@ -1034,6 +1063,7 @@ mod tests {
             payer: "payer".into(),
             key: "0123456789abcdef".into(),
             channel_id: "channel".into(),
+            binding: None,
         };
         assert!(
             driver
@@ -1087,6 +1117,7 @@ mod tests {
             payer: "payer".into(),
             key: "0123456789abcdef".into(),
             channel_id: "channel".into(),
+            binding: None,
         };
         let config = FirestoreConfig {
             project: "project".into(),
@@ -1101,10 +1132,11 @@ mod tests {
             driver.physical_id(&tenant, "weather").unwrap(),
             "fds-0123456789abcdef-weather"
         );
-        assert_eq!(
-            driver.physical_id_from_name(&tenant, "fds-weather"),
-            "fds-0123456789abcdef-fds-weather"
-        );
+        assert!(validate_name("fds-weather").is_err());
+        assert!(validate_name("fds-0123456789abcdef-weather").is_err());
+        assert!(validate_name("fdsweather").is_ok());
+        assert!(validate_name("weather-fds-").is_err());
+        assert!(validate_name("weather-fds-x").is_ok());
         assert!(
             driver
                 .physical_id(&tenant, "fds-fedcba9876543210-weather")

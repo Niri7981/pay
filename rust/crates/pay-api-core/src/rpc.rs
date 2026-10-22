@@ -147,43 +147,32 @@ impl RpcClient {
         rpc_url: &str,
         addresses: &[String],
     ) -> Result<Vec<Option<AccountInfo>>> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [
-                addresses,
-                { "commitment": "confirmed", "encoding": "base64" }
-            ],
-        });
-        let result = self.post_rpc_value(rpc_url, body).await?;
-        let value = result
-            .get("value")
-            .and_then(Value::as_array)
+        let result = self
+            .post_rpc_value(
+                rpc_url,
+                multiple_accounts_body(addresses, Commitment::Confirmed),
+            )
+            .await?;
+        parse_accounts_with_owner(&result)
+    }
+
+    /// [`Self::get_multiple_accounts_with_owner`] at `commitment`, with the
+    /// context slot the RPC node answered at. Callers that act irreversibly
+    /// on an absence use it to prove the read is recent enough.
+    pub async fn get_multiple_accounts_with_owner_at(
+        &self,
+        rpc_url: &str,
+        addresses: &[String],
+        commitment: Commitment,
+    ) -> Result<(u64, Vec<Option<AccountInfo>>)> {
+        let result = self
+            .post_rpc_value(rpc_url, multiple_accounts_body(addresses, commitment))
+            .await?;
+        let slot = result
+            .pointer("/context/slot")
+            .and_then(Value::as_u64)
             .ok_or(Error::RpcMalformed)?;
-        let mut out = Vec::with_capacity(value.len());
-        for entry in value {
-            if entry.is_null() {
-                out.push(None);
-                continue;
-            }
-            let owner = entry
-                .get("owner")
-                .and_then(Value::as_str)
-                .ok_or(Error::RpcMalformed)?
-                .to_string();
-            let data_array = entry
-                .get("data")
-                .and_then(Value::as_array)
-                .ok_or(Error::RpcMalformed)?;
-            let b64 = data_array
-                .first()
-                .and_then(Value::as_str)
-                .ok_or(Error::RpcMalformed)?;
-            let bytes = base64_decode(b64)?;
-            out.push(Some(AccountInfo { owner, data: bytes }));
-        }
-        Ok(out)
+        Ok((slot, parse_accounts_with_owner(&result)?))
     }
 
     /// Current confirmed slot.
@@ -292,6 +281,38 @@ impl RpcClient {
         Ok(out)
     }
 
+    /// [`Self::get_signatures_for_address`] keeping each entry's slot and
+    /// whether the transaction failed, so history scans can skip entries
+    /// that cannot be what they look for without fetching them.
+    pub async fn get_signature_infos_for_address(
+        &self,
+        rpc_url: &str,
+        address: &str,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SignatureInfo>> {
+        let mut opts = json!({
+            "limit": limit,
+            "commitment": "confirmed",
+        });
+        if let Some(before) = before {
+            opts["before"] = Value::String(before.to_string());
+        }
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [address, opts],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        result
+            .as_array()
+            .ok_or(Error::RpcMalformed)?
+            .iter()
+            .map(parse_signature_info)
+            .collect()
+    }
+
     /// `getTransaction` with `jsonParsed` encoding. Returns the entire RPC
     /// result so callers can pick the fields they need.
     ///
@@ -384,6 +405,51 @@ impl RpcClient {
         Ok(Some(entry))
     }
 
+    /// `getSignatureStatuses` with `searchTransactionHistory`: the slot of the
+    /// state the answer reflects, and one entry per signature (`Null` when
+    /// the cluster does not know it).
+    pub async fn get_signature_statuses(
+        &self,
+        rpc_url: &str,
+        signatures: &[String],
+    ) -> Result<(u64, Vec<Value>)> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [signatures, { "searchTransactionHistory": true }],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        let slot = result
+            .pointer("/context/slot")
+            .and_then(Value::as_u64)
+            .ok_or(Error::RpcMalformed)?;
+        let entries = result
+            .get("value")
+            .and_then(Value::as_array)
+            .filter(|entries| entries.len() == signatures.len())
+            .ok_or(Error::RpcMalformed)?;
+        Ok((slot, entries.clone()))
+    }
+
+    /// `getEpochInfo` at `finalized` commitment: `(absolute slot, block height)`.
+    pub async fn get_finalized_tip(&self, rpc_url: &str) -> Result<(u64, u64)> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getEpochInfo",
+            "params": [{ "commitment": "finalized" }],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        match (
+            result.get("absoluteSlot").and_then(Value::as_u64),
+            result.get("blockHeight").and_then(Value::as_u64),
+        ) {
+            (Some(slot), Some(height)) => Ok((slot, height)),
+            _ => Err(Error::RpcMalformed),
+        }
+    }
+
     /// `getMinimumBalanceForRentExemption` for a byte length.
     pub async fn get_minimum_balance_for_rent_exemption(
         &self,
@@ -456,6 +522,18 @@ impl RpcClient {
         Ok((blockhash, last_valid_block_height))
     }
 
+    /// `getBlockHeight` at `finalized` commitment.
+    pub async fn get_finalized_block_height(&self, rpc_url: &str) -> Result<u64> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBlockHeight",
+            "params": [{ "commitment": "finalized" }],
+        });
+        let result = self.post_rpc_value(rpc_url, body).await?;
+        result.as_u64().ok_or(Error::RpcMalformed)
+    }
+
     /// `sendTransaction` — submit a fully-signed, base64-encoded transaction.
     /// Returns the transaction signature on success.
     ///
@@ -498,6 +576,20 @@ impl RpcClient {
         signature: &str,
         max_wait: Duration,
     ) -> Result<()> {
+        self.confirm_signature_at(rpc_url, signature, max_wait, Commitment::Confirmed)
+            .await
+    }
+
+    /// [`Self::confirm_signature`] waiting for `commitment`. Durable terminal
+    /// state must wait for `Finalized`: a confirmed transaction can still be
+    /// dropped by a fork.
+    pub async fn confirm_signature_at(
+        &self,
+        rpc_url: &str,
+        signature: &str,
+        max_wait: Duration,
+        commitment: Commitment,
+    ) -> Result<()> {
         // Total polling budget; we re-check on a short loop. Cancel-class
         // transactions usually land within 1–2 slots.
         let deadline = std::time::Instant::now() + max_wait;
@@ -532,7 +624,7 @@ impl RpcClient {
                     .get("confirmationStatus")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if confirmation == "confirmed" || confirmation == "finalized" {
+                if reaches_commitment(confirmation, commitment) {
                     return Ok(());
                 }
             }
@@ -613,6 +705,95 @@ fn asset_price_request_body(asset_id: &str) -> Value {
     })
 }
 
+/// One `getSignaturesForAddress` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureInfo {
+    pub signature: String,
+    pub slot: u64,
+    /// The transaction landed but its execution failed.
+    pub failed: bool,
+}
+
+fn parse_signature_info(entry: &Value) -> Result<SignatureInfo> {
+    Ok(SignatureInfo {
+        signature: entry
+            .get("signature")
+            .and_then(Value::as_str)
+            .ok_or(Error::RpcMalformed)?
+            .to_string(),
+        slot: entry
+            .get("slot")
+            .and_then(Value::as_u64)
+            .ok_or(Error::RpcMalformed)?,
+        failed: entry.get("err").is_some_and(|err| !err.is_null()),
+    })
+}
+
+/// RPC commitment level for a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commitment {
+    Confirmed,
+    Finalized,
+}
+
+impl Commitment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Finalized => "finalized",
+        }
+    }
+}
+
+fn reaches_commitment(status: &str, commitment: Commitment) -> bool {
+    match commitment {
+        Commitment::Confirmed => status == "confirmed" || status == "finalized",
+        Commitment::Finalized => status == "finalized",
+    }
+}
+
+fn multiple_accounts_body(addresses: &[String], commitment: Commitment) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getMultipleAccounts",
+        "params": [
+            addresses,
+            { "commitment": commitment.as_str(), "encoding": "base64" }
+        ],
+    })
+}
+
+fn parse_accounts_with_owner(result: &Value) -> Result<Vec<Option<AccountInfo>>> {
+    let value = result
+        .get("value")
+        .and_then(Value::as_array)
+        .ok_or(Error::RpcMalformed)?;
+    let mut out = Vec::with_capacity(value.len());
+    for entry in value {
+        if entry.is_null() {
+            out.push(None);
+            continue;
+        }
+        let owner = entry
+            .get("owner")
+            .and_then(Value::as_str)
+            .ok_or(Error::RpcMalformed)?
+            .to_string();
+        let b64 = entry
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|data| data.first())
+            .and_then(Value::as_str)
+            .ok_or(Error::RpcMalformed)?;
+        out.push(Some(AccountInfo {
+            owner,
+            data: base64_decode(b64)?,
+        }));
+    }
+    Ok(out)
+}
+
 /// Account info with both decoded data and the owning program. Mirrors what
 /// the Solana RPC returns in `getAccountInfo` / `getMultipleAccounts`.
 #[derive(Debug, Clone)]
@@ -677,6 +858,54 @@ fn json_number(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_confirmed_status_does_not_satisfy_finality() {
+        assert!(reaches_commitment("confirmed", Commitment::Confirmed));
+        assert!(reaches_commitment("finalized", Commitment::Confirmed));
+        assert!(!reaches_commitment("processed", Commitment::Confirmed));
+        assert!(!reaches_commitment("confirmed", Commitment::Finalized));
+        assert!(reaches_commitment("finalized", Commitment::Finalized));
+        assert!(!reaches_commitment("", Commitment::Finalized));
+    }
+
+    #[test]
+    fn signature_infos_keep_slot_and_failure() {
+        let ok = parse_signature_info(&json!({"signature": "s", "slot": 7, "err": null})).unwrap();
+        assert_eq!(
+            ok,
+            SignatureInfo {
+                signature: "s".into(),
+                slot: 7,
+                failed: false
+            }
+        );
+        assert!(
+            parse_signature_info(&json!({"signature": "s", "slot": 7, "err": {"x": 1}}))
+                .unwrap()
+                .failed
+        );
+        assert!(parse_signature_info(&json!({"signature": "s"})).is_err());
+    }
+
+    #[test]
+    fn account_reads_carry_the_requested_commitment_and_parse_owners() {
+        let body = multiple_accounts_body(&["a".into()], Commitment::Finalized);
+        assert_eq!(body["params"][1]["commitment"], "finalized");
+        let body = multiple_accounts_body(&["a".into()], Commitment::Confirmed);
+        assert_eq!(body["params"][1]["commitment"], "confirmed");
+
+        let parsed = parse_accounts_with_owner(&json!({
+            "context": {"slot": 9},
+            "value": [null, {"owner": "prog", "data": ["AQI=", "base64"]}]
+        }))
+        .unwrap();
+        assert!(parsed[0].is_none());
+        let account = parsed[1].as_ref().unwrap();
+        assert_eq!(account.owner, "prog");
+        assert_eq!(account.data, vec![1, 2]);
+        assert!(parse_accounts_with_owner(&json!({"value": [{"data": ["", "base64"]}]})).is_err());
+    }
 
     #[test]
     fn parse_das_price_per_token_reads_helius_shape() {

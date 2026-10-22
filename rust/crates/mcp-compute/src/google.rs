@@ -319,7 +319,7 @@ impl GoogleCloudFunctionsDriver {
         if !status.is_success() {
             return Err(json_provider_error(status, &existing));
         }
-        require_tenant_label(tenant, &existing)?;
+        require_deployment_lease(tenant, &existing)?;
         if let Some((lease, created_at)) = expected_cleanup
             && (existing
                 .pointer("/labels/pay-channel")
@@ -387,6 +387,30 @@ impl GoogleCloudFunctionsDriver {
         hostname: &str,
         path: Option<&str>,
     ) -> Result<crate::payment_policy::DeploymentIdentity> {
+        Ok(self.payment_deployment_value(hostname, path).await?.0)
+    }
+
+    /// Owner-side lookup: the caller's channel must hold the deployment lease.
+    pub(crate) async fn owned_payment_deployment(
+        &self,
+        tenant: &Tenant,
+        hostname: &str,
+    ) -> Result<crate::payment_policy::DeploymentIdentity> {
+        let (identity, value) = self.payment_deployment_value(hostname, None).await?;
+        if identity.owner_key != tenant.key {
+            return Err(ComputeError::InvalidRequest(
+                "deployment belongs to a different payer".into(),
+            ));
+        }
+        require_deployment_lease(tenant, &value)?;
+        Ok(identity)
+    }
+
+    async fn payment_deployment_value(
+        &self,
+        hostname: &str,
+        path: Option<&str>,
+    ) -> Result<(crate::payment_policy::DeploymentIdentity, Value)> {
         let suffix = format!(".{}", self.config.gateway_domain);
         let id = hostname.strip_suffix(&suffix).ok_or_else(|| {
             ComputeError::InvalidRequest("hostname is outside the compute gateway domain".into())
@@ -439,12 +463,13 @@ impl GoogleCloudFunctionsDriver {
             .ok_or_else(|| {
                 ComputeError::Provider("deployment creation identity is missing".into())
             })?;
-        Ok(crate::payment_policy::DeploymentIdentity {
+        let identity = crate::payment_policy::DeploymentIdentity {
             owner_key,
             resource_name: resource,
             created_at: created_at.into(),
             hostname: hostname.into(),
-        })
+        };
+        Ok((identity, value))
     }
 
     pub fn new(config: GoogleConfig) -> Result<Self> {
@@ -967,7 +992,7 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
         if !status.is_success() {
             return Err(json_provider_error(status, &value));
         }
-        require_tenant_label(tenant, &value)?;
+        require_deployment_lease(tenant, &value)?;
         normalize_deployment(value)
     }
 
@@ -992,7 +1017,7 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|value| has_tenant_label(tenant, value))
+            .filter(|value| has_deployment_lease(tenant, value))
             .cloned()
             .map(normalize_deployment)
             .collect::<Result<Vec<_>>>()?;
@@ -1024,7 +1049,23 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
                 None,
             )
             .await?;
-        require_operation_tenant(tenant, &value)?;
+        let target = require_operation_tenant(tenant, &value)?;
+        // Deletion operations outlive their target; only a present target can
+        // still be leased to another channel.
+        let (status, function) = self
+            .send_json(
+                Method::GET,
+                format!("{}/v2/{target}", self.config.api_base),
+                None,
+            )
+            .await?;
+        if status.is_success() {
+            require_deployment_lease(tenant, &function).map_err(|_| {
+                ComputeError::Provider("operation was not found for this payer".into())
+            })?;
+        } else if status != StatusCode::NOT_FOUND {
+            return Err(json_provider_error(status, &function));
+        }
         normalize_operation(value)
     }
 
@@ -1121,6 +1162,14 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
         if !path_is_public(&public_paths, &request.path_and_query) {
             return Err(ComputeError::InvalidRequest(
                 "requested path is not published by the deployment owner".into(),
+            ));
+        }
+        if let Some(expected) = &request.expected_created_at
+            && (value.get("name").and_then(Value::as_str) != Some(resource.as_str())
+                || value.get("createTime").and_then(Value::as_str) != Some(expected.as_str()))
+        {
+            return Err(ComputeError::InvalidRequest(
+                "deployment was recreated after the payment was admitted".into(),
             ));
         }
         let deployment = normalize_deployment(value)?;
@@ -1472,7 +1521,7 @@ fn validate_owned_function_name(tenant: &Tenant, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn channel_lease_key(channel_id: &str) -> Result<String> {
+pub(crate) fn channel_lease_key(channel_id: &str) -> Result<String> {
     if channel_id.is_empty() {
         return Err(ComputeError::InvalidRequest(
             "resource deployment requires a verified payment channel".into(),
@@ -1510,6 +1559,25 @@ fn require_tenant_label(tenant: &Tenant, value: &Value) -> Result<()> {
     }
 }
 
+/// Payer-scoped reads and mutations require the exact funding channel lease.
+fn has_deployment_lease(tenant: &Tenant, value: &Value) -> bool {
+    has_tenant_label(tenant, value)
+        && channel_lease_key(&tenant.channel_id).is_ok_and(|expected| {
+            value.pointer("/labels/pay-channel").and_then(Value::as_str) == Some(expected.as_str())
+        })
+}
+
+fn require_deployment_lease(tenant: &Tenant, value: &Value) -> Result<()> {
+    require_tenant_label(tenant, value)?;
+    if has_deployment_lease(tenant, value) {
+        Ok(())
+    } else {
+        Err(ComputeError::Provider(
+            "deployment was not found for this payment channel".into(),
+        ))
+    }
+}
+
 fn require_channel_lease(channel_id: &str, value: &Value) -> Result<()> {
     let expected = channel_lease_key(channel_id)?;
     if let Some(existing) = value.pointer("/labels/pay-channel").and_then(Value::as_str)
@@ -1522,7 +1590,7 @@ fn require_channel_lease(channel_id: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn require_operation_tenant(tenant: &Tenant, value: &Value) -> Result<()> {
+fn require_operation_tenant<'a>(tenant: &Tenant, value: &'a Value) -> Result<&'a str> {
     let target = value
         .pointer("/metadata/target")
         .and_then(Value::as_str)
@@ -1530,7 +1598,8 @@ fn require_operation_tenant(tenant: &Tenant, value: &Value) -> Result<()> {
         .ok_or_else(|| ComputeError::Provider("operation omitted its target resource".into()))?;
     let name = target.rsplit('/').next().unwrap_or_default();
     validate_owned_function_name(tenant, name)
-        .map_err(|_| ComputeError::Provider("operation was not found for this payer".into()))
+        .map_err(|_| ComputeError::Provider("operation was not found for this payer".into()))?;
+    Ok(target)
 }
 
 fn validate_runtime(runtime: &str, entrypoint: &str) -> Result<()> {

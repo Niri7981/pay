@@ -2,6 +2,7 @@ pub mod demo;
 pub mod inference;
 pub mod local_registration;
 pub(crate) mod payments;
+pub(crate) mod plan_yaml;
 pub mod plans;
 pub(crate) mod provider_registration;
 pub mod scaffold;

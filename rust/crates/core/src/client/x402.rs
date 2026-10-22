@@ -166,18 +166,30 @@ pub fn build_payment_with_override(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
-    let requirements = &challenge.requirements;
-    let amount = format_amount(&requirements.amount, &requirements.currency);
-    let prompt_context = crate::client::prompt::payment_prompt_context(
-        requirements.description.as_deref(),
-        &[Some(requirements.resource.as_str()), resource_url],
-    );
-    let intent = crate::keystore::AuthIntent::authorize_payment_details(
-        &amount,
-        &prompt_context.reason,
-        &prompt_context.operator,
-    );
+    build_payment_for_attempt(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        None,
+    )
+}
 
+/// [`build_payment_with_override`] for one logical request: while `attempt`
+/// is unresolved, every build for the same offer carries the same
+/// `payment-identifier`, so the server can deduplicate a retried payment.
+pub fn build_payment_for_attempt(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    attempt: Option<&crate::client::attempt::PaymentAttempt>,
+) -> Result<BuiltPayment> {
+    let requirements = &challenge.requirements;
     let cluster_raw = normalize_network(
         requirements
             .cluster
@@ -211,16 +223,6 @@ pub fn build_payment_with_override(
         should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment_with_intent_and_override(
-            &network,
-            store,
-            account_override,
-            &amount,
-            &intent,
-            auth_override,
-        )?;
-
     let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
         if surfpool_detected {
             // `default_rpc_url("localnet")` is `http://localhost:8899`
@@ -235,6 +237,31 @@ pub fn build_payment_with_override(
         }
     });
     let rpc = RpcClient::new(rpc_url.clone());
+
+    // Value the payment at the decimals it is signed at, before approval.
+    let amount = crate::client::prompt::payment_display_amount(
+        &requirements.amount,
+        &requirements.currency,
+        exact_payment_decimals(&rpc, requirements)?,
+    )?;
+    let prompt_context = crate::client::prompt::payment_prompt_context(
+        requirements.description.as_deref(),
+        &[Some(requirements.resource.as_str()), resource_url],
+    );
+    let intent = crate::keystore::AuthIntent::authorize_payment_details(
+        &amount,
+        &prompt_context.reason,
+        &prompt_context.operator,
+    );
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &amount,
+            &intent,
+            auth_override,
+        )?;
 
     debug!(
         amount = %requirements.amount,
@@ -274,7 +301,32 @@ pub fn build_payment_with_override(
             (X402_V1_PAYMENT_HEADER, header)
         }
         _ => {
-            let extensions = build_outbound_extensions(challenge.extensions.as_ref())?;
+            let payer = signer.pubkey();
+            let payment_identifier = || match attempt {
+                Some(attempt) => crate::client::attempt::PaymentCacheKey::new(
+                    attempt,
+                    &payer,
+                    &network,
+                    "x402-payment-identifier",
+                    &[
+                        &requirements.network,
+                        requirements.cluster.as_deref().unwrap_or_default(),
+                        &requirements.amount,
+                        &requirements.currency,
+                        &requirements.recipient,
+                        &requirements.resource,
+                    ],
+                )
+                .reuse_or_insert(
+                    std::time::Duration::from_secs(
+                        requirements.max_age.unwrap_or(300).clamp(1, 3_600),
+                    ),
+                    || Ok(generate_payment_identifier_id()),
+                ),
+                None => Ok(generate_payment_identifier_id()),
+            };
+            let extensions =
+                build_outbound_extensions(challenge.extensions.as_ref(), payment_identifier)?;
             let header = rt
                 .block_on(build_payment_header_v2(
                     &signer,
@@ -301,6 +353,28 @@ pub fn build_payment_with_override(
         headers,
         ephemeral_notice,
     })
+}
+
+/// Decimals of an exact payment's asset: the challenge's, else the mint's
+/// on-chain decimals. Native SOL and known stablecoins need no lookup.
+fn exact_payment_decimals(
+    rpc: &RpcClient,
+    requirements: &PaymentRequirements,
+) -> Result<Option<crate::client::prompt::Decimals>> {
+    let decimals = if requirements.decimals.is_some()
+        || requirements.currency.eq_ignore_ascii_case("SOL")
+        || pay_types::Stablecoin::from_mint(&requirements.currency).is_some()
+        || pay_types::Stablecoin::parse_symbol(&requirements.currency).is_some()
+    {
+        requirements.decimals
+    } else {
+        pay_kit::x402::client::exact::payment_decimals(rpc, requirements)
+            .map(Some)
+            .map_err(|e| Error::Mpp(format!("Failed to resolve x402 asset decimals: {e}")))?
+    };
+    decimals
+        .map(|decimals| crate::client::prompt::Decimals::new(u64::from(decimals)))
+        .transpose()
 }
 
 /// The shared preamble every x402 payment-channel scheme needs before it can
@@ -416,7 +490,8 @@ fn prepare_channel_payment(
     // `PaymentLimit::from_amount`, which would drop the amount-specific spend
     // limit and fall back to the generic authorization action. Keep the amount
     // canonical and carry the escrow context in the intent kind instead.
-    let display_amount = format_amount(offer.amount, offer.asset);
+    let display_amount =
+        crate::client::prompt::payment_display_amount(offer.amount, offer.asset, None)?;
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
     let intent = if offer.channel_escrow {
         crate::keystore::AuthIntent::authorize_channel_escrow(
@@ -582,6 +657,98 @@ pub fn build_upto_payment_with_override(
     })
 }
 
+const UPTO_HEADER_KIND: &str = "x402-upto-header";
+
+/// The terms that identify an upto offer across challenges: blockhash and
+/// slot hints change on every challenge, the offer does not.
+fn upto_offer_terms(requirements: &pay_kit::x402::upto::UptoRequirements) -> Result<[String; 6]> {
+    let mut extra = serde_json::to_value(&requirements.extra)?;
+    if let Some(extra) = extra.as_object_mut() {
+        for hint in ["recentBlockhash", "lastValidBlockHeight", "recentSlot"] {
+            extra.remove(hint);
+        }
+    }
+    Ok([
+        requirements.network.clone(),
+        requirements.amount.clone(),
+        requirements.asset.clone(),
+        requirements.pay_to.clone(),
+        requirements.max_timeout_seconds.to_string(),
+        extra.to_string(),
+    ])
+}
+
+/// [`build_upto_payment_with_override`] for one logical request. While
+/// `attempt` is unresolved, a retry for the same offer resends the exact
+/// header already signed — same nonce, same channel — instead of opening
+/// another channel whose settlement could charge the payer again.
+#[allow(clippy::too_many_arguments)]
+pub fn build_upto_payment_for_attempt(
+    challenge: &UptoChallenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    attempt: &crate::client::attempt::PaymentAttempt,
+) -> Result<BuiltPayment> {
+    let requirements = &challenge.requirements;
+    let route = resolve_channel_route(
+        &ChannelOffer {
+            network: &requirements.network,
+            amount: &requirements.amount,
+            asset: &requirements.asset,
+            channel_escrow: false,
+            recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
+        },
+        network_override,
+    )?;
+    // Signed material is reusable only by the wallet that signed it; with no
+    // payer known up front, sign afresh.
+    let Some(payer) = configured_channel_payer(store, &route.network, account_override)? else {
+        return build_upto_payment_with_override(
+            challenge,
+            store,
+            network_override,
+            account_override,
+            resource_url,
+            auth_override,
+        );
+    };
+    let terms = upto_offer_terms(requirements)?;
+    let key = crate::client::attempt::PaymentCacheKey::new(
+        attempt,
+        &payer,
+        &route.network,
+        UPTO_HEADER_KIND,
+        &terms.each_ref().map(String::as_str),
+    );
+    let mut ephemeral_notice = None;
+    let header = key.reuse_or_insert(
+        std::time::Duration::from_secs(requirements.max_timeout_seconds.clamp(1, 3_600)),
+        || {
+            let mut built = build_upto_payment_with_override(
+                challenge,
+                store,
+                network_override,
+                account_override,
+                resource_url,
+                auth_override,
+            )?;
+            ephemeral_notice = built.ephemeral_notice.take();
+            built
+                .headers
+                .pop()
+                .map(|(_, value)| value)
+                .ok_or_else(|| Error::Mpp("x402 upto payment built no header".to_string()))
+        },
+    )?;
+    Ok(BuiltPayment {
+        headers: vec![(X402_V2_PAYMENT_HEADER, header)],
+        ephemeral_notice,
+    })
+}
+
 /// Try to parse an x402 `batch-settlement` challenge from headers and/or body.
 ///
 /// Checked before `exact`: a `batch-settlement`-only 402 also parses leniently
@@ -736,6 +903,33 @@ pub fn build_batch_payment(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltBatchPayment> {
+    build_batch_payment_checked(
+        challenge,
+        store,
+        cache,
+        deposit_amount,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        &|_| Ok(()),
+    )
+}
+
+/// [`build_batch_payment`], calling `authorize_escrow` with the exact amount
+/// an `open` or `top_up` would move into escrow before any approval or signing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_batch_payment_checked(
+    challenge: &BatchChallenge,
+    store: &dyn AccountsStore,
+    cache: &crate::client::batch::BatchChannelCache,
+    deposit_amount: Option<u64>,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    authorize_escrow: &dyn Fn(u64) -> Result<()>,
+) -> Result<BuiltBatchPayment> {
     use pay_kit::x402::client::batch_settlement as batch_client;
 
     // Resolve ambiguous funding before wallet approval or building another
@@ -774,6 +968,9 @@ pub fn build_batch_payment(
                 .max(price),
         ),
     };
+    if let Some(escrow) = escrow_amount {
+        authorize_escrow(escrow)?;
+    }
     // Opening and topping up move additional funds into escrow, so both must
     // go through wallet approval. A voucher/authorization only spends capacity
     // covered by the already-approved deposit and can reuse its resident
@@ -959,8 +1156,10 @@ pub fn build_siwx_auth_header_with_override(
 ) -> Result<BuiltPayment> {
     let (chain, network) = sign_in_chain(challenge, network_override)?;
     let desc = crate::client::prompt::payment_description(None, &[resource_url]);
-    let reason = format!("authorize sign-in for {desc}");
-    let intent = crate::keystore::AuthIntent::from_reason(&reason);
+    let intent = crate::keystore::AuthIntent::sign_in(format!(
+        "sign in to {} ({}) with your wallet for {desc}",
+        challenge.extension.domain, challenge.extension.uri
+    ));
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_with_intent_and_override(
             &network,
@@ -1075,11 +1274,11 @@ fn parse_siwx_extension(
 /// and appends a fresh `payment-identifier.info.id` when the server
 /// flagged that extension `info.required = true`.
 ///
-/// TODO: cache the generated id keyed on `(resource_url, body_hash)`
-/// so HTTP-level retries of the same logical request reuse the same
-/// idempotency key and benefit from server-side cached 200s.
+/// `payment_identifier` supplies the id, so retries of one logical request
+/// can reuse theirs.
 fn build_outbound_extensions(
     inbound: Option<&serde_json::Value>,
+    payment_identifier: impl FnOnce() -> Result<String>,
 ) -> Result<Option<PaymentExtensions>> {
     let Some(mut ext) = PaymentExtensions::echoing(inbound)
         .map_err(|e| Error::Mpp(format!("malformed PAYMENT-REQUIRED extensions: {e}")))?
@@ -1087,7 +1286,7 @@ fn build_outbound_extensions(
         return Ok(None);
     };
     if ext.requires_payment_identifier() {
-        ext = ext.with_payment_identifier_id(generate_payment_identifier_id());
+        ext = ext.with_payment_identifier_id(payment_identifier()?);
     }
     Ok(Some(ext))
 }
@@ -1119,43 +1318,9 @@ fn parse_payment_required_envelope_header(value: &str) -> Option<PaymentRequired
     serde_json::from_slice::<PaymentRequiredEnvelope>(&decoded).ok()
 }
 
+#[cfg(test)]
 fn format_amount(amount: &str, currency: &str) -> String {
-    let base: u64 = amount.parse().unwrap_or(0);
-    let value = if currency.to_uppercase() == "SOL" {
-        base as f64 / 1_000_000_000.0
-    } else {
-        base as f64 / 1_000_000.0
-    };
-    format!("${}", format_value(value))
-}
-
-fn format_value(v: f64) -> String {
-    if v == 0.0 {
-        "0".to_string()
-    } else if v >= 0.01 && is_cent_exact(v) {
-        format!("{v:.2}")
-    } else if v >= 0.01 {
-        format_precise_value(v, 6)
-    } else if v >= 0.001 {
-        format!("{v:.3}")
-    } else if v >= 0.0001 {
-        format!("{v:.4}")
-    } else {
-        format!("{v:.6}")
-    }
-}
-
-fn is_cent_exact(v: f64) -> bool {
-    let rounded_to_cent = (v * 100.0).round() / 100.0;
-    (v - rounded_to_cent).abs() < 0.0000005
-}
-
-fn format_precise_value(v: f64, decimals: usize) -> String {
-    let mut value = format!("{v:.decimals$}");
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
-    }
-    value
+    crate::client::prompt::payment_display_amount(amount, currency, None).unwrap()
 }
 
 fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u64 {
@@ -1204,6 +1369,89 @@ fn x402_version_from_json(body: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn batch_challenge_with_min_deposit(min_deposit: &str) -> BatchChallenge {
+        use base64::Engine;
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "minDeposit": min_deposit,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                }
+            }]
+        });
+        let headers = vec![(
+            "payment-required".to_string(),
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&envelope).unwrap()),
+        )];
+        match crate::client::runner::classify_402(&headers, None, "https://example.com/r") {
+            crate::client::runner::RunOutcome::X402BatchChallenge { challenge, .. } => *challenge,
+            other => panic!("expected a batch challenge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_escrow_from_min_deposit_is_authorized_before_signing() {
+        let challenge = batch_challenge_with_min_deposit("5000000");
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let cache = crate::client::batch::BatchChannelCache::default();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let result = build_batch_payment_checked(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &|escrow| {
+                seen.lock().unwrap().push(escrow);
+                if escrow > 1000 {
+                    Err(Error::PaymentRejected(format!("escrow {escrow} over cap")))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let err = result.expect_err("oversized escrow must be refused");
+        assert!(err.to_string().contains("escrow 5000000 over cap"), "{err}");
+        assert_eq!(*seen.lock().unwrap(), vec![5_000_000]);
+    }
+
+    #[test]
+    fn batch_escrow_without_min_deposit_is_the_request_price() {
+        let challenge = batch_challenge_with_min_deposit("10");
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let cache = crate::client::batch::BatchChannelCache::default();
+        let seen = std::sync::Mutex::new(Vec::new());
+        // A minimum below the price is ignored; the open escrows the price.
+        let _ = build_batch_payment_checked(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &|escrow| {
+                seen.lock().unwrap().push(escrow);
+                Ok(())
+            },
+        );
+        assert_eq!(*seen.lock().unwrap(), vec![1000]);
+    }
     use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use pay_kit::x402::exact::EXACT_SCHEME;
 
@@ -1262,37 +1510,37 @@ mod tests {
 
     #[test]
     fn format_value_zero() {
-        assert_eq!(format_value(0.0), "0");
+        assert_eq!(crate::client::prompt::format_value(0.0), "0");
     }
 
     #[test]
     fn format_value_large() {
-        assert_eq!(format_value(1.5), "1.50");
+        assert_eq!(crate::client::prompt::format_value(1.5), "1.50");
     }
 
     #[test]
     fn format_value_preserves_fractional_cent_fees() {
-        assert_eq!(format_value(1.0015), "1.0015");
+        assert_eq!(crate::client::prompt::format_value(1.0015), "1.0015");
     }
 
     #[test]
     fn format_value_cents() {
-        assert_eq!(format_value(0.01), "0.01");
+        assert_eq!(crate::client::prompt::format_value(0.01), "0.01");
     }
 
     #[test]
     fn format_value_milli() {
-        assert_eq!(format_value(0.005), "0.005");
+        assert_eq!(crate::client::prompt::format_value(0.005), "0.005");
     }
 
     #[test]
     fn format_value_micro() {
-        assert_eq!(format_value(0.0005), "0.0005");
+        assert_eq!(crate::client::prompt::format_value(0.0005), "0.0005");
     }
 
     #[test]
     fn format_value_tiny() {
-        assert_eq!(format_value(0.00005), "0.000050");
+        assert_eq!(crate::client::prompt::format_value(0.00005), "0.000050");
     }
 
     #[test]
@@ -1307,7 +1555,8 @@ mod tests {
 
     #[test]
     fn format_amount_sol() {
-        assert_eq!(format_amount("1000000000", "SOL"), "$1.00");
+        assert_eq!(format_amount("1000000000", "SOL"), "1 SOL");
+        assert_eq!(format_amount("1500000001", "sol"), "1.500000001 SOL");
     }
 
     #[test]
@@ -1561,9 +1810,11 @@ mod tests {
             serde_json::json!(true)
         );
 
-        let outbound = build_outbound_extensions(challenge.extensions.as_ref())
-            .unwrap()
-            .expect("outbound extensions produced");
+        let outbound = build_outbound_extensions(challenge.extensions.as_ref(), || {
+            Ok(generate_payment_identifier_id())
+        })
+        .unwrap()
+        .expect("outbound extensions produced");
         let pid = outbound
             .payment_identifier
             .as_ref()
@@ -1577,9 +1828,333 @@ mod tests {
         assert!(id.len() >= 16 && id.len() <= 128);
     }
 
+    fn upto_challenge(blockhash: &str, amount: &str) -> UptoChallenge {
+        UptoChallenge {
+            requirements: serde_json::from_value(serde_json::json!({
+                "scheme": "upto",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": amount,
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "receiverAuthorizer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "recentBlockhash": blockhash,
+                    "recentSlot": "42",
+                }
+            }))
+            .unwrap(),
+        }
+    }
+
+    /// A mainnet wallet known by its public key only: anything that needs
+    /// to sign with it fails.
+    fn upto_payer_store(pubkey: &str) -> MemoryAccountsStore {
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some(pubkey.to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        MemoryAccountsStore::with_file(file)
+    }
+
+    const UPTO_PAYER: &str = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
+    const OTHER_UPTO_PAYER: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+
+    fn record_signed_upto_header(
+        attempt: &crate::client::attempt::PaymentAttempt,
+        payer: &str,
+        challenge: &UptoChallenge,
+    ) {
+        let terms = upto_offer_terms(&challenge.requirements).unwrap();
+        crate::client::attempt::PaymentCacheKey::new(
+            attempt,
+            &payer.parse().unwrap(),
+            "mainnet",
+            UPTO_HEADER_KIND,
+            &terms.each_ref().map(String::as_str),
+        )
+        .reuse_or_insert(std::time::Duration::from_secs(300), || {
+            Ok("original-signed-header".to_string())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn an_ambiguous_upto_retry_resends_the_original_header() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://api.example/metered",
+            Some(b"{\"prompt\":\"hi\"}"),
+        );
+        // The first attempt signed this header; its response was lost.
+        record_signed_upto_header(
+            &attempt,
+            UPTO_PAYER,
+            &upto_challenge("11111111111111111111111111111111", "250000"),
+        );
+
+        // The retry's challenge carries fresh hints. The wallet cannot sign,
+        // so anything but a resend would fail.
+        let store = upto_payer_store(UPTO_PAYER);
+        let retry = upto_challenge("SysvarRent111111111111111111111111111111111", "250000");
+        let built = build_upto_payment_for_attempt(
+            &retry,
+            &store,
+            None,
+            None,
+            Some("https://api.example/metered"),
+            None,
+            &attempt,
+        )
+        .expect("pending header is resent without signing");
+        assert_eq!(
+            built.headers,
+            vec![(X402_V2_PAYMENT_HEADER, "original-signed-header".to_string())]
+        );
+
+        // A different ceiling is a different offer and must be built afresh.
+        let repriced = upto_challenge("SysvarRent111111111111111111111111111111111", "500000");
+        assert!(
+            build_upto_payment_for_attempt(&repriced, &store, None, None, None, None, &attempt)
+                .is_err()
+        );
+
+        // A definitive answer ends the attempt: the next call builds anew.
+        attempt.resolved();
+        assert!(
+            build_upto_payment_for_attempt(&retry, &store, None, None, None, None, &attempt)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pending_upto_header_is_never_resent_for_another_wallet() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://api.example/metered-other-wallet",
+            Some(b"{}"),
+        );
+        let challenge = upto_challenge("11111111111111111111111111111111", "250000");
+        record_signed_upto_header(&attempt, UPTO_PAYER, &challenge);
+
+        for store in [
+            upto_payer_store(OTHER_UPTO_PAYER),
+            MemoryAccountsStore::new(),
+        ] {
+            assert!(
+                build_upto_payment_for_attempt(
+                    &challenge, &store, None, None, None, None, &attempt
+                )
+                .is_err(),
+                "another wallet must sign its own payment"
+            );
+        }
+        // Positive control: the signing wallet still gets its header back.
+        assert!(
+            build_upto_payment_for_attempt(
+                &challenge,
+                &upto_payer_store(UPTO_PAYER),
+                None,
+                None,
+                None,
+                None,
+                &attempt
+            )
+            .is_ok()
+        );
+        attempt.resolved();
+    }
+
+    fn payment_identifier_store() -> MemoryAccountsStore {
+        const TEST_KEYPAIR_BYTES: [u8; 64] = [
+            41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
+            204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
+            72, 22, 157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100,
+            246, 17, 170, 104, 17, 151, 48,
+        ];
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "devnet",
+            "default",
+            Account {
+                backend: BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(TEST_KEYPAIR_BYTES).into_string()),
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        MemoryAccountsStore::with_file(file)
+    }
+
+    fn payment_identifier_challenge(blockhash_seed: u8, amount: &str) -> Challenge {
+        Challenge {
+            x402_version: pay_kit::x402::X402_VERSION_V2,
+            requirements: serde_json::from_value(serde_json::json!({
+                "network": SOLANA_DEVNET,
+                "cluster": "devnet",
+                "recipient": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
+                "amount": amount,
+                "currency": "SOL",
+                "resource": "https://provider.example/resource",
+                "maxAge": 300,
+                "recentBlockhash": bs58::encode([blockhash_seed; 32]).into_string(),
+            }))
+            .unwrap(),
+            siwx: None,
+            extensions: Some(serde_json::json!({
+                "payment-identifier": {
+                    "info": { "required": true },
+                    "schema": { "type": "object", "required": ["id"] }
+                }
+            })),
+        }
+    }
+
+    fn sent_payment_identifier(built: &BuiltPayment) -> String {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&built.headers[0].1)
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        envelope["extensions"]["payment-identifier"]["info"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn retries_of_one_unresolved_request_keep_their_payment_identifier() {
+        let store = payment_identifier_store();
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"q\":1}"),
+        );
+        let build = |challenge: &Challenge| {
+            build_payment_for_attempt(
+                challenge,
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        // The retry gets a fresh challenge (new blockhash) for the same offer.
+        let first = build(&payment_identifier_challenge(1, "1000"));
+        let retry = build(&payment_identifier_challenge(2, "1000"));
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&retry)
+        );
+        assert_ne!(
+            first.headers[0].1, retry.headers[0].1,
+            "the transaction is rebuilt"
+        );
+
+        // Different terms are a different payment.
+        let repriced = build(&payment_identifier_challenge(2, "2000"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&repriced)
+        );
+
+        // Once the server answered, a new call is a new payment.
+        attempt.resolved();
+        let next = build(&payment_identifier_challenge(3, "1000"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&next)
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn a_pending_payment_identifier_is_never_reused_by_another_wallet() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"q\":\"other-wallet\"}"),
+        );
+        let build = |store: &MemoryAccountsStore, seed| {
+            build_payment_for_attempt(
+                &payment_identifier_challenge(seed, "1000"),
+                store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        let payer = payment_identifier_store();
+        let first = build(&payer, 1);
+        // Another tenant's wallet (a fresh ephemeral) makes the same request.
+        let other = build(&MemoryAccountsStore::new(), 2);
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&other)
+        );
+        // Positive control: the first wallet's retry still reuses its own.
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&build(&payer, 3))
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn builds_without_an_attempt_get_fresh_payment_identifiers() {
+        let store = payment_identifier_store();
+        let build = |seed| {
+            build_payment(
+                &payment_identifier_challenge(seed, "1000"),
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+            )
+            .unwrap()
+        };
+        assert_ne!(
+            sent_payment_identifier(&build(1)),
+            sent_payment_identifier(&build(2))
+        );
+    }
+
     #[test]
     fn build_outbound_extensions_returns_none_when_inbound_absent() {
-        assert!(build_outbound_extensions(None).unwrap().is_none());
+        assert!(
+            build_outbound_extensions(None, || Ok(generate_payment_identifier_id()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1590,9 +2165,11 @@ mod tests {
         let inbound = serde_json::json!({
             "payment-identifier": { "info": { "required": false } }
         });
-        let outbound = build_outbound_extensions(Some(&inbound))
-            .unwrap()
-            .expect("echoed");
+        let outbound = build_outbound_extensions(Some(&inbound), || {
+            panic!("no id is generated when the server does not require one")
+        })
+        .unwrap()
+        .expect("echoed");
         assert!(!outbound.requires_payment_identifier());
         assert!(
             outbound
@@ -1878,6 +2455,89 @@ mod tests {
         assert_eq!(payload.address, pubkey);
         assert_eq!(payload.chain_id, SOLANA_DEVNET);
         assert!(pay_kit::x402::siwx::verify_siwx_payload(&payload).unwrap());
+    }
+
+    #[test]
+    fn build_siwx_auth_header_asks_for_a_sign_in_approval_naming_the_site() {
+        use std::sync::{Arc, Mutex};
+        struct Recording(Arc<Mutex<Vec<crate::keystore::AuthIntent>>>);
+        impl crate::keystore::AuthGate for Recording {
+            fn authenticate(
+                &self,
+                intent: &crate::keystore::AuthIntent,
+            ) -> pay_keystore::Result<()> {
+                self.0.lock().unwrap().push(intent.clone());
+                Ok(())
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let keypair = solana_keypair::Keypair::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            Account {
+                backend: BackendKind::File,
+                provider: None,
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some(solana_signer::Signer::pubkey(&keypair).to_string()),
+                vault: None,
+                account: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = MemoryAccountsStore::with_file(file);
+        let challenge = SiwxAuthChallenge {
+            extension: pay_kit::x402::siwx::SiwxExtension::new(
+                pay_kit::x402::siwx::SiwxExtensionInfo {
+                    domain: "merchant.example".to_string(),
+                    uri: "https://merchant.example/data".to_string(),
+                    statement: None,
+                    version: "1".to_string(),
+                    nonce: "nonce-1".to_string(),
+                    issued_at: "2026-10-19T00:00:00Z".to_string(),
+                    expiration_time: None,
+                    not_before: None,
+                    request_id: None,
+                    resources: None,
+                },
+                pay_kit::x402::siwx::default_solana_siwx_chains(),
+            ),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        build_siwx_auth_header_with_override(
+            &challenge,
+            &store,
+            Some("mainnet"),
+            Some("default"),
+            Some("https://merchant.example/data"),
+            Some(Box::new(Recording(seen.clone()))),
+        )
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].signs_raw_proof(), "{:?}", seen[0]);
+        assert!(!seen[0].moves_money());
+        assert!(
+            seen[0].message().contains("merchant.example"),
+            "{:?}",
+            seen[0]
+        );
     }
 
     #[test]

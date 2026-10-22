@@ -155,9 +155,13 @@ fn parse_network(value: &str) -> Result<SolanaNetwork, String> {
         "mainnet" | "mainnet-beta" | "solana:mainnet" => Ok(SolanaNetwork::Mainnet),
         "devnet" | "solana:devnet" => Ok(SolanaNetwork::Devnet),
         "localnet" | "localhost" => Ok(SolanaNetwork::Localnet),
-        value => pay_kit::x402::exact::cluster_for_caip2_network(value)
-            .and_then(|cluster| cluster.parse().ok())
-            .ok_or_else(|| format!("invalid Solana network `{value}`")),
+        value => match pay_kit::x402::exact::cluster_for_caip2_network(value) {
+            Some("mainnet-beta") => Ok(SolanaNetwork::Mainnet),
+            Some(cluster) => cluster
+                .parse()
+                .map_err(|_| format!("invalid Solana network `{value}`")),
+            None => Err(format!("invalid Solana network `{value}`")),
+        },
     }
 }
 
@@ -168,6 +172,17 @@ pub struct McpPermissions(ClientPermissions);
 impl McpPermissions {
     pub fn from_config(config: &PermissionConfig) -> Result<Self, String> {
         config.build().map(Self)
+    }
+
+    /// Permissions for hosted tenants: mainnet and known stablecoins only,
+    /// from any origin. Amounts are bounded by the tenant spending policy.
+    pub fn hosted() -> Self {
+        Self::from_config(&PermissionConfig {
+            networks: Some(vec!["mainnet".to_string()]),
+            unlimited_amount: true,
+            ..Default::default()
+        })
+        .expect("hosted payment permissions are statically valid")
     }
 
     fn authorize(
@@ -260,6 +275,42 @@ impl McpPermissions {
         )
     }
 
+    /// Authorize the deposit an operator-signed session open would lock.
+    pub fn authorize_session(
+        &self,
+        challenge: &mpp::Challenge,
+        resource_url: &str,
+    ) -> Result<(), pay_core::Error> {
+        let request: pay_kit::mpp::SessionRequest = challenge
+            .request
+            .decode()
+            .map_err(|error| permission_error(format!("invalid MPP session: {error}")))?;
+        let deposit = pay_core::session::operator_session_deposit(&request)
+            .map_err(|error| permission_error(error.to_string()))?;
+        self.authorize(
+            resource_url,
+            &request.method_details.network,
+            &request.currency,
+            deposit,
+        )
+    }
+
+    /// Authorize the escrow a batch `open` or `top_up` would deposit.
+    pub fn authorize_batch_escrow(
+        &self,
+        challenge: &x402::BatchChallenge,
+        resource_url: &str,
+        escrow: u64,
+    ) -> Result<(), pay_core::Error> {
+        let requirement = &challenge.requirements;
+        self.authorize(
+            resource_url,
+            &requirement.network,
+            &requirement.asset,
+            escrow,
+        )
+    }
+
     pub fn reject_unsupported(&self, kind: &str) -> Result<(), pay_core::Error> {
         Err(permission_error(format!(
             "{kind} is not supported when MCP payment permissions are enabled"
@@ -312,5 +363,161 @@ assets:
     fn unknown_yaml_fields_are_rejected() {
         let error = serde_yml::from_str::<PermissionConfig>("maximum: 1").unwrap_err();
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    #[test]
+    fn hosted_permissions_allow_known_stablecoins_on_mainnet_only() {
+        let hosted = McpPermissions::hosted();
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", "USDC", 50_000_000)
+                .is_ok()
+        );
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", USDC, 1)
+                .is_ok()
+        );
+        // Challenge-selected custom mints, native SOL, and other clusters
+        // never reach the hosted signer.
+        let custom = "So11111111111111111111111111111111111111112";
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", custom, 1)
+                .is_err()
+        );
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "mainnet", "SOL", 1)
+                .is_err()
+        );
+        assert!(
+            hosted
+                .authorize("https://any.example/x", "devnet", "USDC", 1)
+                .is_err()
+        );
+        assert!(hosted.authorize("not a url", "mainnet", "USDC", 1).is_err());
+    }
+
+    fn session_challenge(currency: &str, suggested: &str) -> mpp::Challenge {
+        let request = serde_json::json!({
+            "amount": "1",
+            "currency": currency,
+            "recipient": "11111111111111111111111111111111",
+            "suggestedDeposit": suggested,
+            "methodDetails": {
+                "network": "mainnet",
+                "channelProgram": "11111111111111111111111111111111",
+                "voucherSigner": "operator",
+            },
+        });
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "session",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn session_deposit_is_authorized_against_the_cap() {
+        let capped = McpPermissions::from_config(&PermissionConfig {
+            max_payment: Some("$1".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            capped
+                .authorize_session(&session_challenge("USDC", "1000000"), "https://a.example/x")
+                .is_ok()
+        );
+        assert!(
+            capped
+                .authorize_session(&session_challenge("USDC", "1000001"), "https://a.example/x")
+                .is_err()
+        );
+        assert!(
+            McpPermissions::hosted()
+                .authorize_session(&session_challenge("SOL", "1"), "https://a.example/x")
+                .is_err()
+        );
+    }
+
+    fn batch_challenge(min_deposit: &str) -> x402::BatchChallenge {
+        use base64::Engine;
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "batch-settlement",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": "1000",
+                "asset": USDC,
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "minDeposit": min_deposit,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                }
+            }]
+        });
+        let headers = vec![(
+            "payment-required".to_string(),
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&envelope).unwrap()),
+        )];
+        match pay_core::client::runner::classify_402(&headers, None, "https://a.example/x") {
+            pay_core::client::runner::RunOutcome::X402BatchChallenge { challenge, .. } => {
+                *challenge
+            }
+            other => panic!("expected batch challenge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caip2_networks_resolve_to_their_cluster() {
+        assert_eq!(
+            parse_network("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
+            Ok(SolanaNetwork::Mainnet)
+        );
+        assert_eq!(
+            parse_network("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"),
+            Ok(SolanaNetwork::Devnet)
+        );
+        assert!(parse_network("solana:unknown").is_err());
+    }
+
+    #[test]
+    fn batch_escrow_is_capped_even_when_the_request_price_fits() {
+        let capped = McpPermissions::from_config(&PermissionConfig {
+            max_payment: Some("$1".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let challenge = batch_challenge("5000000");
+        assert!(
+            capped
+                .authorize_batch(&challenge, "https://a.example/x")
+                .is_ok()
+        );
+        assert!(
+            capped
+                .authorize_batch_escrow(&challenge, "https://a.example/x", 5_000_000)
+                .is_err()
+        );
+        assert!(
+            capped
+                .authorize_batch_escrow(&challenge, "https://a.example/x", 1_000_000)
+                .is_ok()
+        );
+        assert!(
+            capped
+                .authorize_batch_escrow(&challenge, "https://a.example/x", 1_000_001)
+                .is_err()
+        );
     }
 }

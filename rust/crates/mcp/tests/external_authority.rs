@@ -643,17 +643,21 @@ async fn failed_context_and_forged_caller_are_not_authorization_fallbacks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn canonical_yaml_rejection_remains_fail_closed_without_a_fallback() {
+async fn canonical_yaml_reaches_authority_after_network_normalization() {
     let m = Merchant::new("exact").await;
-    let a = Authority::new(Decision::Allow);
+    let a = Authority::new(Decision::Deny);
     let mut c = Context::new(Some(a.clone()));
     c.permissions = Some(Arc::new(
         McpPermissions::from_config(&serde_yml::from_str("max_payment: '$1.00'").unwrap()).unwrap(),
     ));
     let c = Arc::new(c);
-    let result = call(c.clone(), args(&m.url, Some("existing-yaml-rejection"))).await;
-    assert!(text(&result).contains("invalid Solana network"));
-    assert_eq!(a.calls.load(Ordering::SeqCst), 0);
+    let result = call(
+        c.clone(),
+        args(&m.url, Some("canonical-yaml-authority-denial")),
+    )
+    .await;
+    assert!(text(&result).contains("DENIED"));
+    assert_eq!(a.calls.load(Ordering::SeqCst), 1);
     assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
     assert_eq!(c.approval.load(Ordering::SeqCst), 0);
     assert_eq!(m.paid.load(Ordering::SeqCst), 0);

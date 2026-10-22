@@ -29,6 +29,9 @@ pub enum AuthIntent {
     OpenSession(String),
     UseGatewayFeePayer(String),
     UseAccount(String),
+    /// A raw wallet proof for a third party (a sign-in message). Moves no
+    /// money, but can unlock access the wallet already paid for.
+    SignIn(String),
     /// One-approval authorization for a `pay push` CSV batch. Shown once
     /// after read-only preflight, naming the exact recipient count, token
     /// total, and worst-case ceiling (including gasless reimbursement) the
@@ -337,6 +340,16 @@ impl AuthIntent {
         Self::UseAccount(message.into())
     }
 
+    pub fn sign_in(message: impl Into<String>) -> Self {
+        Self::SignIn(normalize_message(&message.into()))
+    }
+
+    /// Whether approving this intent releases a signature over a message a
+    /// third party chose.
+    pub fn signs_raw_proof(&self) -> bool {
+        matches!(self, Self::SignIn(_))
+    }
+
     pub fn from_reason(reason: &str) -> Self {
         let message = normalize_message(reason);
         let lower = message.to_ascii_lowercase();
@@ -379,7 +392,8 @@ impl AuthIntent {
             | Self::DeleteAccount(message)
             | Self::OpenSession(message)
             | Self::UseGatewayFeePayer(message)
-            | Self::UseAccount(message) => message,
+            | Self::UseAccount(message)
+            | Self::SignIn(message) => message,
         }
     }
 
@@ -814,6 +828,21 @@ mod tests {
 
         assert!(message.ends_with("..."));
         assert!(message.len() < 230);
+    }
+
+    #[test]
+    fn sign_in_is_a_raw_proof_that_moves_no_money() {
+        let intent =
+            AuthIntent::sign_in("sign in to  merchant.example\n(https://merchant.example)");
+        assert!(intent.signs_raw_proof());
+        assert!(!intent.moves_money());
+        assert_eq!(intent.amount_minor_units(), None);
+        assert_eq!(
+            intent.prompt_message(),
+            "sign in to merchant.example (https://merchant.example)"
+        );
+        assert!(!AuthIntent::use_account("read").signs_raw_proof());
+        assert!(!AuthIntent::default_payment().signs_raw_proof());
     }
 
     #[test]

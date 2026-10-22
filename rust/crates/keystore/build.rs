@@ -57,7 +57,7 @@ fn main() {
         match status {
             Ok(s) if s.success() => {
                 let sign = std::process::Command::new(CODESIGN)
-                    .args(["-s", "-", "-f", "--entitlements"])
+                    .args(["-s", "-", "-f", "--options", "kill,hard", "--entitlements"])
                     .arg(&entitlements)
                     .arg(&marker)
                     .status();

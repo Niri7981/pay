@@ -74,6 +74,8 @@ async fn generic_payment_state_rejects_unavailable_credit_provider() {
             currency: pay_kit::mpp::mints::USDC_DEVNET.to_string(),
             network: "devnet".into(),
             challenge_binding_secret: Some("credit-provider-gate-test-secret".into()),
+            realm: Some("test-realm".to_string()),
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
             ..Default::default()
         })
         .unwrap(),
@@ -214,6 +216,8 @@ async fn channel_charge_handler_receipt_replay_and_preflight() {
             payee_signer: operator.clone(),
             hooks: ChannelHooks::default(),
         }),
+        realm: Some("test-realm".to_string()),
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         ..Default::default()
     })
     .unwrap()

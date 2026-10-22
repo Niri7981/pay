@@ -75,6 +75,7 @@ async fn run_worker(rpc_url: &str, redis_url: &str, prefix: &str, operator: &Sig
         .env("PAY_MPP_REDIS_URL", redis_url)
         .env("PAY_MPP_REDIS_PREFIX", prefix)
         .env("PAY_X402_REDIS_PREFIX", format!("{prefix}unused-batch:"))
+        .env("PAY_RESOURCE_CLEANUP_DRIVERS", "none")
         .env("RUN_ONCE", "true")
         .env("DRY_RUN", "false")
         .env("RUST_LOG", "info")

@@ -75,6 +75,56 @@ impl StreamCompletion {
     }
 }
 
+/// Trusted handler observer for usage-metered live responses, carried in
+/// response extensions. The payment adapter records each committed usage
+/// increment; the callback receives the committed USD total exactly once, when
+/// the last owner drops (zero when nothing was committed).
+#[derive(Clone)]
+pub struct MeteredSettlement(Arc<MeteredState>);
+
+type MeteredCallback = Box<dyn FnOnce(f64) + Send>;
+
+struct MeteredState {
+    committed_usd: Mutex<f64>,
+    callback: Mutex<Option<MeteredCallback>>,
+}
+
+impl Drop for MeteredState {
+    fn drop(&mut self) {
+        let committed = *self
+            .committed_usd
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(callback) = self
+            .callback
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            callback(committed);
+        }
+    }
+}
+
+impl MeteredSettlement {
+    pub fn with_callback(callback: impl FnOnce(f64) + Send + 'static) -> Self {
+        Self(Arc::new(MeteredState {
+            committed_usd: Mutex::new(0.0),
+            callback: Mutex::new(Some(Box::new(callback))),
+        }))
+    }
+
+    /// Record one durably committed usage increment.
+    pub fn record(&self, base_units: u64, decimals: u8) {
+        let usd = base_units as f64 / 10f64.powi(i32::from(decimals));
+        *self
+            .0
+            .committed_usd
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) += usd;
+    }
+}
+
 type SettlementResult = Result<Option<(HeaderName, HeaderValue)>, String>;
 type Outcome = (
     bool,
@@ -379,6 +429,28 @@ mod tests {
             );
             assert_eq!(*outcomes.lock().unwrap(), vec![end == "complete"]);
         }
+    }
+
+    #[test]
+    fn metered_settlement_reports_committed_usage_once_on_last_drop() {
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = outcomes.clone();
+        let observer = MeteredSettlement::with_callback(move |usd| {
+            recorded.lock().unwrap().push(usd);
+        });
+        let meter = observer.clone();
+        meter.record(150_000, 6);
+        meter.record(1, 6);
+        drop(observer);
+        assert!(outcomes.lock().unwrap().is_empty(), "a clone still owns it");
+        drop(meter);
+        assert_eq!(*outcomes.lock().unwrap(), vec![0.150_001]);
+
+        let recorded = outcomes.clone();
+        drop(MeteredSettlement::with_callback(move |usd| {
+            recorded.lock().unwrap().push(usd);
+        }));
+        assert_eq!(*outcomes.lock().unwrap(), vec![0.150_001, 0.0]);
     }
 
     #[tokio::test]

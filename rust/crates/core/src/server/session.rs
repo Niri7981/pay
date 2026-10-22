@@ -154,6 +154,8 @@ pub mod terminal_errors {
     pub const PREDATES_PROOF_BINDING: &str = "predates proof binding";
     /// The bearer proof presented doesn't match what was bound at open.
     pub const PROOF_MISMATCH: &str = "does not match the proof bound at open";
+    /// The channel was closed, sealed or distributed on-chain.
+    pub const CLOSED_ONCHAIN: &str = "payment channel is no longer open on-chain";
 }
 fn session_close_already_finalized(message: &str) -> bool {
     message.contains("already finalized")
@@ -161,6 +163,31 @@ fn session_close_already_finalized(message: &str) -> bool {
 
 fn session_close_needs_reconciliation(message: &str) -> bool {
     message.contains("Close already requested") || message.contains("Channel is already sealed")
+}
+
+/// Challenge-binding secret for one endpoint of an operator serving several
+/// from one root secret, so a challenge minted for one endpoint (and the
+/// session opened from it) never verifies at another.
+pub fn endpoint_challenge_binding_secret(secret: &str, endpoint_id: &str) -> String {
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(b"pay-session-endpoint\0");
+    mac.update(endpoint_id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+/// The per-request price a voucher must pay: the authenticated challenge
+/// amount, never the static session config amount.
+fn voucher_request_amount(request: &SessionRequest) -> Result<u64> {
+    match request.amount.parse::<u64>() {
+        Ok(amount) if amount > 0 => Ok(amount),
+        _ => Err(Error::PaymentRejected(format!(
+            "session challenge amount `{}` is not a positive base-unit amount",
+            request.amount
+        ))),
+    }
 }
 
 // ── Session outcome ────────────────────────────────────────────────────────
@@ -208,7 +235,6 @@ struct SessionOperatorRuntime {
     network: String,
     token_program: String,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
-    payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn TransactionSigner>>>>,
     committed_watermarks: Arc<dashmap::DashMap<String, u64>>,
     reserved_capacity: Arc<Mutex<HashMap<String, u64>>>,
     delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
@@ -270,14 +296,6 @@ impl SessionOperatorRuntime {
             .lock()
             .ok()
             .and_then(|signer| signer.clone())
-    }
-
-    fn payment_channel_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
-        self.payment_channel_payer_signer
-            .lock()
-            .ok()
-            .and_then(|signer| signer.clone())
-            .or_else(|| self.payment_channel_signer())
     }
 
     /// Push the latest accepted cumulative voucher on-chain without sealing
@@ -342,18 +360,7 @@ impl SessionOperatorRuntime {
                 let tx_pipeline = tx_pipeline.clone();
                 let rpc_url = self.rpc_url.clone();
                 async move {
-                    // Version 1 when the cluster gate is active: 18 voucher
-                    // settlements per flush transaction instead of 4.
-                    let tx_version = match rpc_url {
-                        Some(url) => tokio::task::spawn_blocking(move || {
-                            pay_kit::core::tx::highest(&pay_kit::core::tx::TxV1Mode::Auto.resolve(
-                                &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(url),
-                            ))
-                        })
-                        .await
-                        .unwrap_or(pay_kit::core::tx::TxVersion::V0),
-                        None => pay_kit::core::tx::TxVersion::V0,
-                    };
+                    let tx_version = settlement_tx_version(rpc_url).await;
                     spawn(
                         SettlementConfig::new(operator, signer).with_tx_version(tx_version),
                         Arc::new(RpcBroadcaster::with_pipeline(tx_pipeline)),
@@ -380,7 +387,15 @@ impl SessionOperatorRuntime {
     /// operator-bound payer proof), so idle close cannot go through
     /// [`SessionServer::process_close`] — the server closes on its own
     /// authority and seals at the highest accepted watermark.
-    async fn request_server_close(&self, channel_id: &str) -> Result<()> {
+    ///
+    /// `observed` is the idle lifecycle a due scan saw: the claim only lands
+    /// if the record still carries it, so a voucher that re-armed the
+    /// deadline after the scan keeps the channel open.
+    async fn request_server_close(
+        &self,
+        channel_id: &str,
+        observed: Option<ChannelLifecycle>,
+    ) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -403,6 +418,11 @@ impl SessionOperatorRuntime {
                     if state.close_requested_at.is_some() {
                         return Err(StoreError::Internal("Close already requested".to_string()));
                     }
+                    if observed.is_some() && state.lifecycle != observed {
+                        return Err(StoreError::Internal(
+                            IDLE_CLOSE_LIFECYCLE_CHANGED.to_string(),
+                        ));
+                    }
                     state.close_requested_at = Some(now);
                     Ok(state)
                 }),
@@ -412,7 +432,11 @@ impl SessionOperatorRuntime {
         Ok(())
     }
 
-    async fn operator_close_channel(&self, channel_id: &str) -> Result<SessionCloseResult> {
+    async fn operator_close_channel(
+        &self,
+        channel_id: &str,
+        observed: Option<ChannelLifecycle>,
+    ) -> Result<SessionCloseResult> {
         if self.channel_is_tombstoned_on_chain(channel_id).await {
             self.server
                 .mark_sealed(channel_id)
@@ -421,8 +445,11 @@ impl SessionOperatorRuntime {
             return Ok(SessionCloseResult::AlreadyFinalized);
         }
 
-        match self.request_server_close(channel_id).await {
+        match self.request_server_close(channel_id, observed).await {
             Ok(()) => {}
+            Err(error) if error.to_string().contains(IDLE_CLOSE_LIFECYCLE_CHANGED) => {
+                return Ok(SessionCloseResult::Rearmed);
+            }
             Err(error) if session_close_already_finalized(&error.to_string()) => {
                 return Ok(SessionCloseResult::AlreadyFinalized);
             }
@@ -520,17 +547,12 @@ impl SessionOperatorRuntime {
         // `settle_and_finalize` requires the **merchant** (recipient) to sign,
         // and for client-voucher pull the recipient is pinned to the settlement
         // signer — so the worker must sign with that. The channel's `rent_payer`
-        // (the advertised operator / channel payer, distinct in sandbox) is a
-        // *non-signer* account on `distribute`; it only has to equal the
-        // channel's stored rent_payer (else 0xA InvalidChannelRentPayer). Keeping
-        // these separate fixes both the rent-payer check and the merchant sig.
+        // is a *non-signer* account on `distribute` that must equal the one
+        // recorded at open (else 0xA InvalidChannelRentPayer); it is read from
+        // stored and on-chain state, never inferred from a signer.
         let Some(signer) = self.payment_channel_signer() else {
             return Ok(None);
         };
-        let rent_payer = self
-            .payment_channel_payer_signer()
-            .map(|s| s.pubkey())
-            .unwrap_or_else(|| signer.pubkey());
         let tx_pipeline = self.transaction_pipeline().await?;
         let authorized_signer = params.authorized_signer.ok_or_else(|| {
             Error::Mpp("payment-channel settlement missing authorized signer".to_string())
@@ -549,11 +571,17 @@ impl SessionOperatorRuntime {
         // fails with VoucherWatermarkNotMonotonic (0xEA). When chain already
         // has the latest accepted watermark, seal it without another voucher.
         let channel_id = params.channel_id.to_string();
-        let onchain_settled = self
-            .fetch_payment_channel(&channel_id)
-            .await?
+        let onchain = self.fetch_payment_channel(&channel_id).await?;
+        let onchain_settled = onchain
+            .as_ref()
             .map(|channel| channel.settlement.settled)
             .unwrap_or_default();
+        let rent_payer = close_rent_payer(
+            params.rent_payer,
+            onchain
+                .as_ref()
+                .map(|channel| solana_pubkey::Pubkey::from(channel.rent_payer.to_bytes())),
+        )?;
         let voucher_required = close_voucher_required(onchain_settled, params.settled);
         let signature = match (voucher_required, params.voucher_signature.as_deref()) {
             (false, _) => None,
@@ -565,24 +593,14 @@ impl SessionOperatorRuntime {
                 ));
             }
         };
-        let expires_at = params.voucher_expires_at.unwrap_or(0);
-
-        let mut instructions =
-            pay_kit::mpp::program::payment_channels::build_settle_and_seal_instructions(
-                &params.recipient,
-                &params.channel_id,
-                &authorized_signer,
-                signature.as_ref(),
-                params.settled,
-                expires_at,
-                &params.program_id,
-            )
-            .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
-        instructions.push(
-            params
-                .distribute_instruction(&rent_payer, &treasury, &token_program)
-                .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
-        );
+        let instructions = close_instructions(
+            params,
+            &authorized_signer,
+            signature.as_ref(),
+            rent_payer,
+            &treasury,
+            &token_program,
+        )?;
 
         // Route through the shared batched worker: concurrent closes pack into
         // shared transactions, signed once by the operator and broadcast.
@@ -594,18 +612,7 @@ impl SessionOperatorRuntime {
                 let tx_pipeline = tx_pipeline.clone();
                 let rpc_url = self.rpc_url.clone();
                 async move {
-                    // Version 1 when the cluster gate is active: 18 voucher
-                    // settlements per flush transaction instead of 4.
-                    let tx_version = match rpc_url {
-                        Some(url) => tokio::task::spawn_blocking(move || {
-                            pay_kit::core::tx::highest(&pay_kit::core::tx::TxV1Mode::Auto.resolve(
-                                &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(url),
-                            ))
-                        })
-                        .await
-                        .unwrap_or(pay_kit::core::tx::TxVersion::V0),
-                        None => pay_kit::core::tx::TxVersion::V0,
-                    };
+                    let tx_version = settlement_tx_version(rpc_url).await;
                     spawn(
                         SettlementConfig::new(operator, signer).with_tx_version(tx_version),
                         Arc::new(RpcBroadcaster::with_pipeline(tx_pipeline)),
@@ -633,6 +640,102 @@ impl SessionOperatorRuntime {
             }
         }
         Ok(Some(signature))
+    }
+}
+
+/// Message version for operator settlement transactions, from the same
+/// cluster gate that decides what sessions accept: version 1 when active, so
+/// a close that only fits version 1 (hooks, many splits) can still settle.
+async fn settlement_tx_version(rpc_url: Option<String>) -> pay_kit::core::tx::TxVersion {
+    let Some(url) = rpc_url else {
+        return pay_kit::core::tx::TxVersion::V0;
+    };
+    tokio::task::spawn_blocking(move || {
+        pay_kit::core::tx::highest(
+            &pay_kit::core::tx::TxV1Mode::Auto
+                .resolve(&pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(url)),
+        )
+    })
+    .await
+    .unwrap_or(pay_kit::core::tx::TxVersion::V0)
+}
+
+/// Most distribution recipients a channel may commit to: the most pay-worker's
+/// close can distribute in one transaction.
+pub const MAX_DISTRIBUTION_RECIPIENTS: usize = 50;
+
+/// Refuse to issue sessions whose distribution could never be paid out.
+fn ensure_distributable(recipients: usize) -> Result<()> {
+    if recipients > MAX_DISTRIBUTION_RECIPIENTS {
+        return Err(Error::Config(format!(
+            "session distribution has {recipients} recipients; at most \
+             {MAX_DISTRIBUTION_RECIPIENTS} can be distributed"
+        )));
+    }
+    Ok(())
+}
+
+/// Reusable session authorization needs the channel open on-chain: a payer
+/// may already have closed, sealed or distributed it. Without an RPC there is
+/// no chain to consult.
+fn require_open_onchain(rpc_configured: bool, status: Option<u8>) -> Result<()> {
+    const OPEN: u8 = 0;
+    match status {
+        Some(OPEN) => Ok(()),
+        None if !rpc_configured => Ok(()),
+        _ => Err(Error::PaymentRejected(format!(
+            "{}; open a new session",
+            terminal_errors::CLOSED_ONCHAIN
+        ))),
+    }
+}
+
+/// The atomic settle-and-seal plus distribute instructions closing a channel.
+fn close_instructions(
+    params: &SealParams,
+    authorized_signer: &solana_pubkey::Pubkey,
+    signature: Option<&[u8; 64]>,
+    rent_payer: solana_pubkey::Pubkey,
+    treasury: &solana_pubkey::Pubkey,
+    token_program: &solana_pubkey::Pubkey,
+) -> Result<Vec<solana_instruction::Instruction>> {
+    let mut instructions =
+        pay_kit::mpp::program::payment_channels::build_settle_and_seal_instructions(
+            &params.recipient,
+            &params.channel_id,
+            authorized_signer,
+            signature,
+            params.settled,
+            params.voucher_expires_at.unwrap_or(0),
+            &params.program_id,
+        )
+        .map_err(|e| Error::Mpp(format!("failed to build settlement instruction: {e}")))?;
+    let distribution = SealParams {
+        rent_payer: Some(rent_payer),
+        ..params.clone()
+    };
+    instructions.push(
+        distribution
+            .distribute_instruction(treasury, token_program)
+            .map_err(|error| Error::Mpp(format!("failed to build distribution: {error}")))?,
+    );
+    Ok(instructions)
+}
+
+/// The rent payer a close must name: the one recorded at open, cross-checked
+/// against a fresh channel read when there is one.
+fn close_rent_payer(
+    stored: Option<solana_pubkey::Pubkey>,
+    onchain: Option<solana_pubkey::Pubkey>,
+) -> Result<solana_pubkey::Pubkey> {
+    match (stored, onchain) {
+        (Some(stored), Some(onchain)) if stored != onchain => Err(Error::Mpp(format!(
+            "payment-channel rent payer {stored} recorded at open does not match on-chain {onchain}"
+        ))),
+        (Some(rent_payer), _) | (None, Some(rent_payer)) => Ok(rent_payer),
+        (None, None) => Err(Error::Mpp(
+            "payment-channel settlement has no recorded rent payer".to_string(),
+        )),
     }
 }
 
@@ -1170,12 +1273,12 @@ impl SessionLifecycleRunloop {
                     "payment-channel idle-close check"
                 );
                 (owned && close_after.is_some_and(|close_after| close_after <= now_ms))
-                    .then_some(state.channel_id)
+                    .then_some((state.channel_id, state.lifecycle))
             })
             .collect::<Vec<_>>();
 
         let mut closing = Vec::with_capacity(due.len());
-        for channel_id in due {
+        for (channel_id, observed) in due {
             // Closing and serving both claim the same channel slot. This makes
             // the reservation check atomic with the start of close: a request
             // already in flight defers close, while a close already in progress
@@ -1188,7 +1291,7 @@ impl SessionLifecycleRunloop {
             }
             let runtime = self.runtime.clone();
             closing.push(async move {
-                let result = runtime.operator_close_channel(&channel_id).await;
+                let result = runtime.operator_close_channel(&channel_id, observed).await;
                 (channel_id, result)
             });
         }
@@ -1201,6 +1304,9 @@ impl SessionLifecycleRunloop {
                 }
                 Ok(SessionCloseResult::AlreadyFinalized) => {
                     tracing::debug!(channel_id, "payment channel already finalized");
+                }
+                Ok(SessionCloseResult::Rearmed) => {
+                    tracing::debug!(channel_id, "payment channel re-armed since the idle scan");
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1374,9 +1480,15 @@ fn next_lifecycle_wakeup(
 }
 
 enum SessionCloseResult {
-    Closed { settled: u64 },
+    Closed {
+        settled: u64,
+    },
     AlreadyFinalized,
+    /// Activity re-armed the idle deadline after the due scan; not closed.
+    Rearmed,
 }
+
+const IDLE_CLOSE_LIFECYCLE_CHANGED: &str = "channel lifecycle changed since the idle scan";
 
 // ── Session manager ────────────────────────────────────────────────────────
 
@@ -1568,7 +1680,6 @@ impl SessionMpp {
                     .to_string()
                 }),
             payment_channel_signer: Arc::clone(&payment_channel_signer),
-            payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
             reserved_capacity: Arc::clone(&reserved_capacity),
             delegated_voucher_lock,
@@ -1899,7 +2010,7 @@ impl SessionMpp {
         if self.network() == "localnet" && self.decimals() == 6 {
             return Ok(());
         }
-        if !matches!(self.network(), "mainnet" | "devnet" | "testnet")
+        if !matches!(self.network(), "mainnet" | "devnet")
             || self.decimals() != 6
             || !self.accepts_currency(pay_types::Stablecoin::Usdc.mint(Some(self.network())))
         {
@@ -1940,6 +2051,42 @@ impl SessionMpp {
     }
 
     pub async fn authorize_reserved_usage(
+        &self,
+        channel_id: &str,
+        amount: u64,
+        lease: Option<&DelegatedCapacityLease>,
+    ) -> Result<DelegatedUsageAuthorization> {
+        let accepted = self
+            .commit_reserved_usage(channel_id, amount, lease)
+            .await?;
+        self.touch_after_delegated_usage(channel_id).await?;
+        Ok(accepted)
+    }
+
+    /// The durable half of [`Self::authorize_delegated_usage`]: persist the
+    /// voucher for `amount` and return its cumulative, without the lifecycle
+    /// touch that follows ([`Self::touch_after_delegated_usage`]). A caller
+    /// that must learn whether a charge landed even when the touch fails, or
+    /// is cancelled, uses the two halves.
+    pub async fn commit_delegated_usage(
+        &self,
+        channel_id: &str,
+        amount: u64,
+    ) -> Result<DelegatedUsageAuthorization> {
+        self.commit_reserved_usage(channel_id, amount, None).await
+    }
+
+    /// Extend the channel lifecycle after a committed delegated charge.
+    pub async fn touch_after_delegated_usage(&self, channel_id: &str) -> Result<()> {
+        // Bound voucher acceptance updates lifecycle in the same durable CAS.
+        // A second fallible write here could report a failed response after debit.
+        if self.channel_binding.is_none() {
+            self.touch_channel(channel_id.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    async fn commit_reserved_usage(
         &self,
         channel_id: &str,
         amount: u64,
@@ -2085,11 +2232,6 @@ impl SessionMpp {
             accepted.charged,
         );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
-        // Bound voucher acceptance updates lifecycle in the same durable CAS.
-        // A second fallible write here could report a failed response after debit.
-        if self.channel_binding.is_none() {
-            self.touch_channel(channel_id.to_string()).await?;
-        }
         Ok(DelegatedUsageAuthorization {
             cumulative: accepted.cumulative,
             idle_timeout_seconds,
@@ -2314,6 +2456,7 @@ impl SessionMpp {
     /// default. Deployment challenges require async preparation first and use a
     /// cache-only builder, so expiry can never fall back to a confirmed RPC read.
     pub fn challenge(&self, amount: Option<u64>) -> Result<PaymentChallenge> {
+        ensure_distributable(self.session_config.splits.len())?;
         let request = if let Some(binding) = &self.channel_binding {
             let source = self.deployment_blockhash_source.as_ref().ok_or_else(|| {
                 Error::Config("deployment finalized blockhash source is missing".into())
@@ -2422,6 +2565,28 @@ impl SessionMpp {
         &self,
         credential: pay_kit::mpp::PaymentCredential,
     ) -> Result<SessionOutcome> {
+        self.process_credential_priced(credential, None).await
+    }
+
+    /// Process a credential presented on a route whose challenge was built
+    /// with `challenge(route_amount)`. A voucher answering a challenge issued
+    /// at another price (e.g. for a cheaper route) is rejected.
+    #[tracing::instrument(name = "session_process_credential", skip_all)]
+    pub async fn process_credential_for_route(
+        &self,
+        credential: pay_kit::mpp::PaymentCredential,
+        route_amount: Option<u64>,
+    ) -> Result<SessionOutcome> {
+        let expected = route_amount.unwrap_or(self.session_config.amount);
+        self.process_credential_priced(credential, Some(expected))
+            .await
+    }
+
+    async fn process_credential_priced(
+        &self,
+        credential: pay_kit::mpp::PaymentCredential,
+        expected_amount: Option<u64>,
+    ) -> Result<SessionOutcome> {
         if credential.challenge.intent.as_str() != INTENT {
             return Err(Error::Mpp(format!(
                 "Expected '{}' intent, got '{}'",
@@ -2506,11 +2671,20 @@ impl SessionMpp {
                 // Reuse: adopt a prior-run channel from chain before verifying,
                 // so a voucher for a channel this process never opened is honored
                 // instead of rejected as unknown.
+                let amount = voucher_request_amount(&request)?;
+                if let Some(expected) = expected_amount
+                    && expected != amount
+                {
+                    return Err(Error::PaymentRejected(format!(
+                        "session challenge was issued at {amount} base units, but this route \
+                         costs {expected}; request a new challenge"
+                    )));
+                }
                 self.ensure_channel_loaded(&p.voucher.data.channel_id)
                     .await?;
                 let acceptance = self
                     .server
-                    .verify_voucher(p)
+                    .verify_voucher_for_amount(p, amount)
                     .await
                     .map_err(|e| Error::PaymentRejected(e.to_string()))?;
                 let cumulative = acceptance.cumulative;
@@ -2843,6 +3017,15 @@ impl SessionMpp {
                 terminal_errors::PROOF_MISMATCH
             )));
         }
+        // The payer can close and seal on-chain before this store catches up.
+        let onchain = self
+            .operator_runtime
+            .fetch_payment_channel(&state.channel_id)
+            .await?;
+        require_open_onchain(
+            self.operator_runtime.rpc_url.is_some(),
+            onchain.as_ref().map(|channel| channel.status),
+        )?;
         Ok(state)
     }
 
@@ -2908,11 +3091,17 @@ pub fn test_channel_state(
 fn payment_channel_treasury_owner(network: &str) -> Result<solana_pubkey::Pubkey> {
     const DEVNET_TREASURY_OWNER: &str = "4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap";
 
-    if network == "devnet" {
-        return solana_pubkey::Pubkey::from_str(DEVNET_TREASURY_OWNER)
-            .map_err(|error| Error::Mpp(format!("invalid devnet treasury owner: {error}")));
+    match network {
+        "devnet" => solana_pubkey::Pubkey::from_str(DEVNET_TREASURY_OWNER)
+            .map_err(|error| Error::Mpp(format!("invalid devnet treasury owner: {error}"))),
+        // Localnet runs the mainnet build of the program.
+        "mainnet" | "mainnet-beta" | "localnet" => {
+            Ok(pay_kit::mpp::program::payment_channels::treasury_owner())
+        }
+        other => Err(Error::Mpp(format!(
+            "no payment-channels treasury owner for network `{other}`"
+        ))),
     }
-    Ok(pay_kit::mpp::program::payment_channels::treasury_owner())
 }
 
 fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
@@ -3408,6 +3597,8 @@ mod tests {
                 available_base_units: 50_000,
                 authorized_base_units: CAP,
                 verified_payer: None,
+                request_body_bytes: None,
+                payment_policy: None,
                 _reservation: Some(lease),
             };
             let body = if broken {
@@ -3705,6 +3896,20 @@ mod tests {
     }
 
     #[test]
+    fn payment_channel_treasury_owner_rejects_unknown_networks() {
+        let mainnet = pay_kit::mpp::program::payment_channels::treasury_owner();
+        for network in ["mainnet", "mainnet-beta", "localnet"] {
+            assert_eq!(payment_channel_treasury_owner(network).unwrap(), mainnet);
+        }
+        for network in ["testnet", "devnet2", "", "solana:mainnet"] {
+            assert!(
+                payment_channel_treasury_owner(network).is_err(),
+                "{network} must not fall back to the mainnet treasury"
+            );
+        }
+    }
+
+    #[test]
     fn session_currency_matches_its_advertised_mint() {
         let mut config = test_session_config();
         config.currency = "USDC".to_string();
@@ -3974,6 +4179,364 @@ mod tests {
         );
     }
 
+    fn signer_for(key: &ed25519_dalek::SigningKey) -> Box<dyn TransactionSigner> {
+        let mut keypair = [0u8; 64];
+        keypair[..32].copy_from_slice(key.as_bytes());
+        keypair[32..].copy_from_slice(key.verifying_key().as_bytes());
+        Box::new(MemorySigner::from_bytes(&keypair).unwrap())
+    }
+
+    /// A client channel seeded for `challenge`, plus a factory for fresh
+    /// client handles that start signing from cumulative zero.
+    async fn client_voucher_channel(
+        session: &SessionMpp,
+        challenge: &PaymentChallenge,
+    ) -> (String, impl Fn() -> SessionHandle) {
+        let channel = solana_pubkey::Pubkey::new_unique();
+        let (voucher_key, signer) = test_keypair();
+        seed_channel(
+            session,
+            &channel.to_string(),
+            CAP,
+            &signer.pubkey().to_string(),
+            "client",
+            &challenge.id,
+            &solana_pubkey::Pubkey::new_unique().to_string(),
+            None,
+        )
+        .await;
+        let challenge = challenge.clone();
+        let handle = move || {
+            SessionHandle::new(channel, signer_for(&voucher_key), challenge.clone())
+                .with_voucher_key(voucher_key.clone())
+        };
+        (channel.to_string(), handle)
+    }
+
+    async fn stored_channel(session: &SessionMpp, channel_id: &str) -> ChannelState {
+        session
+            .operator_runtime
+            .channel_store
+            .get_channel(channel_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A JSON-RPC node whose v1 transaction feature gate is `activated`.
+    async fn feature_gate_rpc(activated: bool) -> String {
+        use axum::{Json, Router, routing::post};
+        use base64::Engine as _;
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| async move {
+                assert_eq!(request["method"], "getAccountInfo");
+                assert_eq!(
+                    request["params"][0],
+                    pay_kit::core::tx::TX_V1_FEATURE_GATE.to_string()
+                );
+                let value = activated.then(|| {
+                    let mut data = vec![1u8];
+                    data.extend_from_slice(&7u64.to_le_bytes());
+                    serde_json::json!({
+                        "data": [base64::engine::general_purpose::STANDARD.encode(&data), "base64"],
+                        "executable": false,
+                        "lamports": 1,
+                        "owner": "Feature111111111111111111111111111111111111",
+                        "rentEpoch": 0,
+                        "space": data.len(),
+                    })
+                });
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"context": {"slot": 1}, "value": value},
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    #[test]
+    fn sessions_are_not_issued_with_undistributable_splits() {
+        let session_with = |count: usize| {
+            let mut config = test_session_config();
+            config.splits = (0..count)
+                .map(|_| pay_kit::mpp::server::session::Split {
+                    recipient: solana_pubkey::Pubkey::new_unique(),
+                    bps: 1,
+                })
+                .collect();
+            SessionMpp::new(config, "test-secret").with_blockhash_cache(test_blockhash_cache())
+        };
+        session_with(MAX_DISTRIBUTION_RECIPIENTS)
+            .challenge(None)
+            .unwrap();
+        let error = session_with(MAX_DISTRIBUTION_RECIPIENTS + 1)
+            .challenge(None)
+            .unwrap_err();
+        assert!(error.to_string().contains("can be distributed"), "{error}");
+    }
+
+    #[test]
+    fn reusable_use_requires_an_open_channel_on_chain() {
+        use pay_kit::mpp::program::payment_channels::generated::generated::types::ChannelStatus;
+        assert!(require_open_onchain(true, Some(ChannelStatus::Open as u8)).is_ok());
+        for terminal in [
+            ChannelStatus::Sealed,
+            ChannelStatus::Closing,
+            ChannelStatus::Distributed,
+        ] {
+            let error = require_open_onchain(true, Some(terminal as u8)).unwrap_err();
+            // Payer proxies key cached-session eviction on this text.
+            assert!(
+                error.to_string().contains(terminal_errors::CLOSED_ONCHAIN),
+                "{error}"
+            );
+        }
+        // Gone from chain entirely: closed and reclaimed.
+        assert!(require_open_onchain(true, None).is_err());
+        assert!(require_open_onchain(false, None).is_ok());
+    }
+
+    #[test]
+    fn a_split_heavy_close_settles_only_on_version_one() {
+        use pay_kit::core::tx::{TxVersion, build_unsigned_fitting};
+        let pubkey = |byte: u8| solana_pubkey::Pubkey::new_from_array([byte; 32]);
+        let operator = pubkey(0xAA);
+        let params = SealParams {
+            channel_id: pubkey(0x10),
+            authorized_signer: Some(operator),
+            payer: Some(pubkey(0x20)),
+            rent_payer: Some(pubkey(0x20)),
+            mint: Some(pubkey(0x21)),
+            program_id: pay_kit::core::payment_channels::default_program_id(),
+            channel_version: None,
+            channel_hooks: None,
+            settled: 1_000,
+            voucher_signature: None,
+            voucher_expires_at: None,
+            recipient: operator,
+            splits: (0..8u8)
+                .map(|index| pay_kit::mpp::server::session::Split {
+                    recipient: pubkey(0x40 + index),
+                    bps: 1_250,
+                })
+                .collect(),
+            distribution_hash: [0; 32],
+        };
+        let close = close_instructions(
+            &params,
+            &operator,
+            Some(&[7; 64]),
+            pubkey(0x20),
+            &pubkey(0x22),
+            &pubkey(0x23),
+        )
+        .unwrap();
+        let blockhash = solana_hash::Hash::new_unique();
+        // A V0-only cluster cannot carry it; the version the worker resolves
+        // on a V1 cluster can.
+        assert!(
+            build_unsigned_fitting(&[TxVersion::V0], &operator, &close, blockhash, None).is_err()
+        );
+        let tx = build_unsigned_fitting(
+            &[TxVersion::V0, TxVersion::V1],
+            &operator,
+            &close,
+            blockhash,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            tx.message,
+            solana_message::VersionedMessage::V1(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settlement_uses_version_one_when_the_cluster_accepts_it() {
+        use pay_kit::core::tx::TxVersion;
+        let active = feature_gate_rpc(true).await;
+        assert_eq!(settlement_tx_version(Some(active)).await, TxVersion::V1);
+        let inactive = feature_gate_rpc(false).await;
+        assert_eq!(settlement_tx_version(Some(inactive)).await, TxVersion::V0);
+        assert_eq!(settlement_tx_version(None).await, TxVersion::V0);
+    }
+
+    #[tokio::test]
+    async fn endpoint_secrets_keep_challenges_on_their_endpoint() {
+        let root = "operator-root-secret";
+        assert_eq!(
+            endpoint_challenge_binding_secret(root, "e1"),
+            endpoint_challenge_binding_secret(root, "e1")
+        );
+        assert_ne!(
+            endpoint_challenge_binding_secret(root, "e1"),
+            endpoint_challenge_binding_secret(root, "e2")
+        );
+        assert_ne!(endpoint_challenge_binding_secret(root, "e1"), root);
+        let endpoint = |id: &str| {
+            SessionMpp::new(
+                test_session_config(),
+                endpoint_challenge_binding_secret(root, id),
+            )
+            .with_realm("Same Title")
+            .with_blockhash_cache(test_blockhash_cache())
+        };
+        let (target, clone) = (endpoint("e1"), endpoint("e2"));
+        let credential = |session: &SessionMpp| {
+            PaymentCredential::new(
+                session.challenge(None).unwrap().to_echo(),
+                serde_json::json!({ "action": "mystery" }),
+            )
+        };
+        let error = target
+            .process_credential(credential(&clone))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(terminal_errors::CHALLENGE_ECHO_MISMATCH),
+            "{error}"
+        );
+        // Its own challenge passes the echo check and reaches the payload.
+        let error = target
+            .process_credential(credential(&target))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Unrecognized session action"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn close_names_the_rent_payer_recorded_at_open() {
+        let operator = solana_pubkey::Pubkey::new_unique();
+        let client_payer = solana_pubkey::Pubkey::new_unique();
+        // A client-funded channel distributes rent back to the client.
+        assert_eq!(
+            close_rent_payer(Some(client_payer), Some(client_payer)).unwrap(),
+            client_payer
+        );
+        assert_eq!(
+            close_rent_payer(Some(client_payer), None).unwrap(),
+            client_payer
+        );
+        assert_eq!(
+            close_rent_payer(None, Some(client_payer)).unwrap(),
+            client_payer
+        );
+        // Stored and on-chain state disagreeing, or neither known, is refused
+        // rather than guessed from the operator signer.
+        assert!(close_rent_payer(Some(operator), Some(client_payer)).is_err());
+        assert!(close_rent_payer(None, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_close_skips_a_channel_rearmed_after_the_scan() {
+        let session = test_session_mpp();
+        session.start_lifecycle_runloop(Duration::from_secs(3600));
+        let challenge = session.challenge(None).unwrap();
+        let (channel_id, handle) = client_voucher_channel(&session, &challenge).await;
+        session.touch_channel(channel_id.clone()).await.unwrap();
+        // Age the deadline so the channel is due, and take the scan's view.
+        let store = &session.operator_runtime.channel_store;
+        store
+            .update_channel(
+                &channel_id,
+                Box::new(|state| {
+                    let mut state = state.unwrap();
+                    state.lifecycle.as_mut().unwrap().close_after = 0;
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        let observed = stored_channel(&session, &channel_id).await.lifecycle;
+
+        // A voucher lands between the scan and the close claim.
+        let header = handle().voucher_header(25).await.unwrap();
+        session.process(&header).await.unwrap();
+        let error = session
+            .operator_runtime
+            .request_server_close(&channel_id, observed)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(IDLE_CLOSE_LIFECYCLE_CHANGED),
+            "{error}"
+        );
+        let state = stored_channel(&session, &channel_id).await;
+        assert!(state.close_requested_at.is_none());
+        // The request that paid is still served.
+        session.touch_channel(channel_id.clone()).await.unwrap();
+
+        // A channel still idle as scanned is claimed.
+        let observed = stored_channel(&session, &channel_id).await.lifecycle;
+        session
+            .operator_runtime
+            .request_server_close(&channel_id, observed)
+            .await
+            .unwrap();
+        assert!(
+            stored_channel(&session, &channel_id)
+                .await
+                .close_requested_at
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn voucher_must_pay_the_challenged_request_amount() {
+        // The static session amount is 25; this route was challenged at 100.
+        let session = test_session_mpp();
+        let challenge = session.challenge(Some(100)).unwrap();
+        let (channel_id, handle) = client_voucher_channel(&session, &challenge).await;
+
+        for under in [1, 25, 99] {
+            let header = handle().voucher_header(under).await.unwrap();
+            let error = session.process(&header).await.unwrap_err();
+            assert!(
+                matches!(error, Error::PaymentRejected(_)),
+                "+{under} must not pay a 100 request: {error}"
+            );
+        }
+        let state = stored_channel(&session, &channel_id).await;
+        assert_eq!((state.cumulative, state.spent_amount), (0, 0));
+
+        let header = handle().voucher_header(100).await.unwrap();
+        let SessionOutcome::Voucher { cumulative, .. } = session.process(&header).await.unwrap()
+        else {
+            panic!("expected voucher outcome");
+        };
+        assert_eq!(cumulative, 100);
+        let state = stored_channel(&session, &channel_id).await;
+        assert_eq!((state.cumulative, state.spent_amount), (100, 100));
+    }
+
+    #[tokio::test]
+    async fn voucher_rejects_a_zero_challenge_amount() {
+        let session = test_session_mpp();
+        let challenge = session.challenge(Some(0)).unwrap();
+        let (channel_id, handle) = client_voucher_channel(&session, &challenge).await;
+
+        let header = handle().voucher_header(25).await.unwrap();
+        let error = session.process(&header).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not a positive base-unit amount"),
+            "{error}"
+        );
+        assert_eq!(stored_channel(&session, &channel_id).await.cumulative, 0);
+    }
+
     #[tokio::test]
     async fn process_supports_voucher_and_close_on_open_channel() {
         let session = test_session_mpp();
@@ -4001,6 +4564,7 @@ mod tests {
         else {
             panic!("expected voucher outcome");
         };
+        handle.record_voucher(&voucher_header).await.unwrap();
         assert_eq!(cumulative, 75);
         assert_eq!(session.committed_watermark(&channel.to_string()), Some(75));
 
@@ -4985,6 +5549,7 @@ mod tests {
             session.process(&voucher_header).await.is_ok(),
             "idle-close must not start while a request owns the lease"
         );
+        handle.record_voucher(&voucher_header).await.unwrap();
 
         drop(lease);
         // Wait out the kit's one-second re-arm window plus a margin so the
@@ -5048,7 +5613,7 @@ mod tests {
         // Server-initiated close (idle path) seals at the accepted watermark.
         session
             .operator_runtime
-            .request_server_close(&channel)
+            .request_server_close(&channel, None)
             .await
             .unwrap();
         let params = session.server.seal_params(&channel).await.unwrap();

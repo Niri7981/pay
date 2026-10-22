@@ -107,6 +107,10 @@ pub struct ExecuteTriggerRequest {
     pub trigger_resource: String,
     pub channel_lease: String,
     pub target_resource: String,
+    /// `pay-channel` label of the target when the trigger was created.
+    pub target_channel_lease: String,
+    /// Provider creation identity of the target incarnation.
+    pub target_created_at: String,
     pub tenant_key: String,
     pub path: String,
     #[serde(default)]

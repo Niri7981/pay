@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use owo_colors::OwoColorize;
-use pay_core::server::subscription::compute_plan_id_numeric;
+use pay_core::server::subscription::PlanRoute;
 use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
 use solana_pubkey::Pubkey;
 
@@ -87,14 +87,14 @@ impl PublishCommand {
             //
             // Reuse a YAML-pinned `plan_id_numeric` when present so an
             // operator who hand-edited the value keeps a stable PDA.
+            let route = PlanRoute::of(endpoint);
             let plan_id_numeric = sub
                 .plan_id_numeric
-                .unwrap_or_else(|| compute_plan_id_numeric(&owner_str, &endpoint.path));
+                .unwrap_or_else(|| route.plan_id_numeric(&owner_str, &api.subdomain));
             let seed = plan_id_seed(plan_id_numeric);
             let (plan_pda, _) = find_plan_pda(&owner, &seed, &program_id);
             rows.push(PlanRow {
-                method: format!("{:?}", endpoint.method).to_uppercase(),
-                path: endpoint.path.clone(),
+                route,
                 period: sub.period.clone(),
                 currency: sub.currency.clone(),
                 derived_plan: plan_pda.to_string(),
@@ -120,9 +120,8 @@ impl PublishCommand {
                 Some(_) => "differs from spec".yellow().to_string(),
                 None => "pending publish".dimmed().to_string(),
             };
-            let label = format!("{} {}", row.method, row.path);
-            let header = label.bold();
-            eprintln!("  {header} [{status}]");
+            let label = row.route.to_string();
+            eprintln!("  {} [{status}]", label.bold());
             eprintln!("    period   {}", row.period);
             eprintln!("    currency {}", row.currency);
             eprintln!("    plan     {}", row.derived_plan);
@@ -158,137 +157,40 @@ impl PublishCommand {
 }
 
 struct PlanRow {
-    method: String,
-    path: String,
+    route: PlanRoute,
     period: String,
     currency: String,
     derived_plan: String,
     existing_plan: Option<String>,
 }
 
-/// In-place rewrite of `plan_id:` lines under each `subscription:` block.
-/// Operates on the YAML text directly so comments and key ordering are
-/// preserved — `serde_yml::to_string` would strip both.
+/// In-place rewrite of `plan_id:` under each route's `subscription:` block.
 fn write_back_plan_ids(yaml: &str, rows: &[PlanRow]) -> pay_core::Result<String> {
-    // Build a quick lookup keyed by endpoint path. The spec doesn't allow
-    // duplicate `(method, path)` pairs so the path alone is unique enough
-    // for the in-place rewrite.
-    let by_path: std::collections::HashMap<&str, &str> = rows
+    let updates = rows
         .iter()
-        .map(|r| (r.path.as_str(), r.derived_plan.as_str()))
+        .map(|r| (r.route.clone(), vec![("plan_id", r.derived_plan.clone())]))
         .collect();
-
-    let mut out = String::with_capacity(yaml.len() + 256);
-    let mut current_path: Option<String> = None;
-    let mut inside_subscription = false;
-    let mut subscription_indent: Option<usize> = None;
-    let mut wrote_plan_id_for_current = false;
-    let mut updated_paths = std::collections::HashSet::new();
-
-    for line in yaml.lines() {
-        let stripped = line.trim_start();
-        let indent = line.len() - stripped.len();
-
-        // Track the current endpoint via `path:` lines under the
-        // `endpoints:` list.
-        if let Some(rest) = stripped
-            .strip_prefix("path:")
-            .or_else(|| stripped.strip_prefix("- path:"))
-        {
-            let path_value = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-            current_path = Some(path_value);
-            inside_subscription = false;
-            subscription_indent = None;
-            wrote_plan_id_for_current = false;
-        } else if stripped.starts_with("subscription:") {
-            inside_subscription = true;
-            subscription_indent = Some(indent);
-        } else if inside_subscription
-            && let Some(block_indent) = subscription_indent
-            && stripped.starts_with("plan_id:")
-            && indent > block_indent
-        {
-            wrote_plan_id_for_current = true;
-            // Replace the existing line with the derived value, preserving
-            // indent.
-            if let Some(path) = current_path.as_deref()
-                && let Some(plan) = by_path.get(path)
-            {
-                let prefix = &line[..indent];
-                out.push_str(prefix);
-                out.push_str("plan_id: ");
-                out.push_str(plan);
-                out.push('\n');
-                updated_paths.insert(path.to_string());
-                continue;
-            }
-        } else if inside_subscription
-            && let Some(block_indent) = subscription_indent
-            && indent <= block_indent
-            && !stripped.is_empty()
-            && !stripped.starts_with('#')
-        {
-            // Leaving the subscription block — if we never saw a
-            // `plan_id:` line for it, insert one before this line.
-            if let Some(path) = current_path.as_deref()
-                && !wrote_plan_id_for_current
-                && let Some(plan) = by_path.get(path)
-            {
-                let field_indent = " ".repeat(block_indent + 2);
-                out.push_str(&field_indent);
-                out.push_str("plan_id: ");
-                out.push_str(plan);
-                out.push('\n');
-                updated_paths.insert(path.to_string());
-            }
-            inside_subscription = false;
-            subscription_indent = None;
-        }
-
-        out.push_str(line);
-        out.push('\n');
-    }
-
-    // Trailing subscription block at EOF — insert plan_id if it was missing.
-    if inside_subscription
-        && let Some(path) = current_path.as_deref()
-        && !wrote_plan_id_for_current
-        && let Some(plan) = by_path.get(path)
-        && let Some(block_indent) = subscription_indent
-    {
-        let field_indent = " ".repeat(block_indent + 2);
-        out.push_str(&field_indent);
-        out.push_str("plan_id: ");
-        out.push_str(plan);
-        out.push('\n');
-        updated_paths.insert(path.to_string());
-    }
-
-    let missing: Vec<&str> = by_path
-        .keys()
-        .copied()
-        .filter(|path| !updated_paths.contains(*path))
-        .collect();
+    let (out, missing) = super::plan_yaml::rewrite_subscription_fields(yaml, &updates);
     if !missing.is_empty() {
+        let missing: Vec<String> = missing.iter().map(ToString::to_string).collect();
         return Err(pay_core::Error::Config(format!(
             "Failed to write plan_id for endpoint(s): {}",
             missing.join(", ")
         )));
     }
-
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_types::metering::HttpMethod;
 
     #[test]
     fn write_back_inserts_plan_id_when_absent() {
         let yaml = "endpoints:\n  - method: GET\n    path: api/v1/pro\n    subscription:\n      period: 30d\n      currency: USDC\n";
         let rows = vec![PlanRow {
-            method: "GET".into(),
-            path: "api/v1/pro".into(),
+            route: PlanRoute::new(&HttpMethod::Get, "api/v1/pro"),
             period: "30d".into(),
             currency: "USDC".into(),
             derived_plan: "PlanXYZ".into(),
@@ -302,8 +204,7 @@ mod tests {
     fn write_back_replaces_existing_plan_id() {
         let yaml = "endpoints:\n  - method: GET\n    path: api/v1/pro\n    subscription:\n      period: 30d\n      currency: USDC\n      plan_id: OLD\n";
         let rows = vec![PlanRow {
-            method: "GET".into(),
-            path: "api/v1/pro".into(),
+            route: PlanRoute::new(&HttpMethod::Get, "api/v1/pro"),
             period: "30d".into(),
             currency: "USDC".into(),
             derived_plan: "NEW".into(),
@@ -318,8 +219,7 @@ mod tests {
     fn write_back_preserves_comments_and_other_endpoints() {
         let yaml = "endpoints:\n  # comment-1\n  - method: GET\n    path: api/v1/pro\n    # subscription block\n    subscription:\n      period: 30d\n      currency: USDC\n  - method: POST\n    path: api/v1/charge\n    metering:\n      dimensions:\n        - direction: usage\n          unit: requests\n          scale: 1\n          tiers:\n            - price_usd: 0.01\n";
         let rows = vec![PlanRow {
-            method: "GET".into(),
-            path: "api/v1/pro".into(),
+            route: PlanRoute::new(&HttpMethod::Get, "api/v1/pro"),
             period: "30d".into(),
             currency: "USDC".into(),
             derived_plan: "PlanXYZ".into(),
@@ -337,8 +237,7 @@ mod tests {
     fn write_back_supports_inline_list_item_paths() {
         let yaml = "endpoints:\n  - path: api/v1/pro\n    method: GET\n    subscription:\n      period: 30d\n      currency: USDC\n";
         let rows = vec![PlanRow {
-            method: "GET".into(),
-            path: "api/v1/pro".into(),
+            route: PlanRoute::new(&HttpMethod::Get, "api/v1/pro"),
             period: "30d".into(),
             currency: "USDC".into(),
             derived_plan: "PlanXYZ".into(),
@@ -351,10 +250,38 @@ mod tests {
     }
 
     #[test]
+    fn write_back_keeps_get_and_post_plans_on_the_same_path_apart() {
+        let yaml = "endpoints:\n  - method: GET\n    path: api/v1/pro\n    subscription:\n      period: 30d\n      currency: USDC\n  - method: POST\n    path: api/v1/pro\n    subscription:\n      period: 30d\n      currency: USDC\n";
+        let row = |method, plan: &str| PlanRow {
+            route: PlanRoute::new(&method, "api/v1/pro"),
+            period: "30d".into(),
+            currency: "USDC".into(),
+            derived_plan: plan.into(),
+            existing_plan: None,
+        };
+        let rows = vec![
+            row(HttpMethod::Get, "GET_PLAN"),
+            row(HttpMethod::Post, "POST_PLAN"),
+        ];
+
+        let out = write_back_plan_ids(yaml, &rows).unwrap();
+
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(&format!(
+            "name: t\nsubdomain: t\ntitle: t\ndescription: t\ncategory: ai_ml\nversion: v1\nrouting:\n  type: proxy\n  url: https://example.com\n{out}"
+        ))
+        .unwrap();
+        let plans: Vec<_> = api
+            .endpoints
+            .iter()
+            .map(|ep| ep.subscription.as_ref().unwrap().plan_id.clone().unwrap())
+            .collect();
+        assert_eq!(plans, ["GET_PLAN", "POST_PLAN"]);
+    }
+
+    #[test]
     fn write_back_errors_when_an_endpoint_cannot_be_matched() {
         let rows = vec![PlanRow {
-            method: "GET".into(),
-            path: "api/v1/missing".into(),
+            route: PlanRoute::new(&HttpMethod::Get, "api/v1/missing"),
             period: "30d".into(),
             currency: "USDC".into(),
             derived_plan: "PlanXYZ".into(),

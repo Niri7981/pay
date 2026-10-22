@@ -277,13 +277,15 @@ async function validateSPLTokenTransfer(
     const accountIndex = accountKeys.indexOf(recipientATA);
     if (accountIndex === -1) throw new ValidateTransferError('recipient not found');
 
-    const preBalance = meta.preTokenBalances?.find(x => x.accountIndex === accountIndex);
-    const postBalance = meta.postTokenBalances?.find(x => x.accountIndex === accountIndex);
-    if (!preBalance || !postBalance) throw new ValidateTransferError('missing balance data');
+    if (!meta.preTokenBalances || !meta.postTokenBalances) throw new ValidateTransferError('missing balance data');
+    const preBalance = meta.preTokenBalances.find(x => x.accountIndex === accountIndex);
+    const postBalance = meta.postTokenBalances.find(x => x.accountIndex === accountIndex);
+    if (!postBalance) throw new ValidateTransferError('missing balance data');
 
     return {
-        pre: BigInt(preBalance.uiTokenAmount.amount),
+        // An account created in this transaction has no pre-token-balance entry.
+        pre: preBalance ? BigInt(preBalance.uiTokenAmount.amount) : 0n,
         post: BigInt(postBalance.uiTokenAmount.amount),
-        decimals: preBalance.uiTokenAmount.decimals,
+        decimals: postBalance.uiTokenAmount.decimals,
     };
 }

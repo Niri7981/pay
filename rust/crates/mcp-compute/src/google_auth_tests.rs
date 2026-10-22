@@ -113,9 +113,11 @@ impl Fixture {
                                 json!({
                                     "name": RESOURCE,
                                     "state": "ACTIVE",
+                                    "createTime": "2025-01-01T00:00:00Z",
                                     "labels": {
                                         "managed-by": "mcp-compute",
-                                        "pay-tenant": TENANT
+                                        "pay-tenant": TENANT,
+                                        "pay-channel": crate::google::channel_lease_key("channel").unwrap()
                                     },
                                     "serviceConfig": {
                                         "uri": origin,
@@ -316,6 +318,8 @@ async fn scheduled_invocation_isolates_platform_authentication() {
             trigger_resource: TRIGGER.into(),
             channel_lease: "lease".into(),
             target_resource: RESOURCE.into(),
+            target_channel_lease: crate::google::channel_lease_key("channel").unwrap(),
+            target_created_at: "2025-01-01T00:00:00Z".into(),
             tenant_key: TENANT.into(),
             path: "/invoke".into(),
             input: json!({"hello": "world"}),

@@ -467,6 +467,7 @@ fn new_mpp(
         rpc_url: Some(resolved.rpc_url.clone()),
         challenge_binding_secret: state.channels_challenge_binding_secret.clone(),
         realm: Some(state.channels.realm.clone()),
+        store: Some(state.charge_store.clone()),
         fee_payer: signer.is_some(),
         fee_payer_signer: signer,
         html: false,

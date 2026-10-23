@@ -59,7 +59,14 @@ caller ID scopes it; a random server-generated `attempt_id` distinguishes attemp
 across connection/process lifetimes.
 
 `SpendingAuthority::authorize(SpendRequest)` returns a nonblocking future resolving
-to explicit `AuthorityDecision::Allow` or `Deny`, or opaque `AuthorityUnavailable`.
+to `AuthorityDecision::Allow`, `Deny`, `RejectBeforeExecution`, or opaque
+`AuthorityUnavailable`. `RejectBeforeExecution` is an explicit provider guarantee
+that rejection occurred before any durable/economic side effect (including purchase,
+reservation, execution provenance, signing or transaction creation). Pay returns
+`REJECTED_BEFORE_EXECUTION` without wallet approval or paid HTTP. Only this verdict
+permits retrying the same caller/operation/immutable request with a new attempt ID.
+Pay cannot prove the absence of provider side effects; an incorrect or dishonest
+verdict is a provider contract violation. Generic `Deny` remains fenced.
 The default deadline is five seconds, configurable to a nonzero duration <=60s.
 Deny, provider error, deadline expiry and configuration failure never fall back to
 wallet signing. The future must cooperate with cancellation and must not block
@@ -113,19 +120,41 @@ rejection tests.
 ## Idempotency and recovery limits
 
 A bounded, mutex-protected connection-local guard claims `(caller_id, operation_id)`
-before any HTTP. It fingerprints the immutable request. Repeated identical calls
-return `OPERATION_ALREADY_STARTED`; changed request bytes return
-`OPERATION_CONFLICT`. Neither starts another probe, policy call or signing attempt.
-All outcomes, including error/unknown, retain the claim. After 1,024 entries it
-fails closed; it never evicts an old operation to authorize a new attempt.
+before any HTTP. The immutable request fingerprint remains bound for the entire
+connection lifetime, including after `RejectBeforeExecution`. Changed request bytes
+always return `OPERATION_CONFLICT` before another probe or authority call.
 
-This is at-most-one attempt per connection, not an economic ledger, cached-result
-replay or durable purchase recovery. It resets on restart. A provider claiming
-durable idempotency must atomically bind caller + operation to immutable request
-and offer facts and one attempt ID; a different attempt for an already claimed
-operation must be denied/reconciled, never blindly re-approved. That provider
-contract is not implemented or guaranteed by this callback API. Changing operation
-IDs also requires the provider's own cumulative authorization/budget enforcement.
+Each entry is either `Claimed(attempt_id)` or `Retryable`. First start atomically
+claims a fresh attempt ID. Concurrent identical calls return
+`OPERATION_ALREADY_STARTED`. Only the current attempt owner's explicit
+`RejectBeforeExecution` transitions the entry to `Retryable`; the next identical
+call atomically claims a new attempt ID. A stale attempt cannot release a newer
+claim. No entry is removed. The 1,024-entry limit never evicts old fingerprints;
+retrying an existing retryable operation does not consume another entry.
+
+All other provider outcomes retain the claim: generic Deny, Allow (including later
+execution failure), unavailable, timeout, malformed response and runtime errors.
+Cancellation or a lost response does not itself make an operation retryable. If
+Pay never receives a provider verdict (including transport failure, a lost provider
+response, or cancellation before a verdict is obtained), the claim stays fenced.
+An unpaid/free response or failure before consultation also retains its claim.
+
+Only a `RejectBeforeExecution` actually received and processed by Pay releases the
+current claim. An already-running blocking worker can still receive that verdict
+after the outer MCP call is cancelled. Once Pay processes the explicit safe
+rejection, cancellation of the MCP client or loss of the rejection response on its
+way back to that client does not make the provider outcome unknown again: the
+operation remains Retryable. Retryability depends on the provider verdict, not on
+MCP response delivery.
+
+This is a connection-local policy replay guard, not an economic ledger, cached-result
+replay, durable purchase recovery, or exactly-once payment. It resets on restart.
+Providers needing cross-process durability must implement their own durable
+idempotency, atomically binding caller + operation to immutable request and offer
+facts and fencing attempts. Only a prior explicit no-side-effect rejection may
+permit a new attempt; uncertain or committed attempts require denial/reconciliation.
+A retried probe can select a new offer, which the provider must evaluate again.
+Changing operation IDs also requires the provider's own cumulative budget enforcement.
 
 There is no result/receipt callback or original-payment query in this PR. An allow
 is not proof of payment, settlement or delivery. A lost ACK, SDK error or timeout

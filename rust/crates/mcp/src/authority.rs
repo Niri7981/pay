@@ -43,6 +43,9 @@ pub struct SpendRequest {
 pub enum AuthorityDecision {
     Allow,
     Deny,
+    /// Provider guarantees rejection before any durable/economic side effect.
+    /// Only the exact same caller/operation/immutable request may retry.
+    RejectBeforeExecution,
 }
 
 /// Provider failures are deliberately opaque to the agent (no raw transport errors).
@@ -53,8 +56,9 @@ pub struct AuthorityUnavailable;
 ///
 /// Providers requiring durable idempotency must atomically bind caller + operation
 /// to immutable request/offer facts and one attempt_id. A new attempt for an already
-/// claimed operation must fail closed. Repeating an allow without this check does
-/// NOT provide at-most-once execution across process restarts.
+/// claimed operation must fail closed unless its prior attempt explicitly returned
+/// RejectBeforeExecution with no durable/economic side effects. Repeating an allow
+/// without this check does NOT provide at-most-once execution across process restarts.
 pub trait SpendingAuthority: Send + Sync {
     fn authorize(
         &self,
@@ -89,10 +93,23 @@ impl AuthorityBinding {
 
 // A bounded connection-local replay guard, not an economic ledger. Entries never
 // expire/evict: a failed/unknown attempt must not silently become a fresh payment.
-#[derive(Default)]
-pub(crate) struct Operations(Mutex<HashMap<(String, String), [u8; 32]>>);
+#[derive(Clone, Default)]
+pub(crate) struct Operations(Arc<Mutex<HashMap<(String, String), Operation>>>);
+
+struct Operation {
+    digest: [u8; 32],
+    state: OperationState,
+}
+
+// Claimed includes in-flight and all terminal/ambiguous outcomes. No drop handler
+// releases it: cancellation, panic and lost responses must remain fenced.
+enum OperationState {
+    Claimed(String),
+    Retryable,
+}
 
 pub(crate) struct AuthorityAttempt {
+    operations: Operations,
     binding: AuthorityBinding,
     operation_id: String,
     attempt_id: String,
@@ -168,27 +185,55 @@ impl Operations {
             .0
             .lock()
             .map_err(|_| rejected("REPLAY_GUARD_UNAVAILABLE"))?;
-        if let Some(previous) = operations.get(&key) {
-            return Err(rejected(if *previous == digest {
-                "OPERATION_ALREADY_STARTED"
-            } else {
-                "OPERATION_CONFLICT"
-            }));
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        if let Some(previous) = operations.get_mut(&key) {
+            if previous.digest != digest {
+                return Err(rejected("OPERATION_CONFLICT"));
+            }
+            if !matches!(previous.state, OperationState::Retryable) {
+                return Err(rejected("OPERATION_ALREADY_STARTED"));
+            }
+            previous.state = OperationState::Claimed(attempt_id.clone());
+        } else {
+            if operations.len() >= 1024 {
+                return Err(rejected("REPLAY_GUARD_FULL"));
+            }
+            operations.insert(
+                key,
+                Operation {
+                    digest,
+                    state: OperationState::Claimed(attempt_id.clone()),
+                },
+            );
         }
-        if operations.len() >= 1024 {
-            return Err(rejected("REPLAY_GUARD_FULL"));
-        }
-        operations.insert(key, digest);
         Ok(AuthorityAttempt {
+            operations: self.clone(),
             binding,
             operation_id: id.to_string(),
-            attempt_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id,
             request,
         })
     }
 }
 
 impl AuthorityAttempt {
+    fn mark_retryable(&self) -> Result<(), pay_core::Error> {
+        let mut operations = self
+            .operations
+            .0
+            .lock()
+            .map_err(|_| rejected("REPLAY_GUARD_UNAVAILABLE"))?;
+        let key = (self.binding.caller_id.clone(), self.operation_id.clone());
+        match operations.get_mut(&key) {
+            Some(Operation { state, .. }) if matches!(&*state, OperationState::Claimed(id) if *id == self.attempt_id) =>
+            {
+                *state = OperationState::Retryable;
+                Ok(())
+            }
+            _ => Err(rejected("OPERATION_ALREADY_STARTED")),
+        }
+    }
+
     pub(crate) fn authorize(
         &self,
         challenge: &pay_core::client::x402::Challenge,
@@ -243,6 +288,10 @@ impl AuthorityAttempt {
         match decision {
             Ok(Ok(AuthorityDecision::Allow)) => Ok(()),
             Ok(Ok(AuthorityDecision::Deny)) => Err(rejected("DENIED")),
+            Ok(Ok(AuthorityDecision::RejectBeforeExecution)) => {
+                self.mark_retryable()?;
+                Err(rejected("REJECTED_BEFORE_EXECUTION"))
+            }
             Ok(Err(_)) => Err(rejected("UNAVAILABLE")),
             Err(_) => Err(rejected("TIMEOUT")),
         }
@@ -268,6 +317,142 @@ mod tests {
     }
     fn binding(caller: &str) -> AuthorityBinding {
         AuthorityBinding::new(caller, Arc::new(Deny))
+    }
+    // Minimal harness for curl's spawn_blocking boundary. No MCP transport,
+    // wallet, signer or HTTP is involved; aborting the outer task drops the
+    // response receiver while the already-entered blocking worker continues.
+    struct GatedOutcome {
+        first: Result<AuthorityDecision, AuthorityUnavailable>,
+        requests: Mutex<Vec<SpendRequest>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl SpendingAuthority for GatedOutcome {
+        fn authorize(
+            &self,
+            request: SpendRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AuthorityDecision, AuthorityUnavailable>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                let first = {
+                    let mut requests = self.requests.lock().unwrap();
+                    requests.push(request);
+                    requests.len() == 1
+                };
+                if first {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    match self.first {
+                        Ok(decision) => Ok(decision),
+                        Err(_) => Err(AuthorityUnavailable),
+                    }
+                } else {
+                    Ok(AuthorityDecision::Allow)
+                }
+            })
+        }
+    }
+    fn fixture_challenge() -> pay_core::client::x402::Challenge {
+        use base64::Engine;
+        let offer = serde_json::json!({"x402Version":2,"accepts":[{
+            "scheme":"exact","network":"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "amount":"10000","asset":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo":"11111111111111111111111111111111","maxTimeoutSeconds":60,
+            "extra":{"decimals":6}
+        }]});
+        let encoded = base64::engine::general_purpose::STANDARD.encode(offer.to_string());
+        pay_core::client::x402::parse(&[("Payment-Required".into(), encoded)], None).unwrap()
+    }
+    async fn cancelled_outer_call(first: Result<AuthorityDecision, AuthorityUnavailable>) {
+        let retryable = matches!(first, Ok(AuthorityDecision::RejectBeforeExecution));
+        let provider = Arc::new(GatedOutcome {
+            first,
+            requests: Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let operations = Operations::default();
+        let start = || {
+            operations.start(
+                AuthorityBinding::new("caller", provider.clone()),
+                Some("cancelled"),
+                "POST",
+                "https://example.com",
+                &[],
+                Some(&RequestBody::text("original")),
+            )
+        };
+        let attempt = start().unwrap();
+        let original_id = attempt.attempt_id.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let outer = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let result = attempt.authorize(&fixture_challenge(), "mainnet");
+                // Sent only after authorize has processed the verdict/transition.
+                done_tx.send(result).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+            .await
+            .unwrap();
+        outer.abort();
+        assert!(outer.await.unwrap_err().is_cancelled());
+        // Cancellation alone cannot release the claim before any verdict.
+        assert!(
+            start()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("OPERATION_ALREADY_STARTED")
+        );
+        provider.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let code = if retryable {
+            "REJECTED_BEFORE_EXECUTION"
+        } else {
+            "UNAVAILABLE"
+        };
+        assert!(result.unwrap_err().to_string().contains(code));
+        if retryable {
+            let next = start().unwrap();
+            assert_ne!(original_id, next.attempt_id);
+            tokio::task::spawn_blocking(move || next.authorize(&fixture_challenge(), "mainnet"))
+                .await
+                .unwrap()
+                .unwrap();
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_ne!(requests[0].attempt_id, requests[1].attempt_id);
+            assert_eq!(requests[0].caller_id, requests[1].caller_id);
+            assert_eq!(requests[0].operation_id, requests[1].operation_id);
+            assert_eq!(
+                serde_json::to_value(&requests[0].request).unwrap(),
+                serde_json::to_value(&requests[1].request).unwrap()
+            );
+        } else {
+            assert!(
+                start()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("OPERATION_ALREADY_STARTED")
+            );
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn safe_rejection_allows_retry_after_outer_cancellation_and_lost_delivery() {
+        cancelled_outer_call(Ok(AuthorityDecision::RejectBeforeExecution)).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_provider_outcome_stays_fenced_after_outer_cancellation() {
+        cancelled_outer_call(Err(AuthorityUnavailable)).await;
     }
     #[test]
     fn replay_and_mutation_are_fenced_without_an_economic_ledger() {
@@ -324,6 +509,56 @@ mod tests {
                     Some(&request)
                 )
                 .is_ok()
+        );
+    }
+    #[test]
+    fn stale_attempt_cannot_release_new_claim_even_at_capacity() {
+        let operations = Operations::default();
+        let start = || {
+            operations.start(
+                binding("a"),
+                Some("op-0"),
+                "GET",
+                "https://example.com",
+                &[],
+                None,
+            )
+        };
+        let old = start().unwrap();
+        old.mark_retryable().unwrap();
+        for i in 1..1024 {
+            operations
+                .start(
+                    binding("a"),
+                    Some(&format!("op-{i}")),
+                    "GET",
+                    "https://example.com",
+                    &[],
+                    None,
+                )
+                .unwrap();
+        }
+        let current = start().unwrap();
+        assert_ne!(old.attempt_id, current.attempt_id);
+        assert!(old.mark_retryable().is_err());
+        assert!(
+            start()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("OPERATION_ALREADY_STARTED")
+        );
+        current.mark_retryable().unwrap();
+        assert!(old.mark_retryable().is_err());
+        let next = start().unwrap();
+        assert_ne!(current.attempt_id, next.attempt_id);
+        drop(next);
+        assert!(
+            start()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("OPERATION_ALREADY_STARTED")
         );
     }
     #[test]

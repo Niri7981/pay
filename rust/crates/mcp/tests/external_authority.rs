@@ -36,6 +36,8 @@ enum Decision {
     Unavailable,
     Pending,
     Barrier,
+    RejectThenAllow,
+    BarrierRejectThenAllow,
 }
 struct Authority {
     decision: Decision,
@@ -62,10 +64,19 @@ impl SpendingAuthority for Authority {
     ) -> Pin<Box<dyn Future<Output = Result<AuthorityDecision, AuthorityUnavailable>> + Send + '_>>
     {
         Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
             self.facts.lock().unwrap().push(request);
             self.entered.notify_one();
             match self.decision {
+                Decision::RejectThenAllow | Decision::BarrierRejectThenAllow if call == 0 => {
+                    if matches!(self.decision, Decision::BarrierRejectThenAllow) {
+                        self.release.notified().await;
+                    }
+                    Ok(AuthorityDecision::RejectBeforeExecution)
+                }
+                Decision::RejectThenAllow | Decision::BarrierRejectThenAllow => {
+                    Ok(AuthorityDecision::Allow)
+                }
                 Decision::Allow => Ok(AuthorityDecision::Allow),
                 Decision::Deny => Ok(AuthorityDecision::Deny),
                 Decision::Unavailable => Err(AuthorityUnavailable),
@@ -661,4 +672,86 @@ async fn canonical_yaml_reaches_authority_after_network_normalization() {
     assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
     assert_eq!(c.approval.load(Ordering::SeqCst), 0);
     assert_eq!(m.paid.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_retries_only_explicit_rejection_and_preserves_fencing() {
+    for (decision, code, retryable) in [
+        (Decision::RejectThenAllow, "REJECTED_BEFORE_EXECUTION", true),
+        (
+            Decision::BarrierRejectThenAllow,
+            "REJECTED_BEFORE_EXECUTION",
+            true,
+        ),
+        (Decision::Deny, "DENIED", false),
+        (Decision::Unavailable, "UNAVAILABLE", false),
+        (Decision::Pending, "TIMEOUT", false),
+        (Decision::Allow, "delivered", false),
+    ] {
+        let m = Merchant::new("exact").await;
+        let a = Authority::new(decision);
+        let mut c = Context::new(Some(a.clone()));
+        c.timeout = Duration::from_secs(1);
+        let c = Arc::new(c);
+        let (x, y) = tokio::io::duplex(65536);
+        let (server, client) = tokio::join!(PayMcp::with_context(c.clone()).serve(x), ().serve(y));
+        let server = server.unwrap();
+        let client = client.unwrap();
+        let params = CallToolRequestParams::new("curl")
+            .with_arguments(args(&m.url, Some("lifecycle")).as_object().unwrap().clone());
+        let first = client.call_tool(params.clone());
+        let concurrent = async {
+            if matches!(decision, Decision::BarrierRejectThenAllow) {
+                a.entered.notified().await;
+                assert!(
+                    text(&client.call_tool(params.clone()).await.unwrap())
+                        .contains("OPERATION_ALREADY_STARTED")
+                );
+                assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+                a.release.notify_one();
+            }
+        };
+        let (first, ()) = tokio::join!(first, concurrent);
+        assert!(text(&first.unwrap()).contains(code));
+        let initially_allowed = usize::from(matches!(decision, Decision::Allow));
+        assert_eq!(c.approval.load(Ordering::SeqCst), initially_allowed);
+        assert_eq!(m.paid.load(Ordering::SeqCst), initially_allowed);
+        if retryable {
+            assert_eq!(c.store.reads.load(Ordering::SeqCst), 0);
+        }
+        let mut changed = args(&m.url, Some("lifecycle"));
+        changed["body"] = json!({"query":"changed"});
+        let conflict = client
+            .call_tool(
+                CallToolRequestParams::new("curl")
+                    .with_arguments(changed.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        assert!(text(&conflict).contains("OPERATION_CONFLICT"));
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(m.probes.load(Ordering::SeqCst), 1);
+        let second = client.call_tool(params.clone()).await.unwrap();
+        if retryable {
+            assert_eq!(second.is_error, Some(false));
+            assert_eq!(c.approval.load(Ordering::SeqCst), 1);
+            assert_eq!(m.paid.load(Ordering::SeqCst), 1);
+            let facts = a.facts.lock().unwrap();
+            assert_ne!(facts[0].attempt_id, facts[1].attempt_id);
+            assert_eq!(facts[0].operation_id, facts[1].operation_id);
+            assert_eq!(
+                serde_json::to_value(&facts[0].request).unwrap(),
+                serde_json::to_value(&facts[1].request).unwrap()
+            );
+        } else {
+            assert!(text(&second).contains("OPERATION_ALREADY_STARTED"));
+        }
+        assert!(
+            text(&client.call_tool(params).await.unwrap()).contains("OPERATION_ALREADY_STARTED")
+        );
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1 + usize::from(retryable));
+        assert_eq!(m.probes.load(Ordering::SeqCst), 1 + usize::from(retryable));
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
+    }
 }

@@ -97,7 +97,7 @@ fn session_payer(
 #[serde(deny_unknown_fields)]
 pub struct Params {
     #[schemars(
-        description = "Stable caller-scoped operation ID. Required only when the server enables an external spending authority; reusing it never starts another attempt."
+        description = "Stable caller-scoped operation ID. Required only when the server enables an external spending authority; only an explicit authority rejection before execution permits an identical request to retry."
     )]
     pub operation_id: Option<String>,
     #[schemars(description = "The URL to fetch (e.g. https://api.example.com/data)")]

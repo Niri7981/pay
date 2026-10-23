@@ -765,14 +765,24 @@ impl Controller {
     }
     fn response(&self) -> pay_mcp::controlled::ControlledResponse {
         pay_mcp::controlled::ControlledResponse {
-            status: if self.mode == "invalid-response" {
+            status: if matches!(self.mode, "invalid-response" | "invalid-execute-response") {
                 0
             } else {
                 200
             },
             headers: vec![("content-type".into(), "application/json".into())],
-            body: if self.mode == "large-response" {
-                vec![0; 65_537]
+            body: if matches!(
+                self.mode,
+                "large-response" | "boundary-response" | "boundary-plus-response"
+            ) {
+                vec![
+                    b'x';
+                    match self.mode {
+                        "boundary-response" => 65_536,
+                        "boundary-plus-response" => 65_537,
+                        _ => 100 * 1024,
+                    }
+                ]
             } else {
                 b"{\"fixture\":\"controller-delivery\"}".to_vec()
             },
@@ -791,8 +801,7 @@ impl pay_mcp::controlled::ControlledExecution for Controller {
                 "CONTROLLER_UNAVAILABLE".into(),
             ));
         }
-        if self.mode == "replay" || self.mode == "invalid-response" || self.mode == "large-response"
-        {
+        if self.mode == "replay" || self.mode == "invalid-response" {
             return Ok(pay_mcp::controlled::ExecutionPlan::Replay {
                 response: self.response(),
             });
@@ -885,7 +894,7 @@ async fn controlled_errors_and_lost_reply_are_terminal_without_wallet_fallback()
         "invalid-blockhash",
         "rpc-error",
         "invalid-response",
-        "large-response",
+        "invalid-execute-response",
     ] {
         let merchant = Merchant::new("exact").await;
         let controller = Controller::new(mode);
@@ -898,7 +907,7 @@ async fn controlled_errors_and_lost_reply_are_terminal_without_wallet_fallback()
             assert!(text(&result).contains("UNSIGNED_PREPARE_FAILED"));
             assert_eq!(controller.rpc_calls.load(Ordering::SeqCst), 1);
             assert_eq!(controller.executions.load(Ordering::SeqCst), 0);
-        } else if mode == "execute-error" {
+        } else if matches!(mode, "execute-error" | "invalid-execute-response") {
             assert_eq!(controller.executions.load(Ordering::SeqCst), 1);
         }
         assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
@@ -1184,5 +1193,34 @@ async fn controlled_retry_boundary_preserves_authority_and_execution_fences() {
         assert_eq!(context.approval.load(Ordering::SeqCst), 0);
         client.cancel().await.unwrap();
         server.cancel().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn controlled_execute_preserves_100_kib_delivery_without_reexecution() {
+    for (mode, len) in [
+        ("boundary-response", 65_536),
+        ("boundary-plus-response", 65_537),
+        ("large-response", 100 * 1024),
+    ] {
+        let merchant = Merchant::new("exact").await;
+        let authority = Authority::new(Decision::Allow);
+        let controller = Controller::new(mode);
+        let mut context = Context::new(Some(authority));
+        context.controller = Some(controller.clone());
+        let context = Arc::new(context);
+        let result = call(context.clone(), args(&merchant.url, Some("large-delivery"))).await;
+        assert_eq!(result.is_error, Some(false), "{}", text(&result));
+        assert!(
+            result
+                .content
+                .iter()
+                .filter_map(|c| c.as_text())
+                .any(|c| c.text == "x".repeat(len))
+        );
+        assert_eq!(controller.plans.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.executions.load(Ordering::SeqCst), 1);
+        assert_eq!(merchant.paid.load(Ordering::SeqCst), 0);
+        assert_eq!(context.approval.load(Ordering::SeqCst), 0);
     }
 }

@@ -5,7 +5,7 @@
 //! durable evidence, final credential-bearing HTTP and original-result recovery.
 use crate::authority::SpendRequest;
 use pay_core::client::{
-    fetch::{RawResponse, raw_to_outcome},
+    fetch::{MAX_PUBLIC_RESPONSE_BODY_BYTES, RawResponse, raw_to_outcome},
     x402::Challenge,
 };
 use pay_kit::x402::exact::{PaymentRequiredEnvelope, PaymentRequirements};
@@ -158,7 +158,7 @@ pub(crate) fn run(
             )?
         }
     };
-    if !(100..=599).contains(&response.status) || response.body.len() > 65_536 {
+    if !(100..=599).contains(&response.status) || !response_body_size_allowed(response.body.len()) {
         return Err(rejected("INVALID_RESPONSE"));
     }
     Ok(raw_to_outcome(RawResponse {
@@ -167,6 +167,13 @@ pub(crate) fn run(
         headers: response.headers,
         body: response.body,
     }))
+}
+
+// Match the existing hosted transport policy, including its inclusive boundary.
+// The host must enforce this before paid egress; Pay checks returned/replayed
+// delivery defensively and never repeats execution to recover an oversized body.
+fn response_body_size_allowed(len: usize) -> bool {
+    len <= MAX_PUBLIC_RESPONSE_BODY_BYTES
 }
 
 /// Preserve the source chosen by the SDK: valid v2 header, valid legacy header,
@@ -210,6 +217,67 @@ mod tests {
                 "asset":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":amount,
                 "payTo":"11111111111111111111111111111111","maxTimeoutSeconds":60,"extra":{"decimals":6}}],
             "extensions":{"bazaar":{"info":{"input":{"queryParams":{"q":"sample"}}}}}})
+    }
+
+    #[test]
+    fn controlled_delivery_uses_inclusive_hosted_response_limit() {
+        assert!(response_body_size_allowed(MAX_PUBLIC_RESPONSE_BODY_BYTES));
+        assert!(!response_body_size_allowed(
+            MAX_PUBLIC_RESPONSE_BODY_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn replay_preserves_bodies_above_old_64_kib_boundary() {
+        struct Replay(usize);
+        impl ControlledExecution for Replay {
+            fn plan(&self, _: &ControlledRequest) -> pay_core::Result<ExecutionPlan> {
+                Ok(ExecutionPlan::Replay {
+                    response: ControlledResponse {
+                        status: 200,
+                        headers: vec![("content-type".into(), "application/octet-stream".into())],
+                        body: vec![0xa5; self.0],
+                    },
+                })
+            }
+            fn execute(
+                &self,
+                _: &ControlledRequest,
+                _: UnsignedPayment,
+            ) -> pay_core::Result<ControlledResponse> {
+                panic!("replay must not execute")
+            }
+        }
+        for len in [65_536, 65_537, 100 * 1024] {
+            let raw = envelope("1000");
+            let challenge = pay_core::client::x402::parse(&[], Some(&raw.to_string())).unwrap();
+            let spend = SpendRequest {
+                operation_id: "op".into(),
+                attempt_id: "attempt".into(),
+                caller_id: "caller".into(),
+                request: crate::authority::ImmutableRequest {
+                    method: "GET".into(),
+                    url: "https://example.com/data".into(),
+                    headers: vec![],
+                    body: None,
+                },
+                amount_atomic: "1000".into(),
+                asset: "asset".into(),
+                network: "network".into(),
+                execution_network: "mainnet".into(),
+                recipient: "recipient".into(),
+                accepted: raw["accepts"][0].clone(),
+            };
+            let result = run(&Replay(len), spend, Some(raw), &challenge).unwrap();
+            match result {
+                pay_core::client::runner::RunOutcome::Completed {
+                    body: Some(body), ..
+                } => {
+                    assert_eq!(body, vec![0xa5; len]);
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
     }
 
     #[test]

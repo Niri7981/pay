@@ -162,19 +162,17 @@ after signing cannot justify a fresh purchase. Providers reserving budgets must
 remain conservative until future authoritative outcome/reconciliation interfaces
 can account for the original attempt.
 
-## Controlled Execution remains separate
+## Policy-only mode and separate Controlled Execution integration
 
-After allow, Pay still receives valid credentials and starts the paid HTTP request.
-A later revocation/Pause cannot revoke that decision or those credentials here.
-This PR does **not** implement a last-send gate, unique signer/gate ownership,
-signed-evidence persistence, durable submission markers, crash-safe Unknown
-reconciliation, or exactly-once accounting. These are blockers for a deployment
-requiring strong Pause/custody guarantees, not guarantees provided by this hook.
+The limitations in this guide describe the policy-only External Spending Authority
+configuration introduced by #514. In that mode, after Allow, Pay receives valid
+credentials and starts paid HTTP. Later revocation/Pause cannot revoke that decision
+or those credentials. The policy-only hook does not provide final-send ownership,
+durable submission markers, crash-safe reconciliation or exactly-once accounting.
 
-A later Controlled Execution contract must retain effective credentials and final
-HTTP start in a trusted boundary, re-check Pause/generation at that boundary, persist
-original evidence/attempts before egress, expose non-consumable handles and safe
-results, and reconcile the same transaction after crash/lost ACK. It must also
-supply durable ownership/fencing and authoritative outcomes. It should reuse the
-SDK and may build on a separate pay-kit unsigned-prepare proposal; this PR has no
-such dependency and does not change pay-kit's pin or API.
+#530 adds the separate optional [Controlled Execution integration](mcp-controlled-execution.md)
+via `AuthorityBinding::with_controlled_execution`. It uses the pay-kit unsigned
+prepare dependency so a host can own signing and final paid HTTP. Hosts needing
+that ownership should use this integration; durable evidence, fencing, Pause checks
+and original-payment recovery remain host responsibilities. These are not guarantees
+of the policy-only hook itself.

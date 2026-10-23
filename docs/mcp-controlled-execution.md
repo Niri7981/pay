@@ -38,6 +38,12 @@ offers, route metadata and extensions) alongside the unchanged `SpendRequest`.
 Existing policy providers and struct literals do not need new fields. The raw
 probe uses the same outbound/no-redirect checks as the normal fetch path.
 
+Controller delivery bodies use Pay's existing hosted response limit,
+`pay_core::client::fetch::MAX_PUBLIC_RESPONSE_BODY_BYTES` (64 MiB, inclusive),
+for both Build and Replay. Hosts must enforce that limit before paid egress;
+Pay also checks returned delivery defensively. HTTP status must remain in 100–599.
+An invalid status or oversized delivery is terminal and never triggers re-execution.
+
 Controller errors, invalid responses and lost replies are terminal. The controlled
 branch returns before Pay account lookup, wallet approval, signing or paid retry.
 A controller must never return signed transactions, buyer signatures or payment

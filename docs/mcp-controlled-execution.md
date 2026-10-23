@@ -21,6 +21,18 @@ external authority allow, Pay calls the controller on curl's blocking worker:
 4. The controller returns only credential-free delivery; Pay runs its existing
    response classifier/interpreter. A `Replay` skips the builder and execution.
 
+The authority's explicit `RejectBeforeExecution` stops before controller `plan`,
+unsigned construction or `execute`. It retains the original immutable request
+fingerprint and permits the exact same caller/operation/request to begin a new
+authority attempt with a fresh attempt ID. A changed request still conflicts.
+Deny, unavailable, timeout and unknown provider outcomes remain fenced. Cancellation
+or loss of the MCP response alone never releases the claim; a safe rejection already
+processed by Pay remains Retryable regardless of MCP response delivery.
+
+After Allow, controller errors or unknown/lost execution replies cannot transition
+the operation back to Retryable. Ordinary same-connection retries remain fenced;
+original-result recovery remains the host's responsibility.
+
 `ControlledRequest` adds the original selected v2 envelope (including unselected
 offers, route metadata and extensions) alongside the unchanged `SpendRequest`.
 Existing policy providers and struct literals do not need new fields. The raw
@@ -36,7 +48,8 @@ Initial scope is the external-authority path's Solana x402 V2 exact flow. Other
 protocols and cached authentication do not fall through to a free wallet path.
 Authorization, per-agent grants, cumulative budgets, revocation, signature custody,
 durable operation identity and recovery remain host responsibilities. Pay's
-connection-local replay guard is unchanged and is not a durable result store;
+connection-local replay guard inherits the spending-authority lifecycle and is not
+a durable result store;
 reconnect/recovery must query the same original operation in the host.
 
 This interface adds no application-specific bridge, service, ledger, wallet or
